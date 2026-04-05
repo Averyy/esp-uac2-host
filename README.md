@@ -6,13 +6,41 @@ Targets the miniDSP 2x4 HD but should work with any UAC2 device (XMOS-based DACs
 
 ## Status
 
-Work in progress. USB Host init, UAC2 descriptor parsing, control requests, and streaming infrastructure built and verified on ESP32-S3. UAC2 control requests (sample rate, clock validity, volume, mute) tested end-to-end against a UAC2 simulator device. Isochronous audio streaming pending live hardware test.
+Phase 3 complete. Full driver stack working end-to-end: descriptor parsing, control requests (CUR/RANGE), isochronous streaming with feedback-based adaptive packet sizing, volume/mute, disconnect handling. Tested against an ESP32-to-ESP32 UAC2 simulator: 48kHz and 44.1kHz streaming, stop/restart cycles, volume/mute during streaming, hot disconnect/reconnect — all verified. Next: test with real miniDSP 2x4 HD hardware.
+
+## Features
+
+- UAC2 descriptor parsing (clock sources, selectors, terminals, feature units, AS interfaces)
+- Clock control: get/set sample rate, query supported ranges, check clock validity
+- Isochronous TX (playback) and RX (capture) with ring buffer
+- Feedback endpoint handling with adaptive packet sizing (accumulator pattern)
+- Volume/mute control via feature unit
+- First-frame timestamp (microsecond precision, for measurement applications)
+- Atomic in-flight URB tracking for crash-free disconnect
+- Spinlock-protected stream state transitions
+
+## Project Structure
+
+```
+components/uac2_host/       # The driver (ESP-IDF component)
+  include/uac2_host.h       #   Public API
+  include/uac2_desc.h       #   Descriptor structs
+  uac2_host.c               #   Driver implementation
+  uac2_desc.c               #   Descriptor parser
+main/                        # Test harness
+  main.c                    #   Enumeration + streaming test suite
+  tone_gen.c/h              #   Sine wave generator
+test_device/                 # UAC2 simulator (TinyUSB, separate ESP32-S3)
+ref/                         # Reference code (read-only, not compiled)
+docs/                        # Design docs and research
+```
 
 ## Hardware
 
 - **MCU:** ESP32-S3-DevKitC-1
-- **USB:** Full Speed (12 Mbps) — sufficient for 48kHz/24-bit/stereo
-- **Test device:** miniDSP 2x4 HD (XMOS XU216, UAC2)
+- **USB:** Full Speed (12 Mbps) — sufficient for 48kHz/24-bit/stereo (25% bus utilization)
+- **Primary test device:** miniDSP 2x4 HD (XMOS XU216, UAC2, VID 0x2752)
+- **Simulator:** Second ESP32-S3 running `test_device/` firmware (TinyUSB)
 
 ## Building
 

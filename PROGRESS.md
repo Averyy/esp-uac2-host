@@ -1,6 +1,6 @@
 # Progress
 
-## Status: Phase 2 complete + live UAC2 device tested via ESP32-to-ESP32 simulator. Control requests verified end-to-end.
+## Status: Phase 3 complete. Isochronous streaming verified end-to-end (48kHz/24-bit/stereo, 40+ seconds sustained, zero errors).
 
 ## Completed
 
@@ -46,34 +46,56 @@
 - [x] Control transfer deadlock found and fixed (was blocking event loop; now runs in separate task)
 - [x] Clock selector SET_CUR support added to simulator
 
-### Known Issues (need hardware to resolve)
-- [ ] Feedback-based adaptive packet sizing (currently fixed at nominal)
-- [ ] Stream shutdown race condition (50ms delay instead of URB tracking)
+### Phase 3 — Isochronous Streaming (April 5, 2026)
+- [x] main.c updated with stream_start, stream_write, tone generator (1kHz sine)
+- [x] SET_CUR sample rate 48kHz accepted by simulator
+- [x] Interface claim + alt setting works (iface 1 alt 1)
+- [x] Isochronous OUT transfers submit without errors
+- [x] Feedback endpoint submitted (EP 0x81)
+- [x] Feedback-based adaptive packet sizing implemented (accumulator pattern)
+- [x] 48kHz/24-bit/stereo sustained for 40+ seconds (zero errors, zero glitches)
+- [x] Ring buffer backpressure working correctly (consistent 1s timing between logs)
+- [x] Pre-fill strategy (50ms buffer) prevents initial underrun
+- [x] Control transfer timeout recovery (semaphore drain on timeout)
+- [x] Device task lifecycle: proper disconnect wait + cleanup in handle_device_gone
+
+### Code Review + Stability Hardening (April 5, 2026)
+- [x] Full 6-agent code review (security, performance, architecture, quality, UX, regression)
+- [x] Control transfer mutex race fixed (mutex held through response data copy)
+- [x] Descriptor parser: bLength validation on all parse functions (defense against malformed USB)
+- [x] Control transfer buffer overflow guard (w_length vs UAC2_CTRL_XFER_MAX_SIZE)
+- [x] `volatile` qualifiers on cross-task shared state (dev_connected, dev_task_hdl)
+- [x] URB resubmit return values checked in RX/feedback callbacks
+- [x] Feedback 4-byte path: explicit little-endian deserialization (portable)
+- [x] Feedback packet size calc: uint32 intermediate prevents overflow
+- [x] ESP_ERROR_CHECK replaced with proper error handling in device task
+- [x] Relative include path fixed (ref/ added to PRIV_INCLUDE_DIRS)
+- [x] Component CMakeLists: esp_ringbuf moved to PRIV_REQUIRES
+- [x] Atomic in-flight URB counter (replaces 50ms delay in stream_stop)
+- [x] Spinlock (portMUX) for stream state transitions
+- [x] Ring buffer flush on stream stop
+- [x] First-frame timestamp API (uac2_host_stream_get_start_time)
+- [x] Interface release retry loop (5 attempts, for ESP-IDF bug #17707)
+- [x] ESP-IDF component restructure (main/ -> components/uac2_host/)
+- [x] Test suite: 5 automated tests (48kHz, volume/mute, stop/restart, 44.1kHz, long-running)
+- [x] Disconnect/reconnect tested and verified clean
+- [x] All tests pass after all fixes applied
+
+### Known Issues (need real miniDSP hardware to resolve)
 - [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
-- [ ] POST-SET_INTERFACE delay may be needed on XMOS
-- [ ] Disconnect during streaming untested
+- [ ] POST-SET_INTERFACE delay may be needed on real XMOS hardware
 - [ ] Feedback format confirmation (expect 3 bytes / 10.14 from XMOS at FS)
+- [ ] Full 373-byte config descriptor capture from real miniDSP (vs simulator)
 
 See `TODO(hardware)` markers in source code for details.
 
-## Next: Phase 0B + 3 — Live Device Testing (needs powered USB hub + miniDSP)
+## Next: Phase 4 — Real Hardware + Integration
 
-### Phase 0B — Hardware Verification
-- [x] ESP32-S3 enumerates USB device (verified with CDC + UAC2 simulator)
-- [x] `uac2_host_device_open()` succeeds on UAC2 device
-- [x] Clock queries return valid data (GET_CUR, GET_RANGE, clock validity)
-- [ ] Full 373-byte config descriptor captured from real miniDSP (vs simulator)
-- [ ] Capture AS interface descriptors documented from real device
-
-### Phase 3 — Live Audio Streaming
-- [ ] SET_CUR sample rate 48kHz accepted
-- [ ] Interface claim + alt setting works
-- [ ] Isochronous OUT transfers submit without errors
-- [ ] Feedback endpoint receives data (log format and values)
-- [ ] Implement feedback-based packet size adjustment
-- [ ] Test tone plays through miniDSP
-- [ ] 48kHz/24-bit/stereo sustained for 30+ seconds
-- [ ] Disconnect/reconnect recovery
+### Phase 0B — Real miniDSP Verification (needs powered USB hub + miniDSP)
+- [ ] Full config descriptor captured from real miniDSP 2x4 HD
+- [ ] Enumeration and clock queries succeed on real device
+- [ ] Streaming works on real device (may need POST-SET_INTERFACE delay)
+- [ ] Feedback format confirmed (3-byte 10.14 vs 4-byte 16.16)
 
 ### Phase 4 — Polish + Integration
 - [ ] Proper URB in-flight tracking for clean shutdown

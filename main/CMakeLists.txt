@@ -1,3 +1,4 @@
-idf_component_register(SRCS "main.c" "uac2_desc.c" "uac2_host.c" "tone_gen.c"
+idf_component_register(SRCS "main.c" "tone_gen.c"
                        INCLUDE_DIRS "."
-                       PRIV_REQUIRES usb esp_ringbuf)
+                       PRIV_INCLUDE_DIRS "../ref"
+                       PRIV_REQUIRES uac2_host usb)

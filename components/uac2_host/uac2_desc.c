@@ -66,9 +66,9 @@ static inline uint32_t read_u32(const uint8_t *p)
 
 static void parse_ac_header(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 9) return;  // UAC2 AC header minimum
     info->bcdADC = read_u16(&desc[3]);
     info->category = desc[5];
-    // wTotalLength at desc[6..7], bmControls at desc[8]
 
     if (info->bcdADC >= 0x0200) {
         info->is_uac2 = true;
@@ -77,6 +77,7 @@ static void parse_ac_header(const uint8_t *desc, uac2_device_info_t *info)
 
 static void parse_clock_source(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 8) return;  // UAC2 Clock Source minimum
     if (info->num_clock_sources >= UAC2_MAX_CLOCK_SOURCES) return;
     uac2_clock_source_t *cs = &info->clock_sources[info->num_clock_sources++];
     cs->clock_id = desc[3];
@@ -87,53 +88,58 @@ static void parse_clock_source(const uint8_t *desc, uac2_device_info_t *info)
 
 static void parse_clock_selector(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 7) return;  // minimum: 7 + bNrInPins
     if (info->num_clock_selectors >= UAC2_MAX_CLOCK_SELECTORS) return;
     uac2_clock_selector_t *cx = &info->clock_selectors[info->num_clock_selectors++];
     cx->clock_id = desc[3];
     cx->nr_pins = desc[4];
     for (int i = 0; i < cx->nr_pins && i < 4; i++) {
+        if (5 + i >= desc[0]) break;  // bounds check against bLength
         cx->source_ids[i] = desc[5 + i];
     }
 }
 
 static void parse_input_terminal(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 17) return;  // UAC2 Input Terminal minimum
     if (info->num_terminals >= UAC2_MAX_TERMINALS) return;
     uac2_terminal_t *t = &info->terminals[info->num_terminals++];
     t->is_input = true;
     t->terminal_id = desc[3];
     t->terminal_type = read_u16(&desc[4]);
-    // bAssocTerminal at desc[6]
     t->clock_source_id = desc[7];
     t->nr_channels = desc[8];
-    t->source_id = 0; // not applicable for input terminals
+    t->source_id = 0;
 }
 
 static void parse_output_terminal(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 12) return;  // UAC2 Output Terminal minimum
     if (info->num_terminals >= UAC2_MAX_TERMINALS) return;
     uac2_terminal_t *t = &info->terminals[info->num_terminals++];
     t->is_input = false;
     t->terminal_id = desc[3];
     t->terminal_type = read_u16(&desc[4]);
-    // bAssocTerminal at desc[6]
     t->source_id = desc[7];
     t->clock_source_id = desc[8];
-    t->nr_channels = 0; // output terminals don't declare channels
+    t->nr_channels = 0;
 }
 
 static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 10) return;  // minimum: header(6) + 1 bmaControls(4)
     if (info->num_feature_units >= UAC2_MAX_FEATURE_UNITS) return;
     uac2_feature_unit_t *fu = &info->feature_units[info->num_feature_units++];
     fu->unit_id = desc[3];
     fu->source_id = desc[4];
-    // bmaControls are 4 bytes each, starting at offset 5
-    // Number of channels = (bLength - 6) / 4 - 1 (subtract master)
     uint8_t bLength = desc[0];
-    int controls_bytes = bLength - 6; // 5 bytes header + 1 byte iFeature
-    fu->nr_channels = (controls_bytes / 4) - 1; // subtract master control
-    if (fu->nr_channels > 32) fu->nr_channels = 0; // sanity check
+    int controls_bytes = bLength - 6;
+    if (controls_bytes < 4) {
+        fu->nr_channels = 0;
+    } else {
+        fu->nr_channels = (controls_bytes / 4) - 1;
+        if (fu->nr_channels > 32) fu->nr_channels = 0;
+    }
 }
 
 static void parse_ac_entity(const uint8_t *desc, uac2_device_info_t *info)
@@ -169,16 +175,15 @@ static void parse_ac_entity(const uint8_t *desc, uac2_device_info_t *info)
 
 static void parse_as_general(const uint8_t *desc, uac2_as_iface_t *as)
 {
+    if (desc[0] < 16) return;  // UAC2 AS General minimum
     as->terminal_link = desc[3];
-    // bmControls at desc[4]
     as->format_type = desc[5];
-    // bmFormats at desc[6..9]
     as->nr_channels = desc[10];
-    // bmChannelConfig at desc[11..14]
 }
 
 static void parse_format_type_i(const uint8_t *desc, uac2_as_iface_t *as)
 {
+    if (desc[0] < 6) return;  // Format Type I minimum
     as->sub_slot_size = desc[4];
     as->bit_resolution = desc[5];
 }

@@ -171,6 +171,13 @@ esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
                                 uint32_t *bytes_read,
                                 uint32_t timeout_ms);
 
+/**
+ * Get the hardware timestamp (microseconds) of when the first isochronous
+ * URB was submitted for the active TX stream. Returns 0 if no stream is active.
+ * Used by callers that need precise playback start timing (e.g., measurement sweeps).
+ */
+int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev);
+
 // ── Volume / Mute ──────────────────────────────────────────────────
 
 /**

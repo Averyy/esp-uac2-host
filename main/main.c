@@ -15,13 +15,24 @@
 #include "usb/usb_host.h"
 #include "uac2_desc.h"
 #include "uac2_host.h"
+#include "tone_gen.h"
 
-// Include the static miniDSP descriptor dump for self-test
-#include "../../ref/minidsp_2x4hd_descriptors.h"
+// Static miniDSP descriptor dump for self-test (ref/ added to include path in CMakeLists)
+#include "minidsp_2x4hd_descriptors.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
 #define CLASS_TASK_STACK_SIZE   (6 * 1024)
+#define DEV_TASK_STACK_SIZE     (10 * 1024)
+
+// Tone test config
+#define TONE_SAMPLE_RATE    48000
+#define TONE_CHANNELS       2
+#define TONE_BIT_DEPTH      24
+#define TONE_FREQ_HZ        1000.0f
+#define TONE_AMPLITUDE      0.5f
+#define TONE_BUF_MS         10
+#define TONE_BUF_SIZE       ((TONE_SAMPLE_RATE / 1000) * TONE_BUF_MS * TONE_CHANNELS * (TONE_BIT_DEPTH / 8))
 
 static const char *TAG = "uac2-host";
 
@@ -113,7 +124,8 @@ typedef struct {
     usb_device_handle_t dev_hdl;
     uac2_host_device_handle_t uac2_dev;
     uint8_t dev_addr;
-    bool dev_connected;
+    volatile bool dev_connected;
+    volatile TaskHandle_t dev_task_hdl;
 } class_driver_t;
 
 static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
@@ -127,11 +139,6 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
         driver->dev_connected = true;
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
-        // TODO(hardware): Test hot-unplug during active streaming. The disconnect
-        // event sets dev_connected=false, then the main loop calls handle_device_gone()
-        // which closes the UAC2 device (stopping streams). But if isochronous callbacks
-        // are still in-flight when we enter handle_device_gone(), there's a window where
-        // the callback accesses freed memory. See stream_stop TODO for tracking fix.
         ESP_LOGW(TAG, "Device disconnected");
         driver->dev_connected = false;
         break;
@@ -159,6 +166,194 @@ static void uac2_event_cb(uac2_host_device_handle_t dev,
     }
 }
 
+// ── Streaming test helpers ─────────────────────────────────────────
+
+/**
+ * Stream a tone for `duration_sec` seconds. Returns number of seconds streamed,
+ * or 0 on failure. Exits early if device disconnects.
+ */
+static int stream_tone(class_driver_t *driver, uint32_t sample_rate,
+                       float freq_hz, int duration_sec)
+{
+    uac2_stream_config_t stream_cfg = {
+        .sample_rate = sample_rate,
+        .channels = TONE_CHANNELS,
+        .bit_resolution = TONE_BIT_DEPTH,
+    };
+    esp_err_t err = uac2_host_stream_start(driver->uac2_dev, UAC2_STREAM_TX,
+                                            &stream_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Stream start failed: %s", esp_err_to_name(err));
+        return 0;
+    }
+
+    uint32_t bytes_per_ms = (sample_rate / 1000) * TONE_CHANNELS * (TONE_BIT_DEPTH / 8);
+    uint32_t buf_size = bytes_per_ms * TONE_BUF_MS;
+
+    ESP_LOGI(TAG, "Streaming %d Hz @ %lu Hz for %d sec (pkt=%lu bytes)",
+             (int)freq_hz, (unsigned long)sample_rate, duration_sec,
+             (unsigned long)bytes_per_ms);
+
+    tone_gen_t gen;
+    tone_gen_config_t tone_cfg = {
+        .sample_rate = sample_rate,
+        .channels = TONE_CHANNELS,
+        .bit_depth = TONE_BIT_DEPTH,
+        .frequency = freq_hz,
+        .amplitude = TONE_AMPLITUDE,
+    };
+    tone_gen_init(&gen, &tone_cfg);
+
+    uint8_t tone_buf[TONE_BUF_SIZE];
+    if (buf_size > TONE_BUF_SIZE) {
+        ESP_LOGE(TAG, "Sample rate too high for tone buffer");
+        uac2_host_stream_stop(driver->uac2_dev, UAC2_STREAM_TX);
+        return 0;
+    }
+    uint32_t writes = 0;
+    uint32_t writes_per_sec = 1000 / TONE_BUF_MS;
+    uint32_t target_writes = (uint32_t)duration_sec * writes_per_sec;
+
+    // Pre-fill ring buffer (~50ms)
+    for (int i = 0; i < 50 / TONE_BUF_MS && driver->dev_connected; i++) {
+        tone_gen_fill(&gen, tone_buf, buf_size);
+        uac2_host_stream_write(driver->uac2_dev, tone_buf, buf_size, 100);
+    }
+
+    while (driver->dev_connected && writes < target_writes) {
+        tone_gen_fill(&gen, tone_buf, buf_size);
+        esp_err_t wr = uac2_host_stream_write(driver->uac2_dev,
+                                               tone_buf, buf_size, 100);
+        if (wr == ESP_ERR_INVALID_STATE) break;
+        if (wr == ESP_OK) {
+            writes++;
+            if (writes % writes_per_sec == 0) {
+                ESP_LOGI(TAG, "  %lu sec",
+                         (unsigned long)(writes / writes_per_sec));
+            }
+        }
+    }
+
+    int seconds = (int)(writes / writes_per_sec);
+    uac2_host_stream_stop(driver->uac2_dev, UAC2_STREAM_TX);
+    ESP_LOGI(TAG, "Stream stopped after %d sec", seconds);
+    return seconds;
+}
+
+static void run_stream_tests(class_driver_t *driver)
+{
+    esp_err_t err;
+
+    // ── Test 1: Basic streaming (10 seconds) ──
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== TEST 1: Basic 48kHz streaming (10 sec) ===");
+    int sec = stream_tone(driver, 48000, 1000.0f, 10);
+    if (!driver->dev_connected) return;
+    ESP_LOGI(TAG, "=== TEST 1: %s (%d sec) ===", sec >= 10 ? "PASS" : "FAIL", sec);
+
+    // ── Test 2: Volume/mute during streaming ──
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== TEST 2: Volume/mute control during streaming ===");
+
+    uac2_stream_config_t stream_cfg = {
+        .sample_rate = TONE_SAMPLE_RATE,
+        .channels = TONE_CHANNELS,
+        .bit_resolution = TONE_BIT_DEPTH,
+    };
+    err = uac2_host_stream_start(driver->uac2_dev, UAC2_STREAM_TX, &stream_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "=== TEST 2: FAIL (stream start: %s) ===", esp_err_to_name(err));
+    } else {
+        tone_gen_t gen;
+        tone_gen_config_t tone_cfg = {
+            .sample_rate = TONE_SAMPLE_RATE, .channels = TONE_CHANNELS,
+            .bit_depth = TONE_BIT_DEPTH, .frequency = TONE_FREQ_HZ,
+            .amplitude = TONE_AMPLITUDE,
+        };
+        tone_gen_init(&gen, &tone_cfg);
+
+        uint8_t tone_buf[TONE_BUF_SIZE];
+        bool test2_pass = true;
+
+        // Pre-fill
+        for (int i = 0; i < 50 / TONE_BUF_MS && driver->dev_connected; i++) {
+            tone_gen_fill(&gen, tone_buf, sizeof(tone_buf));
+            uac2_host_stream_write(driver->uac2_dev, tone_buf, sizeof(tone_buf), 100);
+        }
+
+        // Stream for 2 seconds while testing controls
+        uint32_t writes = 0;
+        uint32_t writes_per_sec = 1000 / TONE_BUF_MS;
+        while (driver->dev_connected && writes < 2 * writes_per_sec) {
+            tone_gen_fill(&gen, tone_buf, sizeof(tone_buf));
+            esp_err_t wr = uac2_host_stream_write(driver->uac2_dev,
+                                                   tone_buf, sizeof(tone_buf), 100);
+            if (wr == ESP_ERR_INVALID_STATE) break;
+            if (wr == ESP_OK) writes++;
+
+            // At 0.5s: set mute
+            if (writes == writes_per_sec / 2) {
+                err = uac2_host_set_mute(driver->uac2_dev, 0, true);
+                ESP_LOGI(TAG, "  Set mute=true: %s", esp_err_to_name(err));
+                if (err != ESP_OK) test2_pass = false;
+            }
+            // At 1.0s: clear mute, set volume
+            if (writes == writes_per_sec) {
+                err = uac2_host_set_mute(driver->uac2_dev, 0, false);
+                ESP_LOGI(TAG, "  Set mute=false: %s", esp_err_to_name(err));
+                if (err != ESP_OK) test2_pass = false;
+
+                err = uac2_host_set_volume(driver->uac2_dev, 0, -12 * 256);
+                ESP_LOGI(TAG, "  Set volume=-12dB: %s", esp_err_to_name(err));
+                if (err != ESP_OK) test2_pass = false;
+            }
+            // At 1.5s: read back volume
+            if (writes == writes_per_sec + writes_per_sec / 2) {
+                int16_t vol = 0;
+                err = uac2_host_get_volume(driver->uac2_dev, 0, &vol);
+                ESP_LOGI(TAG, "  Get volume: %d (1/256 dB), err=%s",
+                         vol, esp_err_to_name(err));
+                if (err != ESP_OK) test2_pass = false;
+            }
+        }
+
+        uac2_host_stream_stop(driver->uac2_dev, UAC2_STREAM_TX);
+        if (!driver->dev_connected) return;
+        ESP_LOGI(TAG, "=== TEST 2: %s ===", test2_pass ? "PASS" : "FAIL");
+    }
+
+    // ── Test 3: Stop/restart cycle ──
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== TEST 3: Stop/restart cycle (5s -> stop -> 2s wait -> 5s) ===");
+    sec = stream_tone(driver, 48000, 440.0f, 5);
+    if (!driver->dev_connected) return;
+    bool test3_pass = (sec >= 5);
+
+    ESP_LOGI(TAG, "  Pausing 2 seconds...");
+    for (int i = 0; i < 20 && driver->dev_connected; i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (!driver->dev_connected) return;
+
+    sec = stream_tone(driver, 48000, 880.0f, 5);
+    if (!driver->dev_connected) return;
+    test3_pass = test3_pass && (sec >= 5);
+    ESP_LOGI(TAG, "=== TEST 3: %s ===", test3_pass ? "PASS" : "FAIL");
+
+    // ── Test 4: 44.1kHz sample rate ──
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== TEST 4: 44.1kHz streaming (5 sec) ===");
+    sec = stream_tone(driver, 44100, 1000.0f, 5);
+    if (!driver->dev_connected) return;
+    ESP_LOGI(TAG, "=== TEST 4: %s (%d sec) ===", sec >= 5 ? "PASS" : "FAIL", sec);
+
+    // ── Test 5: Long-running stability (streams until disconnect) ──
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "=== TEST 5: Long-running stability (until disconnect) ===");
+    stream_tone(driver, 48000, 1000.0f, 3600);  // 1 hour max
+    ESP_LOGI(TAG, "=== TEST 5: ended (disconnect or timeout) ===");
+}
+
 static void handle_new_device_task(void *arg);
 
 static void handle_new_device(class_driver_t *driver)
@@ -167,8 +362,15 @@ static void handle_new_device(class_driver_t *driver)
     // Control transfers complete via callbacks dispatched by
     // usb_host_client_handle_events(), which we can't call while blocked
     // on a semaphore in the same task.
-    xTaskCreatePinnedToCore(handle_new_device_task, "new_dev", 4096,
-                            driver, CLASS_TASK_PRIORITY + 1, NULL, 0);
+    TaskHandle_t task_hdl = NULL;
+    BaseType_t ret = xTaskCreatePinnedToCore(handle_new_device_task, "uac2_dev",
+                                              DEV_TASK_STACK_SIZE, driver,
+                                              CLASS_TASK_PRIORITY + 1, &task_hdl, 0);
+    if (ret == pdPASS) {
+        driver->dev_task_hdl = task_hdl;
+    } else {
+        ESP_LOGE(TAG, "Failed to create device task");
+    }
 }
 
 static void handle_new_device_task(void *arg)
@@ -180,17 +382,28 @@ static void handle_new_device_task(void *arg)
     err = usb_host_device_open(driver->client_hdl, driver->dev_addr, &driver->dev_hdl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open device: %s", esp_err_to_name(err));
+        driver->dev_task_hdl = NULL;
+        vTaskDelete(NULL);
         return;
     }
 
     // Device info
     usb_device_info_t dev_info;
-    ESP_ERROR_CHECK(usb_host_device_info(driver->dev_hdl, &dev_info));
-    ESP_LOGI(TAG, "Device info: %s speed", (char *[]){"Low", "Full", "High"}[dev_info.speed]);
+    err = usb_host_device_info(driver->dev_hdl, &dev_info);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Device info failed: %s", esp_err_to_name(err));
+        goto done;
+    }
+    ESP_LOGI(TAG, "Device info: %s speed",
+             dev_info.speed <= 2 ? (char *[]){"Low", "Full", "High"}[dev_info.speed] : "Unknown");
 
     // Device descriptor
     const usb_device_desc_t *dev_desc;
-    ESP_ERROR_CHECK(usb_host_get_device_descriptor(driver->dev_hdl, &dev_desc));
+    err = usb_host_get_device_descriptor(driver->dev_hdl, &dev_desc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Device descriptor failed: %s", esp_err_to_name(err));
+        goto done;
+    }
     ESP_LOGI(TAG, "  VID=0x%04X  PID=0x%04X  Class=0x%02X",
              dev_desc->idVendor, dev_desc->idProduct, dev_desc->bDeviceClass);
 
@@ -204,9 +417,9 @@ static void handle_new_device_task(void *arg)
 
     // Try to open as UAC2 device
     err = uac2_host_device_open(driver->client_hdl, driver->dev_hdl,
-                                uac2_event_cb, NULL, &driver->uac2_dev);
+                                uac2_event_cb, driver, &driver->uac2_dev);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "*** UAC2 device opened successfully ***");
+        ESP_LOGI(TAG, "*** UAC2 device opened ***");
 
         // Query clock info
         uint32_t sample_rate = 0;
@@ -231,19 +444,40 @@ static void handle_new_device_task(void *arg)
         if (err == ESP_OK) {
             ESP_LOGI(TAG, "Clock valid: %s", clock_valid ? "yes" : "no");
         }
+
+        // ── Test suite: stream, stop/restart, volume, sample rates ──
+
+        ESP_LOGI(TAG, "--- Enumeration complete, running test suite ---");
+        run_stream_tests(driver);
+
     } else if (err == ESP_ERR_NOT_SUPPORTED) {
         ESP_LOGI(TAG, "Not a UAC2 device");
     } else {
         ESP_LOGE(TAG, "UAC2 open failed: %s", esp_err_to_name(err));
     }
 
-    ESP_LOGI(TAG, "--- Enumeration complete ---");
+done:
+    ESP_LOGI(TAG, "--- Device task exiting ---");
+    driver->dev_task_hdl = NULL;
     vTaskDelete(NULL);
 }
 
 static void handle_device_gone(class_driver_t *driver)
 {
-    // Close UAC2 device first
+    // Wait for the device task to exit. While waiting, keep processing USB events
+    // so that cancelled URB callbacks fire (stream_stop releases the interface which
+    // cancels URBs — those callbacks must be delivered before stream_stop frees them).
+    if (driver->dev_task_hdl) {
+        ESP_LOGI(TAG, "Waiting for device task to exit...");
+        for (int i = 0; i < 20 && driver->dev_task_hdl != NULL; i++) {
+            usb_host_client_handle_events(driver->client_hdl, pdMS_TO_TICKS(50));
+        }
+        if (driver->dev_task_hdl) {
+            ESP_LOGW(TAG, "Device task did not exit in time");
+        }
+    }
+
+    // Close UAC2 device (streams already stopped by device task)
     if (driver->uac2_dev) {
         uac2_host_device_close(driver->uac2_dev);
         driver->uac2_dev = NULL;
@@ -264,6 +498,7 @@ static void class_driver_task(void *arg)
         .uac2_dev = NULL,
         .dev_addr = 0,
         .dev_connected = false,
+        .dev_task_hdl = NULL,
     };
 
     ESP_LOGI(TAG, "Registering USB Host client");
@@ -281,7 +516,7 @@ static void class_driver_task(void *arg)
     while (1) {
         usb_host_client_handle_events(driver.client_hdl, portMAX_DELAY);
 
-        if (driver.dev_connected && driver.dev_hdl == NULL) {
+        if (driver.dev_connected && driver.dev_hdl == NULL && driver.dev_task_hdl == NULL) {
             handle_new_device(&driver);
         }
 
@@ -333,7 +568,7 @@ void app_main(void)
                             HOST_LIB_TASK_PRIORITY, &host_task_hdl, 0);
 
     // Wait for the library to finish installing
-    ulTaskNotifyTake(false, pdMS_TO_TICKS(1000));
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
 
     // Start class driver task
     xTaskCreatePinnedToCore(class_driver_task, "class_drv", CLASS_TASK_STACK_SIZE,

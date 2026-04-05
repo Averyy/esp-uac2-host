@@ -34,13 +34,52 @@ idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor
 ```
 
+## Wiring Diagram
+
+Three USB-C cables connect two ESP32-S3-DevKitC-1 boards to each other and to a Mac/PC.
+
+```
+                        Mac / PC
+                 ┌─────────────────────┐
+                 │                     │
+                 │  USB-A    USB-A     │
+                 └───┬─────────┬───────┘
+          Cable 1    │         │    Cable 2
+       (flash/serial)│         │(flash/serial)
+                     │         │
+                     ▼         ▼
+              RIGHT port    RIGHT port
+              (UART/CH340)  (UART/CH340)
+            ┌──────────┐  ┌──────────┐
+            │          │  │          │
+            │   HOST   │  │SIMULATOR │
+            │  ESP32   │  │  ESP32   │
+            │          │  │          │
+            └──────────┘  └──────────┘
+              LEFT port     LEFT port
+              (USB OTG)     (USB OTG)
+                  │             │
+                  └──────┬──────┘
+                         │
+                      Cable 3
+                   (USB audio data)
+```
+
+**Cable 1:** Mac/PC USB port  -->  Host ESP32 **RIGHT** port (UART)
+**Cable 2:** Mac/PC USB port  -->  Simulator ESP32 **RIGHT** port (UART)
+**Cable 3:** Host ESP32 **LEFT** port (OTG)  <-->  Simulator ESP32 **LEFT** port (OTG)
+
+**Port identification (each board has two USB-C ports):**
+- **RIGHT port** = CH340 UART bridge (VID `0x1A86`). For flashing firmware and serial monitor.
+- **LEFT port** = ESP32-S3 native USB on GPIO 19/20. For USB OTG data (host ↔ device).
+
 ## Testing with the host driver
 
-1. Flash this firmware to the "device" ESP32-S3 (green-tape board)
+1. Flash this firmware to the "device" ESP32-S3
 2. Flash the main `esp-uac2-host` firmware to the "host" ESP32-S3
 3. Connect both boards' UART ports to the Mac (for power + serial)
 4. Connect a USB-C cable between both boards' OTG ports (left side)
-5. Monitor the host board's serial output — it should enumerate the device and run UAC2 control queries
+5. Monitor the host board's serial output — it should enumerate the device, query clocks, start streaming, and log "Streamed N sec" every second
 
 ## Differences from real miniDSP 2x4 HD
 

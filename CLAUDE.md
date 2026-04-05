@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**Phase 2 complete + live UAC2 tested.** Descriptor parser, control requests (CUR/RANGE), streaming state machine, ring buffer, and public API all built and verified. UAC2 control requests tested end-to-end against ESP32-to-ESP32 simulator (TinyUSB device mimicking miniDSP 2x4 HD). Isochronous streaming pending live test with powered USB hub + real miniDSP. See `PROGRESS.md` for detailed status and `TODO(hardware)` markers in source for known issues.
+**Phase 3 complete — isochronous streaming verified.** Full driver stack working end-to-end: descriptor parser, control requests (CUR/RANGE), isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Tested against ESP32-to-ESP32 simulator (TinyUSB device mimicking miniDSP 2x4 HD): 48kHz/24-bit/stereo sustained 40+ seconds with zero errors. Next: test with real miniDSP 2x4 HD. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 

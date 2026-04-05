@@ -6,14 +6,20 @@
  */
 
 #include <string.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/ringbuf.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "usb/usb_host.h"
 #include "uac2_host.h"
 
 static const char *TAG = "uac2-host-drv";
+
+// Spinlock for stream state transitions (protects state checks in callbacks
+// from racing with stream_stop)
+static portMUX_TYPE uac2_stream_lock = portMUX_INITIALIZER_UNLOCKED;
 
 // ── UAC2 control request constants ─────────────────────────────────
 // UAC2_REQUEST_CUR, UAC2_REQUEST_RANGE, UAC2_CS_SAM_FREQ_CONTROL,
@@ -58,10 +64,15 @@ typedef struct {
     uint8_t  fb_ep_addr;        // 0 if no feedback
     usb_transfer_t *fb_xfer;
     uint32_t fb_value;          // latest feedback in 16.16 format
+    uint32_t fb_accumulator;    // fractional sample accumulator for adaptive sizing
 
     // Isochronous URBs
     usb_transfer_t *xfer[UAC2_NUM_ISOC_URBS];
     int xfer_count;
+    atomic_int urbs_in_flight;      // decremented by callbacks, waited on by stream_stop
+
+    // Timing
+    int64_t first_frame_us;         // esp_timer_get_time() when first URB submitted (0 = not yet)
 
     // Ring buffer
     RingbufHandle_t ringbuf;
@@ -142,6 +153,13 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
     setup->wIndex = w_index;
     setup->wLength = w_length;
 
+    // Bounds check: prevent buffer overflow on data copy
+    if (w_length > UAC2_CTRL_XFER_MAX_SIZE) {
+        ESP_LOGE(TAG, "Control data too large: %d > %d", w_length, UAC2_CTRL_XFER_MAX_SIZE);
+        xSemaphoreGive(dev->ctrl_mutex);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     // Copy OUT data after setup packet
     if (data_out && w_length > 0) {
         memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data_out, w_length);
@@ -164,6 +182,10 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
     // Wait for completion
     if (xSemaphoreTake(dev->ctrl_xfer_done, pdMS_TO_TICKS(UAC2_CTRL_XFER_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Control transfer timeout");
+        // Drain any late callback signal to prevent next transfer from seeing stale data.
+        // The USB transfer may still complete after our timeout — when its callback fires
+        // and signals the semaphore, we don't want the NEXT ctrl_request to see it.
+        xSemaphoreTake(dev->ctrl_xfer_done, pdMS_TO_TICKS(100));
         xSemaphoreGive(dev->ctrl_mutex);
         return ESP_ERR_TIMEOUT;
     }
@@ -174,9 +196,8 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
         return ESP_FAIL;
     }
 
-    // Note: mutex is released by caller after reading response data
-    // (ctrl_set_cur releases immediately, ctrl_get_cur/range reads then releases)
-    xSemaphoreGive(dev->ctrl_mutex);
+    // Mutex stays held — caller must release after reading response data.
+    // ctrl_set_cur releases immediately; ctrl_get_cur/range copy data then release.
     return ESP_OK;
 }
 
@@ -199,8 +220,12 @@ static esp_err_t ctrl_set_cur(uac2_host_device_handle_t dev,
 {
     uint16_t w_value = (control_selector << 8) | channel;
     uint16_t w_index = (entity_id << 8) | dev->ac_iface_num;
-    return ctrl_request(dev, UAC2_CTRL_SET, UAC2_REQUEST_CUR,
-                        w_value, w_index, len, data);
+    esp_err_t err = ctrl_request(dev, UAC2_CTRL_SET, UAC2_REQUEST_CUR,
+                                  w_value, w_index, len, data);
+    if (err == ESP_OK) {
+        xSemaphoreGive(dev->ctrl_mutex);
+    }
+    return err;
 }
 
 static esp_err_t ctrl_get_cur(uac2_host_device_handle_t dev,
@@ -214,12 +239,15 @@ static esp_err_t ctrl_get_cur(uac2_host_device_handle_t dev,
 
     esp_err_t err = ctrl_request(dev, UAC2_CTRL_GET, UAC2_REQUEST_CUR,
                                  w_value, w_index, len, NULL);
-    if (err == ESP_OK && data) {
-        int actual = ctrl_get_actual_len(dev);
-        int copy_len = actual < len ? actual : len;
-        if (copy_len > 0) {
-            memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+    if (err == ESP_OK) {
+        if (data) {
+            int actual = ctrl_get_actual_len(dev);
+            int copy_len = actual < len ? actual : len;
+            if (copy_len > 0) {
+                memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+            }
         }
+        xSemaphoreGive(dev->ctrl_mutex);
     }
     return err;
 }
@@ -235,12 +263,15 @@ static esp_err_t ctrl_get_range(uac2_host_device_handle_t dev,
 
     esp_err_t err = ctrl_request(dev, UAC2_CTRL_GET, UAC2_REQUEST_RANGE,
                                  w_value, w_index, len, NULL);
-    if (err == ESP_OK && data) {
-        int actual = ctrl_get_actual_len(dev);
-        int copy_len = actual < len ? actual : len;
-        if (copy_len > 0) {
-            memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+    if (err == ESP_OK) {
+        if (data) {
+            int actual = ctrl_get_actual_len(dev);
+            int copy_len = actual < len ? actual : len;
+            if (copy_len > 0) {
+                memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+            }
         }
+        xSemaphoreGive(dev->ctrl_mutex);
     }
     return err;
 }
@@ -256,18 +287,23 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->tx_stream;
 
-    if (!stream || stream->state != UAC2_STREAM_STATE_ACTIVE) {
+    portENTER_CRITICAL(&uac2_stream_lock);
+    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    portEXIT_CRITICAL(&uac2_stream_lock);
+
+    if (!active) {
+        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 
     switch (xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED:
-        // Resubmit with fresh data from ring buffer
         stream_tx_xfer_submit(stream, dev, xfer);
         break;
 
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
 
     default:
@@ -275,7 +311,6 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
         if (dev->event_cb) {
             dev->event_cb(dev, UAC2_HOST_EVENT_TRANSFER_ERROR, dev->event_cb_arg);
         }
-        // Try to resubmit anyway
         stream_tx_xfer_submit(stream, dev, xfer);
         break;
     }
@@ -290,14 +325,27 @@ static void stream_tx_xfer_submit(uac2_stream_t *stream,
     }
 
     size_t item_size = 0;
-    // TODO(hardware): Use feedback value (stream->fb_value) to adjust samples per
-    // frame. At 48kHz FS, nominal is 48 samples/frame (288 bytes for 24-bit stereo).
-    // Feedback tells us the device's actual rate — if it says 48.001, occasionally
-    // send 49 samples (294 bytes) to prevent device buffer underrun. The pattern is
-    // to accumulate the fractional part and send an extra sample when it overflows.
-    // XMOS averages feedback over 128 SOFs (128ms). Without this, playback drifts
-    // and produces audible glitches after several seconds.
-    uint16_t pkt_size = stream->packet_size;
+
+    // Feedback-based adaptive packet sizing: the device's feedback endpoint reports
+    // its ideal samples-per-frame in 16.16 fixed-point. We accumulate the fractional
+    // part and send one extra sample when it overflows. This prevents the device's
+    // buffer from slowly under/overrunning during sustained playback.
+    uint16_t pkt_size;
+    uint32_t fb = stream->fb_value;
+    if (fb > 0) {
+        uint16_t nominal_samples = (uint16_t)(fb >> 16);
+        uint16_t fraction = (uint16_t)(fb & 0xFFFF);
+
+        stream->fb_accumulator += fraction;
+        uint16_t extra = (uint16_t)(stream->fb_accumulator >> 16);
+        stream->fb_accumulator &= 0xFFFF;
+
+        uint16_t samples_this_frame = nominal_samples + extra;
+        uint32_t raw_pkt_size = (uint32_t)samples_this_frame * stream->channels * stream->sub_slot_size;
+        pkt_size = (raw_pkt_size > stream->ep_mps) ? stream->ep_mps : (uint16_t)raw_pkt_size;
+    } else {
+        pkt_size = stream->packet_size;
+    }
 
     // Try to read one packet worth of data from ring buffer
     void *data = xRingbufferReceiveUpTo(stream->ringbuf, &item_size,
@@ -333,6 +381,7 @@ static void stream_tx_xfer_submit(uac2_stream_t *stream,
     esp_err_t err = usb_host_transfer_submit(xfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "TX submit failed: %s", esp_err_to_name(err));
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
     }
 }
 
@@ -341,7 +390,12 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->rx_stream;
 
-    if (!stream || stream->state != UAC2_STREAM_STATE_ACTIVE) {
+    portENTER_CRITICAL(&uac2_stream_lock);
+    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    portEXIT_CRITICAL(&uac2_stream_lock);
+
+    if (!active) {
+        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 
@@ -375,17 +429,28 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
         for (int i = 0; i < xfer->num_isoc_packets; i++) {
             xfer->isoc_packet_desc[i].num_bytes = stream->ep_mps;
         }
-        usb_host_transfer_submit(xfer);
+        {
+            esp_err_t sub_err = usb_host_transfer_submit(xfer);
+            if (sub_err != ESP_OK) {
+                ESP_LOGW(TAG, "RX resubmit failed: %s", esp_err_to_name(sub_err));
+            }
+        }
         break;
 
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
 
     default:
         ESP_LOGW(TAG, "RX transfer error, status=%d", xfer->status);
-        // Resubmit
-        usb_host_transfer_submit(xfer);
+        {
+            esp_err_t sub_err = usb_host_transfer_submit(xfer);
+            if (sub_err != ESP_OK) {
+                ESP_LOGW(TAG, "RX resubmit failed: %s", esp_err_to_name(sub_err));
+                atomic_fetch_sub(&stream->urbs_in_flight, 1);
+            }
+        }
         break;
     }
 }
@@ -395,7 +460,12 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->tx_stream;
 
-    if (!stream || stream->state != UAC2_STREAM_STATE_ACTIVE) {
+    portENTER_CRITICAL(&uac2_stream_lock);
+    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    portEXIT_CRITICAL(&uac2_stream_lock);
+
+    if (!active) {
+        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 
@@ -408,9 +478,11 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
         int actual = xfer->isoc_packet_desc[0].actual_num_bytes;
 
         if (actual == 4) {
-            // 16.16 format (some XMOS devices at FS)
-            uint32_t raw;
-            memcpy(&raw, xfer->data_buffer, 4);
+            // 16.16 format — deserialize little-endian explicitly
+            uint32_t raw = xfer->data_buffer[0]
+                         | ((uint32_t)xfer->data_buffer[1] << 8)
+                         | ((uint32_t)xfer->data_buffer[2] << 16)
+                         | ((uint32_t)xfer->data_buffer[3] << 24);
             stream->fb_value = raw;
         } else if (actual == 3) {
             // 10.14 format (standard FS feedback), convert to 16.16
@@ -430,7 +502,11 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
     if (stream->state == UAC2_STREAM_STATE_ACTIVE) {
         xfer->isoc_packet_desc[0].num_bytes = xfer->data_buffer_size;
         xfer->num_bytes = xfer->data_buffer_size;
-        usb_host_transfer_submit(xfer);
+        esp_err_t sub_err = usb_host_transfer_submit(xfer);
+        if (sub_err != ESP_OK) {
+            ESP_LOGW(TAG, "Feedback resubmit failed: %s", esp_err_to_name(sub_err));
+            atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        }
     }
 }
 
@@ -497,6 +573,9 @@ static esp_err_t stream_alloc(uac2_stream_t **out_stream,
     stream->ep_mps = as->ep_max_packet_size;
     stream->fb_ep_addr = as->fb_ep_addr;
     stream->fb_value = 0;
+    stream->fb_accumulator = 0;
+    atomic_init(&stream->urbs_in_flight, 0);
+    stream->first_frame_us = 0;
 
     stream->packet_size = calc_packet_size(config->sample_rate,
                                            as->nr_channels,
@@ -606,10 +685,16 @@ static esp_err_t stream_submit_urbs(uac2_stream_t *stream,
             }
         }
 
+        atomic_fetch_add(&stream->urbs_in_flight, 1);
         esp_err_t err = usb_host_transfer_submit(xfer);
         if (err != ESP_OK) {
+            atomic_fetch_sub(&stream->urbs_in_flight, 1);
             ESP_LOGE(TAG, "Failed to submit URB %d: %s", i, esp_err_to_name(err));
             return err;
+        }
+        // Capture timestamp when first data URB submits
+        if (i == 0 && stream->first_frame_us == 0) {
+            stream->first_frame_us = esp_timer_get_time();
         }
     }
 
@@ -624,8 +709,10 @@ static esp_err_t stream_submit_urbs(uac2_stream_t *stream,
         fb->num_bytes = 4;
         fb->isoc_packet_desc[0].num_bytes = 4;
 
+        atomic_fetch_add(&stream->urbs_in_flight, 1);
         esp_err_t err = usb_host_transfer_submit(fb);
         if (err != ESP_OK) {
+            atomic_fetch_sub(&stream->urbs_in_flight, 1);
             ESP_LOGW(TAG, "Feedback URB submit failed: %s", esp_err_to_name(err));
             // Non-fatal: continue without feedback
         }
@@ -983,29 +1070,44 @@ esp_err_t uac2_host_stream_stop(uac2_host_device_handle_t dev,
 
     if (!stream) return ESP_OK;
 
+    // Set state to IDLE under spinlock — callbacks check this atomically
+    portENTER_CRITICAL(&uac2_stream_lock);
     stream->state = UAC2_STREAM_STATE_IDLE;
+    portEXIT_CRITICAL(&uac2_stream_lock);
 
-    // Release interface (this cancels pending transfers)
-    // Known ESP-IDF bug (#17707): release can fail with ESP_ERR_INVALID_STATE
-    // if URBs are still in-flight. Retry after a short delay.
-    esp_err_t rel_err = usb_host_interface_release(dev->client, dev->usb_dev, stream->iface_num);
-    if (rel_err == ESP_ERR_INVALID_STATE) {
-        ESP_LOGW(TAG, "Interface release failed (URBs in-flight), retrying...");
-        vTaskDelay(pdMS_TO_TICKS(50));
-        rel_err = usb_host_interface_release(dev->client, dev->usb_dev, stream->iface_num);
-        if (rel_err != ESP_OK) {
-            ESP_LOGE(TAG, "Interface release retry failed: %s", esp_err_to_name(rel_err));
+    // Release interface (cancels pending transfers). Retry for ESP-IDF bug #17707.
+    for (int retry = 0; retry < 5; retry++) {
+        esp_err_t rel_err = usb_host_interface_release(dev->client, dev->usb_dev, stream->iface_num);
+        if (rel_err == ESP_OK) break;
+        if (rel_err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Interface release: URBs in-flight, retry %d", retry + 1);
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } else {
+            ESP_LOGE(TAG, "Interface release failed: %s", esp_err_to_name(rel_err));
+            break;
         }
     }
 
-    // TODO(hardware): Replace fixed delay with proper in-flight URB tracking.
-    // The 50ms delay is a best-effort wait for cancelled transfer callbacks to fire.
-    // A race exists: if a callback fires between state=IDLE and stream_free(), it
-    // will see state!=ACTIVE and return early (safe), but if it's mid-execution
-    // between the state check and a ringbuf access when we free, that's UAF.
-    // Proper fix: add an atomic in-flight counter, decrement in callbacks, wait
-    // for it to reach zero here. Needs live disconnect testing to validate.
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // Wait for all in-flight URBs to complete (callbacks decrement the counter)
+    int wait_ms = 0;
+    while (atomic_load(&stream->urbs_in_flight) > 0 && wait_ms < 500) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        wait_ms += 5;
+    }
+    if (atomic_load(&stream->urbs_in_flight) > 0) {
+        ESP_LOGW(TAG, "Stream stop: %d URBs still in-flight after 500ms",
+                 atomic_load(&stream->urbs_in_flight));
+    }
+
+    // Flush ring buffer before freeing
+    if (stream->ringbuf) {
+        size_t item_size = 0;
+        void *item;
+        while ((item = xRingbufferReceiveUpTo(stream->ringbuf, &item_size, 0,
+                                               stream->ringbuf_size)) != NULL) {
+            vRingbufferReturnItem(stream->ringbuf, item);
+        }
+    }
 
     stream_free(stream);
     *stream_ptr = NULL;
@@ -1054,6 +1156,12 @@ esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
     vRingbufferReturnItem(stream->ringbuf, item);
     *bytes_read = (uint32_t)item_size;
     return ESP_OK;
+}
+
+int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev)
+{
+    if (!dev || !dev->tx_stream) return 0;
+    return dev->tx_stream->first_frame_us;
 }
 
 // ── Public API: Volume / Mute ──────────────────────────────────────

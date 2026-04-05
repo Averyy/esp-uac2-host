@@ -149,43 +149,37 @@ minidsp-open (Rust on ESP-IDF) is the first consumer, calling this C component v
 
 Key test scenario: composite device (HID already claimed), 48kHz/24-bit/stereo OUT, sustained streaming.
 
-## API (Draft)
+## API (Implemented)
+
+See `components/uac2_host/include/uac2_host.h` for the full API. Summary:
 
 ```c
-// Open a UAC2 device (or UAC1 with fallback)
-esp_err_t uac2_host_device_open(uint8_t addr, uac2_host_device_handle_t *handle);
+// Device management
+esp_err_t uac2_host_device_open(client, usb_dev, cb, cb_arg, &handle);
+esp_err_t uac2_host_device_close(handle);
+esp_err_t uac2_host_device_get_info(handle, &info);
 
-// Query capabilities
-esp_err_t uac2_host_get_sample_rates(uac2_host_device_handle_t handle,
-                                      uac2_direction_t dir,
-                                      uint32_t *rates, size_t *count);
+// Clock control
+esp_err_t uac2_host_get_sample_rate(handle, &rate);
+esp_err_t uac2_host_set_sample_rate(handle, rate);
+esp_err_t uac2_host_get_sample_rate_range(handle, ranges, &count);
+esp_err_t uac2_host_get_clock_valid(handle, &valid);
 
-// Configure and start stream
-// Returns the esp_timer timestamp (microseconds) when the first frame is submitted
-esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
-                                  uac2_direction_t dir,
-                                  uint32_t sample_rate,
-                                  uint8_t bit_depth,
-                                  uint8_t channels,
-                                  int64_t *first_frame_us);
+// Streaming
+esp_err_t uac2_host_stream_start(handle, dir, &config);
+esp_err_t uac2_host_stream_stop(handle, dir);
+esp_err_t uac2_host_stream_write(handle, data, size, timeout_ms);
+esp_err_t uac2_host_stream_read(handle, data, size, &bytes_read, timeout_ms);
+int64_t   uac2_host_stream_get_start_time(handle);  // microsecond timestamp
 
-// Write audio (speaker/TX)
-esp_err_t uac2_host_device_write(uac2_host_device_handle_t handle,
-                                  const uint8_t *data, size_t len,
-                                  TickType_t timeout);
-
-// Read audio (mic/RX)
-esp_err_t uac2_host_device_read(uac2_host_device_handle_t handle,
-                                 uint8_t *data, size_t len,
-                                 TickType_t timeout);
-
-// Volume/mute
-esp_err_t uac2_host_device_set_volume(uac2_host_device_handle_t handle, uint8_t volume);
-esp_err_t uac2_host_device_set_mute(uac2_host_device_handle_t handle, bool mute);
-
-// Close
-esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle);
+// Volume/mute (raw 1/256 dB units)
+esp_err_t uac2_host_set_volume(handle, channel, volume_db256);
+esp_err_t uac2_host_get_volume(handle, channel, &volume_db256);
+esp_err_t uac2_host_set_mute(handle, channel, mute);
+esp_err_t uac2_host_get_mute(handle, channel, &mute);
 ```
+
+Note: The current API requires the caller to manage the USB Host client and device enumeration. A future release will add `uac2_host_install()`/`uac2_host_uninstall()` matching the Espressif driver pattern. See `docs/TODO-prep-driver-for-release.md`.
 
 ## Key References
 
@@ -237,9 +231,14 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle);
 - **Memory**: ~40-50 KB internal SRAM. Fits easily on ESP32-S3 alongside WiFi.
 - **Isochronous transfers**: Proven working on ESP32-S3 by esp32-rtp and usb_host_uac.
 
-## Open Questions
+## Resolved Questions
 
-- **Composite device**: Can we open both HID and Audio interfaces on the same miniDSP? ESP-IDF supports it but needs verification with this specific device.
-- **Async mode feedback**: XMOS devices use asynchronous mode (device is clock master). At Full Speed, feedback endpoint handling may differ from High Speed. May be deferrable for MVP (implicit SOF sync often works).
-- **miniDSP clock topology**: Exact layout (how many clock sources, any selectors/multipliers) unknown until Phase 0 descriptor dump.
-- **DWC_OTG disconnect recovery**: `HCCHAR.ChDis` doesn't work for isochronous channels. Need to verify the controller soft reset path works cleanly.
+- **Composite device**: ESP-IDF supports multiple USB Host clients. The UAC2 driver can coexist with HID on the same composite device. Needs final verification on real miniDSP.
+- **Async mode feedback**: Implemented. Feedback endpoint handling works at Full Speed. 3-byte (10.14) and 4-byte (16.16) formats both supported. Adaptive packet sizing via accumulator pattern.
+- **miniDSP clock topology**: Known from descriptor dump: Clock Source ID=41 (internal programmable), Clock Selector ID=40 (1 input from source 41). Single clock path.
+- **DWC_OTG disconnect recovery**: Tested. Disconnect during streaming handled cleanly via atomic in-flight URB tracking + spinlock-protected state transitions. No crashes observed.
+
+## Remaining Open Questions
+
+- **Real miniDSP hardware**: All testing so far against simulator. Need to verify with actual miniDSP 2x4 HD (descriptor match, feedback format, POST-SET_INTERFACE timing).
+- **Full config descriptor**: Simulator provides a subset. Real miniDSP has 373-byte config descriptor with HID + DFU interfaces we haven't tested parsing against.
