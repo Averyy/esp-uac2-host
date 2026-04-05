@@ -25,6 +25,7 @@
 #include "tusb.h"
 
 static const char *TAG = "minidsp-sim";
+static const DRAM_ATTR char TAG_ISR[] = "minidsp-sim";  // ISR-safe copy in DRAM
 
 // ── USB PHY init ──────────────────────────────────────────────────
 
@@ -79,9 +80,9 @@ static int16_t  pb_volume[3] = {0, 0, 0};              // 1/256 dB
 static bool     cap_mute[5] = {false, false, false, false, false};
 static int16_t  cap_volume[5] = {0, 0, 0, 0, 0};
 
-static uint32_t total_pb_bytes = 0;
-static uint32_t pb_frames_received = 0;
-static uint8_t  current_pb_alt = 0;     // 0=idle, 1=24-bit, 2=16-bit
+static volatile uint32_t total_pb_bytes = 0;
+static volatile uint32_t pb_frames_received = 0;
+static volatile uint8_t  current_pb_alt = 0;     // 0=idle, 1=24-bit, 2=16-bit
 
 // ── EEPROM state (Flash page 0xFF) ───────────────────────────────
 
@@ -184,8 +185,8 @@ tusb_desc_device_t const desc_device = {
     .idProduct          = 0x0011,       // Real miniDSP PID
     .bcdDevice          = 0x06F2,
     .iManufacturer      = 1,
-    .iProduct           = 2,
-    .iSerialNumber      = 3,
+    .iProduct           = 3,
+    .iSerialNumber      = 0,        // Real miniDSP has no serial string
     .bNumConfigurations = 1
 };
 
@@ -494,9 +495,9 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 // --- String Descriptors ---
 static char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: English
-    "miniDSP",                    // 1: Manufacturer
-    "2x4HD",                      // 2: Product (match real device)
-    "SIM00001",                   // 3: Serial
+    "miniDSP",                    // 1: Manufacturer (iManufacturer=1)
+    "",                           // 2: (unused — real device skips this index)
+    "2x4HD",                      // 3: Product (iProduct=3, matches real device)
 };
 
 static uint16_t _desc_str[33];
@@ -736,6 +737,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 }
 
 // Playback: receive audio data from host
+// NOTE: This runs in USB ISR context — only use ISR-safe functions (no ESP_LOGx, no locks).
 bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting)
 {
     (void)rhport; (void)func_id; (void)ep_out; (void)cur_alt_setting;
@@ -754,17 +756,17 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
             return true;
         }
         fault.config_switch_until = 0;  // NAK period over
-        ESP_LOGI(TAG, "Config switch delay ended, resuming audio");
+        ESP_DRAM_LOGI(TAG_ISR, "Config switch delay ended, resuming audio");
     }
 
     total_pb_bytes += n_bytes_received;
     pb_frames_received++;
 
     if (pb_frames_received % 1000 == 0) {
-        ESP_LOGI(TAG, "Playback: %lu frames, %lu bytes (alt %d)",
-                 (unsigned long)pb_frames_received,
-                 (unsigned long)total_pb_bytes,
-                 current_pb_alt);
+        ESP_DRAM_LOGI(TAG_ISR, "Playback: %lu frames, %lu bytes (alt %d)",
+                      (unsigned long)pb_frames_received,
+                      (unsigned long)total_pb_bytes,
+                      current_pb_alt);
     }
 
     // Flush received data
@@ -790,10 +792,11 @@ void tud_resume_cb(void) { ESP_LOGI(TAG, "USB: Resumed"); }
 // Decode incoming HID frame: extract payload from 64-byte frame
 // Frame: [length] [payload...] [checksum] [0xFF padding]
 // length is self-inclusive (includes length byte itself)
-static int hid_frame_decode(const uint8_t *frame, uint8_t *payload, uint8_t *payload_len)
+static int hid_frame_decode(const uint8_t *frame, uint16_t bufsize, uint8_t *payload, uint8_t *payload_len)
 {
+    if (bufsize < 2) return -1;
     uint8_t len = frame[0];
-    if (len < 2 || len > 63) return -1;     // invalid length
+    if (len < 2 || len > 63 || len >= bufsize) return -1;  // invalid or exceeds buffer
 
     // Verify checksum
     uint8_t sum = 0;
@@ -903,7 +906,38 @@ static void cmd_write_flash(const uint8_t *payload, uint8_t len, uint8_t *resp, 
 
     ESP_LOGI(TAG, "HID: WriteFlash page=0x%02X addr=0x%02X len=%d", page, addr, data_len);
 
-    if (page == 0xFE && addr == 0x00) {
+    if (page == 0xFF) {
+        // EEPROM page — write individual bytes to state
+        // Bounds check: prevent wrap past end of page
+        if ((uint16_t)addr + data_len > 256) data_len = 256 - addr;
+        for (int i = 0; i < data_len; i++) {
+            uint8_t a = addr + i;
+            uint8_t v = payload[3 + i];
+            switch (a) {
+            case 0xA1: eeprom.dsp_id = v; break;
+            case 0xD8: eeprom.current_preset = v; break;
+            case 0xD9: eeprom.current_source = v; break;
+            case 0xDA: eeprom.master_volume = v; break;
+            case 0xDB: eeprom.master_mute = v; break;
+            case 0xE0: eeprom.dirac_bypass = v; break;
+            case 0xE8: eeprom.display_idle = v; break;
+            case 0xE9: eeprom.display_brightness = v; break;
+            case 0xED: eeprom.dre_state = v; break;
+            case 0xFE: eeprom.serial_number = (eeprom.serial_number & 0x00FF) | ((uint16_t)v << 8); break;
+            case 0xFF: eeprom.serial_number = (eeprom.serial_number & 0xFF00) | v; break;
+            default:
+                // Mod tokens at 0xC8..0xD7 (4 presets × 4 bytes, big-endian)
+                if (a >= 0xC8 && a < 0xD8) {
+                    int preset = (a - 0xC8) / 4;
+                    int byte_pos = (a - 0xC8) % 4;
+                    int shift = (3 - byte_pos) * 8;
+                    eeprom.mod_tokens[preset] &= ~((uint32_t)0xFF << shift);
+                    eeprom.mod_tokens[preset] |= ((uint32_t)v << shift);
+                }
+                break;
+            }
+        }
+    } else if (page == 0xFE && addr == 0x00) {
         // Per-source volume offsets
         for (int i = 0; i < data_len && i < 3; i++) {
             source_vol_offsets[i] = (int8_t)payload[3 + i];
@@ -952,8 +986,8 @@ static void cmd_write_dsp(const uint8_t *payload, uint8_t len, uint8_t *resp, ui
 
     if (val_offset + 4 <= len) {
         float val;
-        uint32_t bits = payload[val_offset] | (payload[val_offset+1] << 8) |
-                        (payload[val_offset+2] << 16) | (payload[val_offset+3] << 24);
+        uint32_t bits = (uint32_t)payload[val_offset] | ((uint32_t)payload[val_offset+1] << 8) |
+                        ((uint32_t)payload[val_offset+2] << 16) | ((uint32_t)payload[val_offset+3] << 24);
         memcpy(&val, &bits, 4);
         dsp_param_set(addr, val);
         ESP_LOGI(TAG, "HID: WriteDSP %s addr=0x%04X val=%.6f",
@@ -976,8 +1010,8 @@ static void cmd_write_biquad(const uint8_t *payload, uint8_t len, uint8_t *resp,
     // Store 5 coefficients (b0, b1, b2, a1, a2)
     for (int i = 0; i < 5; i++) {
         int off = 6 + i * 4;
-        uint32_t bits = payload[off] | (payload[off+1] << 8) |
-                        (payload[off+2] << 16) | (payload[off+3] << 24);
+        uint32_t bits = (uint32_t)payload[off] | ((uint32_t)payload[off+1] << 8) |
+                        ((uint32_t)payload[off+2] << 16) | ((uint32_t)payload[off+3] << 24);
         float val;
         memcpy(&val, &bits, 4);
         dsp_param_set(addr + i, val);
@@ -1210,7 +1244,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
     // Decode frame
     uint8_t payload[62];
     uint8_t payload_len = 0;
-    if (hid_frame_decode(buffer, payload, &payload_len) != 0) {
+    if (hid_frame_decode(buffer, bufsize, payload, &payload_len) != 0) {
         ESP_LOGW(TAG, "HID: Frame decode failed");
         return;
     }

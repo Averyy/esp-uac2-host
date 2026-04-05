@@ -96,9 +96,23 @@
 - [x] 6-agent code review completed: all security, performance, and code quality fixes applied
 - [x] All 5 host driver tests pass against new simulator (48kHz, volume/mute, stop/restart, 44.1kHz, long-running)
 
+### SET_INTERFACE Fix + Code Hardening (April 5, 2026)
+- [x] **SET_INTERFACE crash root cause found and fixed**: `tud_audio_rx_done_isr` was calling `ESP_LOGI` (which needs locks) from USB ISR context. Replaced with ISR-safe `ESP_DRAM_LOGI`. Crash was never in DWC2 — the ISR callback worked fine once logging was fixed.
+- [x] Host driver now sends proper SET_INTERFACE to device: `ctrl_request_no_data()` auto-releases mutex
+- [x] SET_INTERFACE(alt=0) sent on stream stop (before halt/flush/clear, matching Espressif UAC1 pattern)
+- [x] SET_INTERFACE(alt=0) sent in stream_start error cleanup path
+- [x] Endpoint halt/flush/clear on stream stop
+- [x] Transfer error limiting: stops URB re-submission after 10 consecutive errors
+- [x] Fixed RX URB leak: resubmit failure now decrements `urbs_in_flight` counter
+- [x] Fixed feedback resubmit race: state re-checked under spinlock before resubmit
+- [x] Simulator receives audio frames end-to-end (487,000+ frames verified, zero errors)
+- [x] Fixed uint32_t cast UB in WriteDSP/WriteBiquad shift operations
+- [x] Fixed device descriptor: iProduct=3, iSerialNumber=0 (matches real miniDSP)
+- [x] Added WriteFlash page 0xFF handler with bounds checking
+- [x] Added HID frame decode buffer size validation
+- [x] All 5 host driver tests pass with SET_INTERFACE fully working
+
 ### Known Issues
-- [ ] **SET_INTERFACE crash**: Host sending SET_INTERFACE to simulator causes TinyUSB DWC2 abort. Currently disabled — ESP-IDF `usb_host_interface_claim` doesn't send SET_INTERFACE to the device, and the host tests pass without it. Real XMOS hardware may handle this differently. Needs investigation with real miniDSP.
-- [ ] **Simulator audio frame counting**: The simulator's `tud_audio_rx_done_isr` callback fires only when TinyUSB receives data via the activated isochronous endpoint. Without SET_INTERFACE, the endpoint isn't activated, so the callback never fires. The host streams successfully regardless (ISO OUT is fire-and-forget at FS).
 - [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
 - [ ] Feedback format confirmation (expect 3 bytes / 10.14 from XMOS at FS)
 - [ ] Full 373-byte config descriptor capture from real miniDSP (vs simulator)
@@ -110,15 +124,13 @@ See `TODO(hardware)` markers in source code for details.
 ### Phase 0B — Real miniDSP Verification (needs powered USB hub + miniDSP)
 - [ ] Full config descriptor captured from real miniDSP 2x4 HD
 - [ ] Enumeration and clock queries succeed on real device
-- [ ] Verify if real XMOS needs explicit SET_INTERFACE (may work without it like the simulator)
 - [ ] Streaming works on real device
 - [ ] Feedback format confirmed (3-byte 10.14 vs 4-byte 16.16)
 
 ### Phase 4 — Polish + Integration
-- [ ] Fix SET_INTERFACE: either fix TinyUSB DWC2 crash or find alternative for simulator
-- [ ] HID integration testing (once host driver has HID support)
-- [ ] Error recovery (transfer errors, stalls)
+- [ ] HID host driver support (for miniDSP control commands from ESP32)
 - [ ] Integration with minidsp-open Rust FFI
+- [ ] ESP-to-ESP streaming verification with real miniDSP device
 
 ## Hardware
 

@@ -24,6 +24,7 @@
 #include "tusb.h"
 
 static const char *TAG = "uac2-test-dev";
+static const DRAM_ATTR char TAG_ISR[] = "uac2-test-dev";  // ISR-safe copy in DRAM
 
 // ── USB PHY init (replaces esp_tinyusb wrapper) ────────────────────
 
@@ -410,6 +411,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     return true;
 }
 
+// NOTE: Runs in USB ISR context — only use ISR-safe functions (no ESP_LOGx, no locks).
 bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t func_id, uint8_t ep_out, uint8_t cur_alt_setting)
 {
     (void)rhport; (void)func_id; (void)ep_out; (void)cur_alt_setting;
@@ -419,9 +421,9 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
 
     // Log every 1000 frames (~1 second at 1ms per frame)
     if (audio_frames_received % 1000 == 0) {
-        ESP_LOGI(TAG, "Audio: %lu frames, %lu bytes total",
-                 (unsigned long)audio_frames_received,
-                 (unsigned long)total_audio_bytes);
+        ESP_DRAM_LOGI(TAG_ISR, "Audio: %lu frames, %lu bytes total",
+                      (unsigned long)audio_frames_received,
+                      (unsigned long)total_audio_bytes);
     }
 
     // Flush received data

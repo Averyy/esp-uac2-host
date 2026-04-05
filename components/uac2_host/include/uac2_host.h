@@ -27,6 +27,7 @@ extern "C" {
 #define UAC2_NUM_PACKETS_PER_URB    1       // Packets per URB (1 = 1ms per URB at FS)
 #define UAC2_CTRL_XFER_TIMEOUT_MS   5000
 #define UAC2_CTRL_XFER_MAX_SIZE     256     // Max control transfer data size
+#define UAC2_MAX_CONSECUTIVE_ERRORS 10      // Stop URB re-submission after this many errors
 
 // ESP32-S3 DWC_OTG FIFO limits (1024 bytes total, bias-dependent):
 //   PERIODIC_OUT bias: PTX=600, RX=128, NPTX=64

@@ -1,104 +1,88 @@
 # Prep Driver for Public Release
 
-What needs to happen before publishing `uac2_host` as a standalone ESP-IDF component (ESP Component Registry or GitHub). Ordered by priority within each section.
+What needs to happen before publishing `uac2_host` as a standalone ESP-IDF component (ESP Component Registry or GitHub). Do this AFTER real hardware verification (see `TODO-real-device-testing.md`). Ordered by priority.
 
-## Current State
+## Current State (as of 2026-04-05)
 
-The driver works end-to-end: descriptor parsing, control requests (CUR/RANGE), isochronous streaming with feedback-based adaptive packet sizing, volume/mute, disconnect handling. Tested against an ESP32-to-ESP32 simulator for 100+ seconds sustained, all sample rates, stop/restart cycles, and hot unplug/replug. Not yet tested against real miniDSP hardware.
+The driver is complete and verified end-to-end against an ESP32-to-ESP32 simulator. All 5 automated tests pass. 487,000+ audio frames received by simulator with zero errors. Full 6-agent code review completed, all critical/high/medium findings fixed.
 
-The API currently requires the caller to manage the USB Host Library client, device enumeration, and event loop. This is fine for minidsp-open (which already has a USB Host client for HID) but diverges from the standard ESP-IDF class driver pattern used by CDC-ACM, HID, MSC, and UAC1 drivers.
+**What's already solid:**
+- UAC2 descriptor parsing with bLength validation
+- SET_INTERFACE for proper endpoint lifecycle (matches Espressif UAC1 pattern)
+- Feedback-based adaptive packet sizing (10.14 and 16.16 formats)
+- `ctrl_request_no_data()` wrapper eliminates mutex leak bugs
+- Transfer error limiting (10 consecutive → stop re-submission)
+- Endpoint halt/flush/clear on stream stop
+- Atomic `fb_value`, `urbs_in_flight`, `consecutive_errors`
+- Spinlock-protected stream state transitions
+- ISR-safe logging pattern established (`ESP_DRAM_LOGI` with `DRAM_ATTR` tag)
+
+**What the API currently requires:**
+The caller manages USB Host Library client, device enumeration, and event loop. This is fine for minidsp-open (which already has a USB Host client for HID) but diverges from the standard ESP-IDF class driver pattern.
 
 ---
 
-## 1. Install/Uninstall Lifecycle (Architectural)
+## 1. Install/Uninstall Lifecycle
 
 Every official Espressif USB host class driver (CDC-ACM, HID, MSC, UAC1) follows this pattern:
 
 ```c
-// App installs the driver once at startup
 uac2_host_driver_config_t config = {
     .create_background_task = true,
     .task_priority = 5,
     .stack_size = 4096,
-    .core_id = 0,
     .callback = my_driver_event_cb,   // fires on device connect/disconnect
     .callback_arg = NULL,
 };
 uac2_host_install(&config);
 
-// Driver internally:
-// - Registers its own USB Host client
-// - Optionally creates a background task to pump usb_host_client_handle_events()
-// - Scans new devices for Audio Class + bInterfaceProtocol=0x20
-// - Fires callback with UAC2_HOST_DRIVER_EVENT_TX_CONNECTED / RX_CONNECTED
-
-// App opens a specific device/interface from the callback
+// Driver fires callback with UAC2_HOST_DRIVER_EVENT_TX_CONNECTED
+// App opens from callback:
 uac2_host_device_open(addr, iface_num, &dev_config, &handle);
 
-// At shutdown
+// Shutdown
 uac2_host_uninstall();
 ```
 
 ### What to implement
 
-- [ ] Add `uac2_host_install(const uac2_host_driver_config_t *config)` — registers USB Host client, optionally creates background task
-- [ ] Add `uac2_host_uninstall()` — verifies all devices closed, deregisters client, deletes task
-- [ ] Add `uac2_host_handle_events(TickType_t timeout)` — for manual event pumping when `create_background_task = false`
-- [ ] Add driver-level event callback with events: `UAC2_HOST_DRIVER_EVENT_TX_CONNECTED`, `UAC2_HOST_DRIVER_EVENT_RX_CONNECTED`, `UAC2_HOST_DRIVER_EVENT_DEVICE_DISCONNECTED`
-- [ ] Internal device discovery: on `USB_HOST_CLIENT_EVENT_NEW_DEV`, open device, get config descriptor, parse for UAC2 interfaces, fire callback if found
-- [ ] Internal disconnect handling: on `USB_HOST_CLIENT_EVENT_DEV_GONE`, find all open interfaces for that device, stop streams, notify app
-- [ ] Singleton driver state (`s_uac2_driver`) with linked list of open devices/interfaces
-- [ ] Change `uac2_host_device_open()` signature: take `(addr, iface_num, config, &handle)` instead of `(client, usb_dev, cb, cb_arg, &handle)`
-- [ ] Add `uac2_host_device_open_with_vid_pid()` convenience function
-- [ ] Update test harness main.c to use new API
-
-### Why
-
-- Standard ESP-IDF pattern — users expect it
-- Composite device safety — driver gets its own USB Host client, can't interfere with HID
-- Disconnect handling moves inside the driver — fewer race conditions for app code
-- Required for ESP Component Registry publishing
+- [ ] `uac2_host_install()` / `uac2_host_uninstall()` — registers USB Host client, optionally creates background task
+- [ ] `uac2_host_handle_events(timeout)` — for manual event pumping when `create_background_task = false`
+- [ ] Driver-level event callback: `UAC2_HOST_DRIVER_EVENT_TX_CONNECTED`, `RX_CONNECTED`, `DEVICE_DISCONNECTED`
+- [ ] Internal device discovery: on `USB_HOST_CLIENT_EVENT_NEW_DEV`, parse config descriptor for UAC2 interfaces
+- [ ] Internal disconnect handling: on `USB_HOST_CLIENT_EVENT_DEV_GONE`, stop streams, notify app
+- [ ] Singleton driver state with linked list of open devices
+- [ ] Change `uac2_host_device_open()` signature to `(addr, iface_num, config, &handle)`
+- [ ] `uac2_host_device_open_with_vid_pid()` convenience function
 
 ### Trade-offs
 
-- ~500 lines of new code (singleton state, linked list, task management, event dispatch)
-- Full API break — all downstream code changes
-- Makes USB event flow less visible for debugging
-- Not needed for the only current consumer (minidsp-open already has its own USB client)
+~500 lines of new code. Full API break. Not needed for minidsp-open. Only do this for public release or if other consumers appear.
 
 ---
 
 ## 2. Suspend/Resume Without Full Teardown
 
-UAC1 has a 4-state lifecycle: `IDLE -> READY -> ACTIVE -> SUSPENDING -> READY`. Key operations:
-
-- `suspend()`: SET_INTERFACE(0), flush ring buffer, return URBs to free list. Resources stay allocated.
-- `resume()`: Re-select alt setting, re-set frequency, resubmit URBs. No allocation.
-- `stop()`: Full teardown (suspend + release interface + free transfers).
-
-Our driver only has `stream_start()` (allocate everything) and `stream_stop()` (free everything). Every pause requires full teardown and reallocation.
+Currently every `stream_stop`/`stream_start` cycle reallocates URBs and ring buffer. For measurement sweeps (~12s each, with brief pauses between), this wastes time and fragments memory.
 
 ### What to implement
 
-- [ ] Add `uac2_host_stream_suspend(dev, dir)` — sets alt 0, flushes ring buffer, parks URBs. Keeps interface claimed and resources allocated.
-- [ ] Add `uac2_host_stream_resume(dev, dir)` — re-selects alt setting, resubmits URBs. No reallocation.
-- [ ] Add `READY` state between `IDLE` and `ACTIVE` for pre-claimed-but-not-streaming
-- [ ] Optional: `FLAG_STREAM_SUSPEND_AFTER_START` to claim interface and allocate without starting transfers
+- [ ] `uac2_host_stream_suspend(dev, dir)` — SET_INTERFACE(alt=0), halt/flush endpoints, park URBs. Resources stay allocated.
+- [ ] `uac2_host_stream_resume(dev, dir)` — SET_INTERFACE(alt=N), resubmit URBs. No reallocation.
+- [ ] `READY` state between `IDLE` and `ACTIVE`
+- [ ] Optional: `FLAG_STREAM_SUSPEND_AFTER_START` to pre-arm without starting transfers
 
-### Why
+### Lesson learned
 
-- Measurement sweeps are ~12s. Between sweeps, the app pauses briefly, possibly changes sample rate, then plays again. Full teardown/reallocation on every pause is slow and fragments memory on ESP32.
-- Reduces risk of allocation failure on a constrained system.
+The SET_INTERFACE ordering matters: send SET_INTERFACE(alt=0) BEFORE halt/flush/clear (device stops first, then host cleans up). Reverse order causes the device to send data into halted pipes. This was caught during code review and fixed — the suspend implementation should follow the same pattern.
 
 ---
 
-## 3. Kconfig for Build-Time Configuration
-
-All official ESP-IDF components expose tunables via `menuconfig`.
+## 3. Kconfig
 
 ### What to implement
 
-- [ ] Create `components/uac2_host/Kconfig` with:
+- [ ] Create `components/uac2_host/Kconfig`:
   ```
   menu "UAC2 Host Driver"
       config UAC2_HOST_NUM_ISOC_URBS
@@ -113,106 +97,112 @@ All official ESP-IDF components expose tunables via `menuconfig`.
       config UAC2_HOST_CTRL_XFER_MAX_SIZE
           int "Max control transfer data size"
           default 256
+      config UAC2_HOST_MAX_CONSECUTIVE_ERRORS
+          int "Max consecutive transfer errors before stopping"
+          default 10
   endmenu
   ```
-- [ ] Replace `#define UAC2_NUM_ISOC_URBS` etc. with `CONFIG_UAC2_HOST_*` references
-- [ ] Add `sdkconfig.defaults` entries if any non-default values are needed
+- [ ] Replace `#define UAC2_*` in header with `CONFIG_UAC2_HOST_*`
 
 ---
 
 ## 4. Device Handle Validation
 
-Official drivers validate every handle by walking an internal linked list before dereferencing. This catches stale/freed handles.
+Official drivers validate handles by walking an internal linked list before dereferencing. Catches stale/freed handles.
 
-### What to implement
-
-- [ ] Add `is_device_in_list(handle)` check at the top of every public API function
-- [ ] Return `ESP_ERR_INVALID_ARG` for invalid handles instead of dereferencing freed memory
+- [ ] `is_device_in_list(handle)` check at top of every public API function
+- [ ] Return `ESP_ERR_INVALID_ARG` for invalid handles
 - [ ] Requires the device linked list from section 1
 
 ---
 
-## 5. State Mutex for Public API Functions
+## 5. State Mutex for Public API
 
-UAC1 wraps every public API call in a per-interface mutex (`try_lock` / `unlock`). This prevents races like calling `set_volume()` while `stream_stop()` is tearing down.
+Code review identified that `stream_write`/`stream_read` read `stream->state` without holding any lock. A separate task calling `stream_stop` concurrently could cause issues.
 
-### What to implement
-
-- [ ] Add `SemaphoreHandle_t api_mutex` to the device struct
-- [ ] Wrap all public functions (`stream_start`, `stream_stop`, `stream_write`, `set_volume`, etc.) in `xSemaphoreTake(api_mutex)` / `xSemaphoreGive(api_mutex)`
-- [ ] Use `xSemaphoreTake` with timeout to prevent deadlocks
+- [ ] Add `SemaphoreHandle_t api_mutex` to device struct
+- [ ] Wrap all public functions in mutex take/give
+- [ ] Use timeout to prevent deadlocks
 
 ---
 
-## 6. Normalized Volume API
+## 6. Stream Dead Notification
 
-UAC1 exposes both raw dB and normalized 0-100 volume. Convenient for apps that don't want to deal with 1/256 dB units.
+When the consecutive error limit is hit and URBs stop re-submitting, the stream silently dies. The caller has no way to detect this — `stream_write` keeps accepting data into the ringbuf (which nobody drains), eventually returning `ESP_ERR_TIMEOUT`.
 
-### What to implement
-
-- [ ] Add `uac2_host_set_volume_percent(dev, channel, uint8_t percent)` — maps 0-100 to the device's reported min/max range
-- [ ] Add `uac2_host_get_volume_percent(dev, channel, uint8_t *percent)`
-- [ ] Query volume range once at device open, cache min/max
+- [ ] Fire `UAC2_HOST_EVENT_STREAM_DEAD` when error limit reached
+- [ ] Or transition state to `UAC2_STREAM_STATE_ERROR` so `stream_write`/`stream_read` return `ESP_ERR_INVALID_STATE`
 
 ---
 
-## 7. bInterfaceProtocol Check in UAC2 Detection
+## 7. UAC2_HOST_EVENT_DISCONNECTED
 
-Currently UAC2 detection relies solely on `bcdADC >= 0x0200`. The spec says UAC2 also has `bInterfaceProtocol = 0x20`. Checking both provides defense against devices with malformed AC headers.
+Currently declared in the enum but never fired. Disconnect is only detected via `USB_TRANSFER_STATUS_NO_DEVICE` in URB callbacks, which silently stops the stream.
 
-### What to implement
-
-- [ ] In the descriptor parser, also check `bInterfaceProtocol == 0x20` on the Audio Control interface
-- [ ] Use the existing `UAC2_PROTOCOL_VERSION_02_00` constant (defined but unused)
+- [ ] Fire `UAC2_HOST_EVENT_DISCONNECTED` on first `NO_DEVICE` callback (use a flag to avoid firing 3+ times for multiple in-flight URBs)
 
 ---
 
-## 8. Debug Print Function
+## 8. Normalized Volume API
 
-All official drivers have a `printf_device_param()` or similar for dumping device/interface state.
-
-### What to implement
-
-- [ ] Add `uac2_host_device_printf_info(dev)` — logs parsed descriptor topology, clock info, stream state, endpoint config
-- [ ] Useful for debugging real hardware (miniDSP, JDS Labs, etc.)
+- [ ] `uac2_host_set_volume_percent(dev, channel, uint8_t percent)` — maps 0-100 to device's min/max range
+- [ ] `uac2_host_get_volume_percent(dev, channel, &percent)`
+- [ ] Query and cache volume range at device open time
 
 ---
 
-## 9. bInterval Fixup for Full Speed
+## 9. Debug Print Function
 
-Some USB audio devices report incorrect `bInterval` values at Full Speed. UAC1 detects and patches this.
+All official drivers have descriptor/state dump functions. Extremely useful for real hardware debugging.
 
-### What to implement
-
-- [ ] During descriptor parsing, if device is Full Speed and `bInterval != 1` for isochronous endpoints, log a warning and override to 1
-- [ ] Full Speed isochronous endpoints must use `bInterval = 1` per USB 2.0 spec
+- [ ] `uac2_host_device_printf_info(dev)` — logs parsed topology, clock info, stream state, endpoints
+- [ ] Pattern: CDC-ACM has `cdc_acm_host_desc_print()`, MSC has `msc_host_print_descriptors()`
 
 ---
 
-## 10. Multi-Interface / Reference Counting
+## 10. bInterval Fixup for Full Speed
 
-UAC1 tracks `opened_cnt` per physical USB device. Multiple interfaces (TX speaker + RX mic) share one parent device struct. The USB device handle is only closed when the last interface closes.
+Some USB audio devices report incorrect `bInterval` values at Full Speed.
 
-### What to implement
+- [ ] For isochronous data endpoints at Full Speed, warn if `bInterval != 1` (USB 2.0 spec requires 1)
+- [ ] NOTE: Feedback endpoints legitimately use `bInterval > 1` (miniDSP uses bInterval=4 = 8ms). Do NOT fixup feedback endpoints.
 
-- [ ] Add reference counting per USB device (for future TX+RX on different interfaces)
-- [ ] Only call `usb_host_device_close()` when refcount reaches 0
-- [ ] Not critical until duplex support is added (ESP32-S3 FIFO limitation prevents simultaneous TX+RX anyway)
+---
+
+## 11. Component Registry Packaging
+
+- [ ] `idf_component.yml` with version, description, dependencies
+- [ ] LICENSE file in component directory
+- [ ] API documentation (Doxygen comments on all public functions in `uac2_host.h`)
+- [ ] Clean build with `-Werror -Wextra` and no warnings
 
 ---
 
 ## Testing Checklist Before Release
 
 - [ ] All items above implemented
-- [ ] Tested against real miniDSP 2x4 HD (not just simulator)
-- [ ] Tested against JDS Labs Atom DAC+ (UAC1 fallback device — should get `ESP_ERR_NOT_SUPPORTED`)
-- [ ] Tested against cheap USB sound card (UAC1 — should get `ESP_ERR_NOT_SUPPORTED`)
+- [ ] Tested against real miniDSP 2x4 HD
+- [ ] Tested against at least one other UAC2 device (to confirm generic)
 - [ ] Disconnect/reconnect stress test (10+ cycles)
 - [ ] Long-running stability (30+ minutes)
 - [ ] Memory leak check (`heap_caps_get_free_size` before/after open/close cycles)
-- [ ] Stack watermark check on all tasks (`uxTaskGetStackHighWaterMark`)
-- [ ] Clean build with `-Werror -Wextra` and no warnings
-- [ ] API documentation (Doxygen comments on all public functions)
-- [ ] README with usage example
-- [ ] LICENSE file in component directory
-- [ ] `idf_component.yml` for ESP Component Registry
+- [ ] Stack watermark check (`uxTaskGetStackHighWaterMark`)
+- [ ] `llms.txt` and `README.md` updated
+
+---
+
+## Lessons Learned (From Simulator Development)
+
+These informed the design and should be preserved:
+
+1. **ESP_LOGI in ISR = instant crash.** `tud_audio_rx_done_isr` (and any USB ISR callback) must use `ESP_DRAM_LOGI` with a `DRAM_ATTR` tag string. This was the root cause of the "SET_INTERFACE crash" that blocked development for a session.
+
+2. **`usb_host_interface_claim` does NOT send SET_INTERFACE.** It only sets up host-side pipes. A separate control transfer is required to notify the device. This is undocumented in ESP-IDF.
+
+3. **SET_INTERFACE ordering: device first, then host.** Send SET_INTERFACE(alt=0) to the device BEFORE calling halt/flush/clear on host endpoints. The Espressif UAC1 driver does this correctly; we initially had it reversed.
+
+4. **`ctrl_request` mutex protocol is a bug factory.** The pattern where `ctrl_request` holds the mutex and callers must release it led to fragile code. The `ctrl_request_no_data()` wrapper (auto-releases on success) eliminated this entire class of bugs. For public release, consider always auto-releasing and having GET callers copy data from an internal buffer.
+
+5. **URB lifecycle accounting must be airtight.** Every code path that touches a URB must correctly maintain `urbs_in_flight`. We found three separate leak paths during code review: RX resubmit failure, TX state-check bail-out, and feedback resubmit race. All fixed, but this is the most fragile part of the driver.
+
+6. **Feedback endpoint is the canary.** When something goes wrong with SET_INTERFACE or endpoint activation, the feedback endpoint fails first (it's IN direction, smaller, more timing-sensitive). If feedback works, everything works.
