@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "serial-mcp": {
+      "type": "stdio",
+      "command": "serial-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

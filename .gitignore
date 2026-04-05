@@ -1,0 +1,22 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# IDE
+.vscode/
+
+# Claude Code (local settings, not project config)
+.claude/
+
+# macOS
+.DS_Store
+
+# Compiled
+*.o
+*.a
+*.so
+*.pyc
+__pycache__/
