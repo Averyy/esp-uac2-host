@@ -1,38 +1,28 @@
 # esp-uac2-host
 
-USB Audio Class 2.0 host driver for ESP32-S3. Enables ESP32-S3 to send and receive audio to/from UAC2 USB audio devices (DACs, audio interfaces, miniDSP, XMOS-based devices).
+USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component (C).
 
-**This does not exist anywhere else.** Espressif's official `usb_host_uac` driver only supports UAC1. TinyUSB has no audio host class. CherryUSB's open-source host audio is UAC1-only. This is the first UAC2 host implementation for ESP32.
+Targets the miniDSP 2x4 HD but should work with any UAC2 device (XMOS-based DACs, audio interfaces, etc.).
 
 ## Status
 
-**Phase 0A + Phase 1 complete.** USB Host Library initializes on ESP32-S3, UAC2 descriptor parser works (tested against miniDSP 2x4 HD descriptor dump on hardware). Waiting for powered USB hub to test live device enumeration.
+Work in progress. USB Host initialization and UAC2 descriptor parsing working on hardware. Live device enumeration pending.
 
-Implementation plan in `PROJECT.md`, research in `docs/ref-research.md`.
+## Hardware
 
-## Why
+- **MCU:** ESP32-S3-DevKitC-1
+- **USB:** Full Speed (12 Mbps) — sufficient for 48kHz/24-bit/stereo
+- **Test device:** miniDSP 2x4 HD (XMOS XU216, UAC2)
 
-Any modern USB audio device (DAC, ADC, audio interface) uses UAC2. The ESP32-S3 has USB OTG with host mode and supports isochronous transfers — the hardware is capable. Only the driver is missing.
+## Building
 
-Many UAC2 devices do NOT fall back to UAC1 at Full Speed — they present UAC2 descriptors regardless of bus speed. Espressif's `usb_host_uac` can't talk to them. This driver fills that gap.
+Requires [ESP-IDF v5.4](https://docs.espressif.com/projects/esp-idf/en/v5.4/).
 
-## Target
-
-ESP32-S3 (Full Speed USB OTG, 12 Mbps).
-
-## Approach
-
-Fork the architecture of Espressif's `usb_host_uac` v1.3.3 (UAC1). The isochronous transfer plumbing, ring buffers, device enumeration, and streaming API are already proven. The delta for UAC2:
-
-- UAC2 descriptor parsing (clock source/selector/multiplier entities)
-- UAC2 control requests (CUR/RANGE vs UAC1's SET_CUR/GET_CUR)
-- `bInterfaceProtocol` 0x20 detection
-- UAC2 Format Type descriptors
-- Clock source management (explicit in UAC2, implicit in UAC1)
-
-Descriptor struct references (MIT/Apache-2.0):
-- Eclipse ThreadX USBX `ux_class_audio20.h` — complete UAC2 descriptor structs and control selectors
-- CherryUSB `usb_audio.h` — UAC2 descriptor structs alongside UAC1, well-organized for dual-version support
+```sh
+idf.py set-target esp32s3
+idf.py build
+idf.py -p /dev/cu.usbmodem* flash monitor
+```
 
 ## License
 
