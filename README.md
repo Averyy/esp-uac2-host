@@ -6,7 +6,9 @@ USB Audio Class 2.0 host driver for ESP32-S3. Enables ESP32-S3 to send and recei
 
 ## Status
 
-Not started. Implementation plan in `PROJECT.md`, research in `docs/ref-research.md`.
+**Phase 0A + Phase 1 complete.** USB Host Library initializes on ESP32-S3, UAC2 descriptor parser works (tested against miniDSP 2x4 HD descriptor dump on hardware). Waiting for powered USB hub to test live device enumeration.
+
+Implementation plan in `PROJECT.md`, research in `docs/ref-research.md`.
 
 ## Why
 
