@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**Confirmed necessary.** Research (April 2026) proves the miniDSP 2x4 HD presents UAC2 descriptors at Full Speed — it does NOT fall back to UAC1. Espressif's `usb_host_uac` (UAC1-only) will not work. No open-source UAC2 host driver exists for ESP32 on any variant. See `docs/ref-research.md` for full findings.
+**Phase 2 complete + live UAC2 tested.** Descriptor parser, control requests (CUR/RANGE), streaming state machine, ring buffer, and public API all built and verified. UAC2 control requests tested end-to-end against ESP32-to-ESP32 simulator (TinyUSB device mimicking miniDSP 2x4 HD). Isochronous streaming pending live test with powered USB hub + real miniDSP. See `PROGRESS.md` for detailed status and `TODO(hardware)` markers in source for known issues.
 
 ## Related Projects
 
@@ -32,11 +32,15 @@ C (ESP-IDF component). Targets ESP32-S3. Built on top of ESP-IDF USB Host Librar
 - The isochronous transfer layer in ESP-IDF works for audio (proven by `usb_host_uac` UAC1 driver and `esp32-rtp` community project, 78 stars).
 - Memory footprint estimate: ~40-50 KB internal SRAM (driver + ring buffers + URBs). ESP32-S3 has ~200-280 KB free after WiFi.
 - The JDS Labs Atom DAC+ has confirmed UAC1 fallback at Full Speed (`XUA_AUDIO_CLASS_FS=1`). Useful as a UAC1 comparison/baseline device.
+- **XMOS feedback at FS**: 3 bytes, 10.14 format (not 4 bytes despite wMaxPacketSize=4). Arrives every 8ms (bInterval=4). Averaged over 128 SOFs internally.
+- **ESP32-S3 FIFO limitation**: Total 1024 bytes. With PERIODIC_OUT bias: PTX=600 (iso OUT), RX=128 (iso IN), NPTX=64. **Cannot do simultaneous TX+RX** — audio capture packets (~294 bytes) exceed the 128-byte RX FIFO.
+- **ESP-IDF bug #17707**: `usb_host_interface_release()` can fail with ESP_ERR_INVALID_STATE when URBs are in-flight. Driver has retry logic.
+- miniDSP is self-powered (bmAttributes=0xC0, bMaxPower=0) but still needs VBUS present on the bus to enumerate.
 
 ## Kconfig Notes
 
 - `USB_HOST_CONTROL_TRANSFER_MAX_SIZE`: default 256, but miniDSP config descriptor is 373 bytes. **Must increase to at least 512.**
-- `USB_HOST_HW_BUFFER_BIAS`: set to `PERIODIC_OUT` for audio playback (biases DWC_OTG FIFO toward isochronous OUT). Use `IN` if doing capture, `BALANCED` for bidirectional.
+- `USB_HOST_HW_BUFFER_BIAS`: set to `PERIODIC_OUT` for audio playback (biases DWC_OTG FIFO toward isochronous OUT). Cannot use for capture — RX FIFO only 128 bytes.
 
 ## Reference Code
 
@@ -45,7 +49,7 @@ Local copies in `ref/` (read-only, not compiled). See `ref/README.md` for source
 - `ref/espressif-uac1/` — Espressif UAC1 host driver v1.3.3 (Apache-2.0). Architecture to fork. ~4,000 lines.
 - `ref/usbx-uac2/ux_class_audio20.h` — USBX UAC2 descriptor structs (MIT). The gold standard. 1694 lines.
 - `ref/cherryusb-uac2/usb_audio.h` — CherryUSB UAC1+UAC2 structs (Apache-2.0). Standard C types. 1347 lines.
-- `ref/minidsp_2x4hd_descriptors.h` �� Reconstructed raw descriptor bytes for offline parser testing. Partial (256 of 373 config bytes captured).
+- `ref/minidsp_2x4hd_descriptors.h` �� Reconstructed raw descriptor bytes for offline parser testing. Complete (257 captured + 116 reconstructed = 373 bytes).
 
 ## ESP32 Serial (serial-mcp)
 

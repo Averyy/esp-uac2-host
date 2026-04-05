@@ -221,6 +221,12 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
             current_as = NULL;
             ep_count_in_current_as = 0;
 
+            // Track Audio Control interface number
+            if (current_iface_class == UAC2_CLASS_AUDIO &&
+                current_iface_subclass == UAC2_SUBCLASS_AUDIOCONTROL) {
+                info->ac_iface_num = current_iface_num;
+            }
+
             if (current_iface_class == UAC2_CLASS_AUDIO &&
                 current_iface_subclass == UAC2_SUBCLASS_AUDIOSTREAMING &&
                 current_num_endpoints > 0) {

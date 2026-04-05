@@ -1,9 +1,9 @@
 /*
- * esp-uac2-host — Phase 0A+1: USB Host enumeration + UAC2 descriptor parsing
+ * esp-uac2-host — USB Host enumeration + UAC2 driver
  *
- * Initializes USB Host mode on ESP32-S3, enumerates any connected USB device,
- * parses UAC2 descriptors, and logs the audio topology. At boot, runs a
- * self-test against the static miniDSP 2x4 HD descriptor dump.
+ * Initializes USB Host mode on ESP32-S3, enumerates connected USB devices,
+ * and drives them through the UAC2 host driver. Runs a self-test against
+ * static miniDSP 2x4 HD descriptors at boot.
  *
  * SPDX-License-Identifier: MIT
  */
@@ -14,13 +14,14 @@
 #include "esp_log.h"
 #include "usb/usb_host.h"
 #include "uac2_desc.h"
+#include "uac2_host.h"
 
 // Include the static miniDSP descriptor dump for self-test
 #include "../../ref/minidsp_2x4hd_descriptors.h"
 
 #define HOST_LIB_TASK_PRIORITY  2
 #define CLASS_TASK_PRIORITY     3
-#define CLASS_TASK_STACK_SIZE   (5 * 1024)
+#define CLASS_TASK_STACK_SIZE   (6 * 1024)
 
 static const char *TAG = "uac2-host";
 
@@ -110,6 +111,7 @@ static void run_descriptor_self_test(void)
 typedef struct {
     usb_host_client_handle_t client_hdl;
     usb_device_handle_t dev_hdl;
+    uac2_host_device_handle_t uac2_dev;
     uint8_t dev_addr;
     bool dev_connected;
 } class_driver_t;
@@ -125,6 +127,11 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
         driver->dev_connected = true;
         break;
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
+        // TODO(hardware): Test hot-unplug during active streaming. The disconnect
+        // event sets dev_connected=false, then the main loop calls handle_device_gone()
+        // which closes the UAC2 device (stopping streams). But if isochronous callbacks
+        // are still in-flight when we enter handle_device_gone(), there's a window where
+        // the callback accesses freed memory. See stream_stop TODO for tracking fix.
         ESP_LOGW(TAG, "Device disconnected");
         driver->dev_connected = false;
         break;
@@ -133,8 +140,40 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
     }
 }
 
+static void uac2_event_cb(uac2_host_device_handle_t dev,
+                           uac2_host_event_t event, void *arg)
+{
+    switch (event) {
+    case UAC2_HOST_EVENT_TX_DONE:
+        ESP_LOGD(TAG, "UAC2: TX needs data");
+        break;
+    case UAC2_HOST_EVENT_RX_DONE:
+        ESP_LOGD(TAG, "UAC2: RX data ready");
+        break;
+    case UAC2_HOST_EVENT_TRANSFER_ERROR:
+        ESP_LOGW(TAG, "UAC2: Transfer error");
+        break;
+    case UAC2_HOST_EVENT_DISCONNECTED:
+        ESP_LOGW(TAG, "UAC2: Disconnected");
+        break;
+    }
+}
+
+static void handle_new_device_task(void *arg);
+
 static void handle_new_device(class_driver_t *driver)
 {
+    // Run in a separate task to avoid deadlocking the client event loop.
+    // Control transfers complete via callbacks dispatched by
+    // usb_host_client_handle_events(), which we can't call while blocked
+    // on a semaphore in the same task.
+    xTaskCreatePinnedToCore(handle_new_device_task, "new_dev", 4096,
+                            driver, CLASS_TASK_PRIORITY + 1, NULL, 0);
+}
+
+static void handle_new_device_task(void *arg)
+{
+    class_driver_t *driver = (class_driver_t *)arg;
     esp_err_t err;
 
     // Open device
@@ -152,11 +191,8 @@ static void handle_new_device(class_driver_t *driver)
     // Device descriptor
     const usb_device_desc_t *dev_desc;
     ESP_ERROR_CHECK(usb_host_get_device_descriptor(driver->dev_hdl, &dev_desc));
-    ESP_LOGI(TAG, "Device descriptor:");
-    ESP_LOGI(TAG, "  VID=0x%04X  PID=0x%04X", dev_desc->idVendor, dev_desc->idProduct);
-    ESP_LOGI(TAG, "  Class=0x%02X  SubClass=0x%02X  Protocol=0x%02X",
-             dev_desc->bDeviceClass, dev_desc->bDeviceSubClass, dev_desc->bDeviceProtocol);
-    ESP_LOGI(TAG, "  Configs=%d", dev_desc->bNumConfigurations);
+    ESP_LOGI(TAG, "  VID=0x%04X  PID=0x%04X  Class=0x%02X",
+             dev_desc->idVendor, dev_desc->idProduct, dev_desc->bDeviceClass);
 
     // String descriptors
     if (dev_info.str_desc_manufacturer) {
@@ -165,37 +201,54 @@ static void handle_new_device(class_driver_t *driver)
     if (dev_info.str_desc_product) {
         usb_print_string_descriptor(dev_info.str_desc_product);
     }
-    if (dev_info.str_desc_serial_num) {
-        usb_print_string_descriptor(dev_info.str_desc_serial_num);
-    }
 
-    // Configuration descriptor — parse with UAC2 parser
-    const usb_config_desc_t *config_desc;
-    ESP_ERROR_CHECK(usb_host_get_active_config_descriptor(driver->dev_hdl, &config_desc));
+    // Try to open as UAC2 device
+    err = uac2_host_device_open(driver->client_hdl, driver->dev_hdl,
+                                uac2_event_cb, NULL, &driver->uac2_dev);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "*** UAC2 device opened successfully ***");
 
-    ESP_LOGI(TAG, "Configuration %d: %d interface(s), total length %d",
-             config_desc->bConfigurationValue,
-             config_desc->bNumInterfaces,
-             config_desc->wTotalLength);
+        // Query clock info
+        uint32_t sample_rate = 0;
+        err = uac2_host_get_sample_rate(driver->uac2_dev, &sample_rate);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Current sample rate: %lu Hz", (unsigned long)sample_rate);
+        } else {
+            ESP_LOGW(TAG, "Could not read sample rate: %s", esp_err_to_name(err));
+        }
 
-    uac2_device_info_t uac2_info;
-    bool is_uac2 = uac2_parse_config_descriptor(
-        (const uint8_t *)config_desc,
-        config_desc->wTotalLength,
-        &uac2_info);
+        // Query supported sample rates
+        uac2_sample_rate_range_t ranges[UAC2_MAX_SAMPLE_RATE_RANGES];
+        uint8_t num_ranges = 0;
+        err = uac2_host_get_sample_rate_range(driver->uac2_dev, ranges, &num_ranges);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Supported sample rates: %d range(s)", num_ranges);
+        }
 
-    if (is_uac2) {
-        ESP_LOGI(TAG, "*** UAC2 audio device detected! ***");
-        uac2_log_device_info(&uac2_info);
+        // Check clock validity
+        bool clock_valid = false;
+        err = uac2_host_get_clock_valid(driver->uac2_dev, &clock_valid);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Clock valid: %s", clock_valid ? "yes" : "no");
+        }
+    } else if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGI(TAG, "Not a UAC2 device");
     } else {
-        ESP_LOGI(TAG, "Not a UAC2 device (or UAC1)");
+        ESP_LOGE(TAG, "UAC2 open failed: %s", esp_err_to_name(err));
     }
 
     ESP_LOGI(TAG, "--- Enumeration complete ---");
+    vTaskDelete(NULL);
 }
 
 static void handle_device_gone(class_driver_t *driver)
 {
+    // Close UAC2 device first
+    if (driver->uac2_dev) {
+        uac2_host_device_close(driver->uac2_dev);
+        driver->uac2_dev = NULL;
+    }
+
     if (driver->dev_hdl) {
         usb_host_device_close(driver->client_hdl, driver->dev_hdl);
         driver->dev_hdl = NULL;
@@ -208,6 +261,7 @@ static void class_driver_task(void *arg)
     class_driver_t driver = {
         .client_hdl = NULL,
         .dev_hdl = NULL,
+        .uac2_dev = NULL,
         .dev_addr = 0,
         .dev_connected = false,
     };
@@ -267,7 +321,7 @@ static void usb_host_lib_task(void *arg)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "esp-uac2-host — USB device enumeration + UAC2 parsing");
+    ESP_LOGI(TAG, "esp-uac2-host — UAC2 driver");
 
     // Run self-test against static miniDSP descriptors
     run_descriptor_self_test();

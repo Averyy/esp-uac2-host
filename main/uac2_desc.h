@@ -73,6 +73,7 @@ extern "C" {
 // Control request codes
 #define UAC2_REQUEST_CUR                0x01
 #define UAC2_REQUEST_RANGE              0x02
+#define UAC2_REQUEST_MEM                0x03
 
 // Clock source control selectors
 #define UAC2_CS_SAM_FREQ_CONTROL        0x01
@@ -262,6 +263,7 @@ typedef struct {
     bool     is_uac2;
     uint16_t bcdADC;
     uint8_t  category;
+    uint8_t  ac_iface_num;          // Audio Control interface number
 
     // Clock topology
     uint8_t              num_clock_sources;

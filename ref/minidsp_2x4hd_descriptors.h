@@ -16,12 +16,16 @@
  * garbage bytes at the end, which have been stripped during reconstruction.
  *
  * The sketch uses a 256-byte buffer (BUFSIZE=256). The config descriptor has
- * wTotalLength=373 (0x0175), so only the first 256 bytes were captured. The last
+ * wTotalLength=373 (0x0175), so only the first 257 bytes were captured. The last
  * descriptor that begins within the buffer is the AS Isochronous EP descriptor for
  * Interface 1 Alt 2, which starts at byte 253. Only its first 4 bytes (08 25 01 00)
  * are within the buffer; the remaining 4 bytes are truncated.
  *
- * What's captured (bytes 0-255 of config 1):
+ * The remaining 116 bytes (offsets 257-372) have been RECONSTRUCTED from the XMOS
+ * reference firmware, ALSA driver output, and the minidsp-rs control protocol.
+ * See "Sources for reconstruction" at bottom of file for details.
+ *
+ * What's captured (bytes 0-256 of config 1, 257 bytes):
  *   - Configuration descriptor (9 bytes)
  *   - IAD for Audio function (8 bytes)
  *   - Interface 0 Alt 0: AudioControl (9 bytes)
@@ -29,13 +33,14 @@
  *     2x Input Terminal, 2x Feature Unit, 2x Output Terminal (127 bytes total)
  *   - Interface 1 Alt 0: AudioStreaming zero-bandwidth (9 bytes)
  *   - Interface 1 Alt 1: AudioStreaming 24-bit/2ch + endpoints (53 bytes)
- *   - Interface 1 Alt 2: AudioStreaming 16-bit/2ch (partial - 38 of ~53 bytes)
+ *   - Interface 1 Alt 2: AudioStreaming 16-bit/2ch (partial - 42 of 53 bytes)
  *
- * What's missing (bytes 256-372, ~117 bytes):
- *   - Remainder of Interface 1 Alt 2 endpoint descriptors
- *   - Interface 2: AudioStreaming (capture direction) with all alternates
- *   - Interface 3: HID (miniDSP control interface)
- *   - Interface 4: (likely DFU or vendor-specific)
+ * What's reconstructed (bytes 257-372, 116 bytes):
+ *   - 4 bytes: Remainder of AS EP descriptor for Alt 2 (by analogy with Alt 1)
+ *   - 7 bytes: Feedback endpoint 0x81 for Alt 2 (identical to Alt 1)
+ *   - 55 bytes: Interface 2 AudioStreaming capture (Alt 0 + Alt 1, 24-bit/2ch)
+ *   - 32 bytes: Interface 3 HID (miniDSP control, bidirectional 64-byte)
+ *   - 18 bytes: Interface 4 DFU (XMOS standard firmware update)
  *
  * The device has bNumConfigurations=2. Both configurations appear to have the same
  * wTotalLength (373) and identical structure within the captured 256 bytes.
@@ -75,12 +80,11 @@ static const uint8_t minidsp_2x4hd_device_desc[] = {
 };
 
 /* -------------------------------------------------------------------------- */
-/*  Configuration 1 Descriptor (PARTIAL - 256 of 373 bytes captured)          */
+/*  Configuration 1 Descriptor (373 bytes total)                              */
 /*                                                                            */
-/*  Truncation occurs at byte 256. The last complete descriptor is the AS     */
-/*  Format Type I for Alt 2 (ending at byte 246). The OUT endpoint at byte    */
-/*  246 is complete (7 bytes, ending at byte 253). The AS EP descriptor       */
-/*  starting at byte 253 is truncated after 4 bytes (only 08 25 01 00).      */
+/*  Bytes 0-256 (257 bytes): Captured from Arduino USB_desc.ino output.       */
+/*  Bytes 257-372 (116 bytes): RECONSTRUCTED from XMOS reference firmware,    */
+/*  Linux ALSA dumps, and minidsp-rs protocol analysis. See comments inline.  */
 /* -------------------------------------------------------------------------- */
 
 static const uint8_t minidsp_2x4hd_config1_desc[] = {
@@ -388,10 +392,8 @@ static const uint8_t minidsp_2x4hd_config1_desc[] = {
     0x01,                   // bInterval = 1
 
     /* ---------------------------------------------------------------------- */
-    /*  AS Isochronous EP Descriptor - Alt 2 (TRUNCATED) [offset 253]         */
-    /*  Only first 4 bytes captured (256-byte buffer limit).                  */
-    /*  Remaining 4 bytes (bmControls, bLockDelayUnits, wLockDelay) unknown.  */
-    /*  By analogy with Alt 1, likely: 00 02 08 00                            */
+    /*  AS Isochronous EP Descriptor - Alt 2 (8 bytes) [offset 253]           */
+    /*  First 4 bytes captured. Remaining 4 reconstructed by analogy w/ Alt 1 */
     /* ---------------------------------------------------------------------- */
     0x08,                   // bLength = 8
     0x25,                   // bDescriptorType = CS_ENDPOINT
@@ -399,14 +401,191 @@ static const uint8_t minidsp_2x4hd_config1_desc[] = {
     0x00,                   // bmAttributes = 0
 
     /* ====================================================================== */
-    /*  TRUNCATION: bytes 257-372 not captured (256-byte Arduino buffer)      */
+    /*  RECONSTRUCTION: bytes 257-372 (116 bytes)                             */
     /*                                                                        */
-    /*  Missing content (estimated ~117 bytes):                               */
-    /*    - 4 bytes: remainder of AS EP descriptor for Alt 2                  */
-    /*    - 7 bytes: Feedback endpoint 0x81 for Alt 2                         */
-    /*    - ~53 bytes: Interface 2 (AudioStreaming capture) with alternates    */
-    /*    - ~50+ bytes: Interfaces 3-4 (HID control, possibly DFU)           */
+    /*  Not captured by original Arduino dump (256-byte buffer limit).         */
+    /*  Reconstructed from:                                                   */
+    /*    - XMOS XU216 reference firmware (sw_usb_audio descriptors_2.h)      */
+    /*    - Linux ALSA stream0 dump of DDRC-24 (same XMOS hardware as 2x4HD) */
+    /*      posted by mdsimon2 on AudioScienceReview, July 2021               */
+    /*    - XMOS lib_xua defaults for Full Speed channel counts               */
+    /*    - miniDSP HID protocol (mrene/minidsp-rs, bidirectional 64-byte)    */
+    /*    - Byte budget: 373 total - 257 captured = 116 missing, all accounted*/
+    /*                                                                        */
+    /*  Confidence levels:                                                    */
+    /*    - Remaining AS EP + FB EP: HIGH (identical pattern to Alt 1)         */
+    /*    - Interface 2 capture structure: HIGH (XMOS FS defaults + ALSA data)*/
+    /*    - Capture EP 0x82 address: CONFIRMED (from ALSA stream0 dump)       */
+    /*    - Capture channels=2 at FS: HIGH (XMOS default NUM_USB_CHAN_IN_FS)  */
+    /*    - HID bidirectional: HIGH (minidsp-rs uses IN+OUT HID endpoints)    */
+    /*    - HID EP addresses (0x83/0x03): ESTIMATED (XMOS convention)         */
+    /*    - HID report descriptor length: ESTIMATED (34 bytes placeholder)    */
+    /*    - DFU interface: HIGH (XMOS default, standard structure)             */
+    /*    - DFU wTransferSize/bcdVersion: ESTIMATED (common XMOS values)      */
     /* ====================================================================== */
+
+    // --- Reconstructed from here (offset 257) ---
+
+    0x00,                   // bmControls = 0
+    0x02,                   // bLockDelayUnits = 2 (milliseconds)
+    0x08, 0x00,             // wLockDelay = 8 ms
+
+    /* ---------------------------------------------------------------------- */
+    /*  Endpoint 0x81 IN - Isochronous Feedback (7 bytes) [offset 261]        */
+    /*  Identical to Alt 1 feedback endpoint                                  */
+    /* ---------------------------------------------------------------------- */
+    0x07,                   // bLength = 7
+    0x05,                   // bDescriptorType = ENDPOINT
+    0x81,                   // bEndpointAddress = 0x81 (IN)
+    0x11,                   // bmAttributes = 0x11 (Isochronous, Feedback)
+    0x04, 0x00,             // wMaxPacketSize = 4
+    0x04,                   // bInterval = 4 (every 8 frames at FS = 8ms)
+
+    /* ====================================================================== */
+    /*  Interface 2, Alt 0 - AudioStreaming capture (zero-bw) [offset 268]    */
+    /* ====================================================================== */
+    0x09,                   // bLength = 9
+    0x04,                   // bDescriptorType = INTERFACE
+    0x02,                   // bInterfaceNumber = 2
+    0x00,                   // bAlternateSetting = 0
+    0x00,                   // bNumEndpoints = 0
+    0x01,                   // bInterfaceClass = Audio
+    0x02,                   // bInterfaceSubClass = AudioStreaming
+    0x20,                   // bInterfaceProtocol = 0x20 (UAC2)
+    0x05,                   // iInterface = 5
+
+    /* ====================================================================== */
+    /*  Interface 2, Alt 1 - AudioStreaming capture 24-bit [offset 277]       */
+    /*  Capture: 2ch, 24-bit, async isochronous IN EP 0x82                   */
+    /*  At HS this is 4ch (confirmed by ALSA); at FS XMOS defaults to 2ch    */
+    /* ====================================================================== */
+    0x09,                   // bLength = 9
+    0x04,                   // bDescriptorType = INTERFACE
+    0x02,                   // bInterfaceNumber = 2
+    0x01,                   // bAlternateSetting = 1
+    0x01,                   // bNumEndpoints = 1 (data EP only, no feedback for IN)
+    0x01,                   // bInterfaceClass = Audio
+    0x02,                   // bInterfaceSubClass = AudioStreaming
+    0x20,                   // bInterfaceProtocol = 0x20 (UAC2)
+    0x05,                   // iInterface = 5
+
+    /* ---------------------------------------------------------------------- */
+    /*  AS Interface Descriptor - capture (16 bytes) [offset 286]             */
+    /* ---------------------------------------------------------------------- */
+    0x10,                   // bLength = 16
+    0x24,                   // bDescriptorType = CS_INTERFACE
+    0x01,                   // bDescriptorSubtype = AS_GENERAL
+    0x16,                   // bTerminalLink = 22 (OT22 = USB_STREAMING capture)
+    0x00,                   // bmControls = 0
+    0x01,                   // bFormatType = FORMAT_TYPE_I
+    0x01, 0x00, 0x00, 0x00, // bmFormats = 0x00000001 (PCM)
+    0x02,                   // bNrChannels = 2 (FS: 2ch; HS: 4ch)
+    0x00, 0x00, 0x00, 0x00, // bmChannelConfig = 0 (unspecified)
+    0x0D,                   // iChannelNames = 13
+
+    /* ---------------------------------------------------------------------- */
+    /*  AS Format Type I Descriptor - capture (6 bytes) [offset 302]          */
+    /* ---------------------------------------------------------------------- */
+    0x06,                   // bLength = 6
+    0x24,                   // bDescriptorType = CS_INTERFACE
+    0x02,                   // bDescriptorSubtype = FORMAT_TYPE
+    0x01,                   // bFormatType = FORMAT_TYPE_I
+    0x03,                   // bSubSlotSize = 3 (3 bytes = 24 bits)
+    0x18,                   // bBitResolution = 24
+
+    /* ---------------------------------------------------------------------- */
+    /*  Endpoint 0x82 IN - Isochronous Async (7 bytes) [offset 308]           */
+    /*  Capture data endpoint. EP address 0x82 CONFIRMED by ALSA stream0.     */
+    /*  wMaxPacketSize=294: 2ch * 3bytes * 49frames (48kHz + async headroom)  */
+    /* ---------------------------------------------------------------------- */
+    0x07,                   // bLength = 7
+    0x05,                   // bDescriptorType = ENDPOINT
+    0x82,                   // bEndpointAddress = 0x82 (IN) *** CONFIRMED ***
+    0x05,                   // bmAttributes = 0x05 (Isochronous, Async)
+    0x26, 0x01,             // wMaxPacketSize = 294 (0x0126)
+    0x01,                   // bInterval = 1 (every frame = 1ms at FS)
+
+    /* ---------------------------------------------------------------------- */
+    /*  AS Isochronous EP Descriptor - capture (8 bytes) [offset 315]         */
+    /* ---------------------------------------------------------------------- */
+    0x08,                   // bLength = 8
+    0x25,                   // bDescriptorType = CS_ENDPOINT
+    0x01,                   // bDescriptorSubtype = EP_GENERAL
+    0x00,                   // bmAttributes = 0
+    0x00,                   // bmControls = 0
+    0x02,                   // bLockDelayUnits = 2 (milliseconds)
+    0x08, 0x00,             // wLockDelay = 8 ms
+
+    /* ====================================================================== */
+    /*  Interface 3, Alt 0 - HID (miniDSP control) [offset 323]              */
+    /*  Used by minidsp-rs / miniDSP plugin for gain/mute/source/DSP control  */
+    /*  Bidirectional: IN endpoint for status, OUT for commands               */
+    /*  64-byte reports match minidsp-rs protocol (mrene/minidsp-rs)          */
+    /* ====================================================================== */
+    0x09,                   // bLength = 9
+    0x04,                   // bDescriptorType = INTERFACE
+    0x03,                   // bInterfaceNumber = 3
+    0x00,                   // bAlternateSetting = 0
+    0x02,                   // bNumEndpoints = 2 (IN + OUT)
+    0x03,                   // bInterfaceClass = HID
+    0x00,                   // bInterfaceSubClass = 0 (no boot)
+    0x00,                   // bInterfaceProtocol = 0
+    0x00,                   // iInterface = 0
+
+    /* ---------------------------------------------------------------------- */
+    /*  HID Descriptor (9 bytes) [offset 332]                                 */
+    /* ---------------------------------------------------------------------- */
+    0x09,                   // bLength = 9
+    0x21,                   // bDescriptorType = HID
+    0x10, 0x01,             // bcdHID = 1.10
+    0x00,                   // bCountryCode = 0
+    0x01,                   // bNumDescriptors = 1
+    0x22,                   // bDescriptorType[0] = Report
+    0x22, 0x00,             // wDescriptorLength[0] = 34 (ESTIMATED)
+
+    /* ---------------------------------------------------------------------- */
+    /*  Endpoint 0x83 IN - Interrupt (HID status) (7 bytes) [offset 341]      */
+    /* ---------------------------------------------------------------------- */
+    0x07,                   // bLength = 7
+    0x05,                   // bDescriptorType = ENDPOINT
+    0x83,                   // bEndpointAddress = 0x83 (IN)
+    0x03,                   // bmAttributes = 0x03 (Interrupt)
+    0x40, 0x00,             // wMaxPacketSize = 64
+    0x01,                   // bInterval = 1 (1ms)
+
+    /* ---------------------------------------------------------------------- */
+    /*  Endpoint 0x03 OUT - Interrupt (HID commands) (7 bytes) [offset 348]   */
+    /* ---------------------------------------------------------------------- */
+    0x07,                   // bLength = 7
+    0x05,                   // bDescriptorType = ENDPOINT
+    0x03,                   // bEndpointAddress = 0x03 (OUT)
+    0x03,                   // bmAttributes = 0x03 (Interrupt)
+    0x40, 0x00,             // wMaxPacketSize = 64
+    0x01,                   // bInterval = 1 (1ms)
+
+    /* ====================================================================== */
+    /*  Interface 4, Alt 0 - DFU Runtime (9 bytes) [offset 355]               */
+    /*  XMOS standard DFU interface for firmware updates                      */
+    /* ====================================================================== */
+    0x09,                   // bLength = 9
+    0x04,                   // bDescriptorType = INTERFACE
+    0x04,                   // bInterfaceNumber = 4
+    0x00,                   // bAlternateSetting = 0
+    0x00,                   // bNumEndpoints = 0
+    0xFE,                   // bInterfaceClass = Application Specific (0xFE)
+    0x01,                   // bInterfaceSubClass = DFU (0x01)
+    0x01,                   // bInterfaceProtocol = Runtime (0x01)
+    0x00,                   // iInterface = 0
+
+    /* ---------------------------------------------------------------------- */
+    /*  DFU Functional Descriptor (9 bytes) [offset 364]                      */
+    /* ---------------------------------------------------------------------- */
+    0x09,                   // bLength = 9
+    0x21,                   // bDescriptorType = DFU_FUNCTIONAL
+    0x07,                   // bmAttributes = 0x07 (download, upload, manifestation tolerant)
+    0xFA, 0x00,             // wDetachTimeOut = 250 ms
+    0x40, 0x00,             // wTransferSize = 64
+    0x01, 0x10,             // bcdDFUVersion = 1.10 (ESTIMATED)
 };
 
 /*
@@ -427,17 +606,44 @@ static const uint8_t minidsp_2x4hd_config1_desc[] = {
  *
  * Playback path (host -> device):
  *   IT ID=2 (USB_STREAMING, 2ch) -> FU ID=10 -> OT ID=20 (SPEAKER)
- *   Interface 1, Alt 1: 24-bit/2ch, EP 0x01 OUT async iso, 294 bytes/frame
- *   Interface 1, Alt 2: 16-bit/2ch, EP 0x01 OUT async iso, 196 bytes/frame
+ *   Interface 1, Alt 1: 24-bit/2ch, EP 0x01 OUT async iso, MPS=294
+ *   Interface 1, Alt 2: 16-bit/2ch, EP 0x01 OUT async iso, MPS=196
  *   Feedback: EP 0x81 IN, 4 bytes, interval=4 (8ms at FS)
  *
- * Capture path (device -> host):
+ * Capture path (device -> host):  [RECONSTRUCTED]
  *   IT ID=1 (MICROPHONE, 2ch) -> FU ID=11 -> OT ID=22 (USB_STREAMING)
- *   Interface 2: NOT CAPTURED (truncated)
+ *   Interface 2, Alt 1: 24-bit/2ch, EP 0x82 IN async iso, MPS=294
+ *   No feedback endpoint needed for IN direction
+ *   At High Speed: 4 channels (confirmed by ALSA dump of DDRC-24)
+ *   At Full Speed: 2 channels (XMOS default NUM_USB_CHAN_IN_FS)
+ *
+ * HID control interface (Interface 3):  [RECONSTRUCTED]
+ *   Bidirectional: EP 0x83 IN + EP 0x03 OUT, interrupt, 64-byte MPS
+ *   Used by miniDSP plugin / minidsp-rs for gain/mute/source/DSP control
+ *
+ * DFU interface (Interface 4):  [RECONSTRUCTED]
+ *   Standard XMOS DFU runtime interface for firmware updates
+ *
+ * Endpoint summary:
+ *   EP 0x01 OUT  - Isochronous Async  - Audio playback data
+ *   EP 0x81 IN   - Isochronous Feedback - Playback rate feedback
+ *   EP 0x82 IN   - Isochronous Async  - Audio capture data (CONFIRMED)
+ *   EP 0x83 IN   - Interrupt           - HID status/responses (ESTIMATED)
+ *   EP 0x03 OUT  - Interrupt           - HID commands (ESTIMATED)
  *
  * Audio formats at Full Speed:
- *   Alt 1: PCM, 2ch, 24-bit, 3 bytes/subslot -> 294 bytes/frame max
+ *   Playback Alt 1: PCM, 2ch, 24-bit, 3 bytes/subslot -> 294 bytes/frame max
  *          (48kHz * 2ch * 3B = 288B/frame nominal + 6B headroom for async)
- *   Alt 2: PCM, 2ch, 16-bit, 2 bytes/subslot -> 196 bytes/frame max
+ *   Playback Alt 2: PCM, 2ch, 16-bit, 2 bytes/subslot -> 196 bytes/frame max
  *          (48kHz * 2ch * 2B = 192B/frame nominal + 4B headroom for async)
+ *   Capture Alt 1:  PCM, 2ch, 24-bit, 3 bytes/subslot -> 294 bytes/frame max
+ *
+ * Sources for reconstruction:
+ *   - XMOS sw_usb_audio v6.1 descriptors_2.h (GitHub: itdaniher/USB-Audio-2.0-Software-v6.1)
+ *   - XMOS lib_xua xua_conf_default.h (NUM_USB_CHAN_IN_FS defaults to min(N,2))
+ *   - ALSA stream0 dump of DDRC-24 (same XMOS XU216 hardware as 2x4 HD)
+ *     confirming EP 0x82 for capture, 4ch at HS, S32_LE/24-bit, async mode
+ *     (mdsimon2 on AudioScienceReview, July 2021)
+ *   - minidsp-rs (mrene/minidsp-rs) confirming bidirectional HID with 64-byte reports
+ *   - linux-hardware.org usb:2752-0011 confirming Class 01-01-20 (Audio UAC2)
  */
