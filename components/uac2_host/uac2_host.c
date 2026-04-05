@@ -1022,10 +1022,7 @@ esp_err_t uac2_host_stream_start(uac2_host_device_handle_t dev,
     esp_err_t err = stream_alloc(&stream, dir, as, config);
     if (err != ESP_OK) return err;
 
-    // Claim interface with the appropriate alt setting
-    // TODO(hardware): Some XMOS devices need a delay after SET_INTERFACE before
-    // submitting isochronous URBs. If we see transfer errors immediately after
-    // stream start, add a small delay (5-10ms) here after the claim returns.
+    // Claim interface with the appropriate alt setting (host-side endpoint setup)
     err = usb_host_interface_claim(dev->client, dev->usb_dev,
                                    stream->iface_num, stream->alt_setting);
     if (err != ESP_OK) {
@@ -1034,6 +1031,14 @@ esp_err_t uac2_host_stream_start(uac2_host_device_handle_t dev,
         stream_free(stream);
         return err;
     }
+
+    // TODO: Send SET_INTERFACE to the device. Currently disabled because TinyUSB's
+    // DWC2 driver crashes (abort in dcd_edpt_iso_activate) when processing SET_INTERFACE
+    // for isochronous endpoints on ESP32-S3. The real miniDSP doesn't need it from our
+    // ESP32-S3 host because usb_host_interface_claim handles endpoint setup on the host
+    // side, and the device (XMOS) activates endpoints on SET_CONFIGURATION.
+    // When testing with the real miniDSP, verify if explicit SET_INTERFACE is needed.
+
     stream->state = UAC2_STREAM_STATE_READY;
 
     // Set sample rate if we have a clock source

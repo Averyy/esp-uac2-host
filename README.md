@@ -30,7 +30,9 @@ components/uac2_host/       # The driver (ESP-IDF component)
 main/                        # Test harness
   main.c                    #   Enumeration + streaming test suite
   tone_gen.c/h              #   Sine wave generator
-test_device/                 # UAC2 simulator (TinyUSB, separate ESP32-S3)
+simulators/
+  simple/                   #   Minimal UAC2 simulator (TinyUSB, separate ESP32-S3)
+  minidsp-2x4hd/            #   Full miniDSP 2x4 HD simulator (audio + HID)
 ref/                         # Reference code (read-only, not compiled)
 docs/                        # Design docs and research
 ```
@@ -40,7 +42,7 @@ docs/                        # Design docs and research
 - **MCU:** ESP32-S3-DevKitC-1
 - **USB:** Full Speed (12 Mbps) — sufficient for 48kHz/24-bit/stereo (25% bus utilization)
 - **Primary test device:** miniDSP 2x4 HD (XMOS XU216, UAC2, VID 0x2752)
-- **Simulator:** Second ESP32-S3 running `test_device/` firmware (TinyUSB)
+- **Simulator:** Second ESP32-S3 running `simulators/minidsp-2x4hd/` firmware (TinyUSB, audio + HID)
 
 ## Building
 

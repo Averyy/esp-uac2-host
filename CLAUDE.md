@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**Phase 3 complete — isochronous streaming verified.** Full driver stack working end-to-end: descriptor parser, control requests (CUR/RANGE), isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Tested against ESP32-to-ESP32 simulator (TinyUSB device mimicking miniDSP 2x4 HD): 48kHz/24-bit/stereo sustained 40+ seconds with zero errors. Next: test with real miniDSP 2x4 HD. See `PROGRESS.md` for detailed status.
+**Phase 3 complete + miniDSP simulator built.** Full driver stack working end-to-end: descriptor parser, control requests (CUR/RANGE), isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Two simulators: `simulators/simple/` (minimal UAC2) and `simulators/minidsp-2x4hd/` (full composite device: UAC2 audio + HID control with complete command protocol, EEPROM/DSP state, fault injection). All 5 host tests pass. Known issue: SET_INTERFACE causes TinyUSB DWC2 crash on simulator — see PROGRESS.md. Next: test with real miniDSP 2x4 HD. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 

@@ -81,9 +81,25 @@
 - [x] Disconnect/reconnect tested and verified clean
 - [x] All tests pass after all fixes applied
 
-### Known Issues (need real miniDSP hardware to resolve)
+### miniDSP 2x4 HD Simulator — Full Composite Device (April 5, 2026)
+- [x] Restructured `test_device/` → `simulators/simple/` + `simulators/minidsp-2x4hd/`
+- [x] Composite TinyUSB device: UAC2 audio (playback IF1, alt 1 24-bit + alt 2 16-bit) + HID (IF2, 64-byte vendor reports)
+- [x] Full AC topology in descriptor: playback path (IT2→FU10→OT20) + capture path (IT1→FU11→OT22) — matches real miniDSP
+- [x] Config descriptor: 300 bytes (all AC entities, playback AS with 2 alt settings, HID — no DFU/capture AS due to TinyUSB constraints)
+- [x] PID changed to 0x0011 (real miniDSP PID), VID 0x2752, bcdDevice 0x06F2
+- [x] HID command protocol: all 20 commands implemented (ReadHardwareId, ReadFlash, ReadFloats, SetVolume, SetMute, SetConfig, SetSource, WriteDSP, WriteBiquad, etc.)
+- [x] EEPROM state: preset, source, volume, mute, serial, mod tokens, DSP ID
+- [x] DSP parameter storage: WriteDSP/WriteBiquad store float values, ReadFloats reads them back
+- [x] Fault injection: config switch delay, empty HID response, HID NAK, command timeout (serial console toggle)
+- [x] USB lifecycle callbacks: mount/unmount/suspend/resume logging
+- [x] Fixed TinyUSB callback name: `tud_audio_rx_done_pre_read_cb` → `tud_audio_rx_done_isr` (both simulators)
+- [x] 6-agent code review completed: all security, performance, and code quality fixes applied
+- [x] All 5 host driver tests pass against new simulator (48kHz, volume/mute, stop/restart, 44.1kHz, long-running)
+
+### Known Issues
+- [ ] **SET_INTERFACE crash**: Host sending SET_INTERFACE to simulator causes TinyUSB DWC2 abort. Currently disabled — ESP-IDF `usb_host_interface_claim` doesn't send SET_INTERFACE to the device, and the host tests pass without it. Real XMOS hardware may handle this differently. Needs investigation with real miniDSP.
+- [ ] **Simulator audio frame counting**: The simulator's `tud_audio_rx_done_isr` callback fires only when TinyUSB receives data via the activated isochronous endpoint. Without SET_INTERFACE, the endpoint isn't activated, so the callback never fires. The host streams successfully regardless (ISO OUT is fire-and-forget at FS).
 - [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
-- [ ] POST-SET_INTERFACE delay may be needed on real XMOS hardware
 - [ ] Feedback format confirmation (expect 3 bytes / 10.14 from XMOS at FS)
 - [ ] Full 373-byte config descriptor capture from real miniDSP (vs simulator)
 
@@ -94,11 +110,13 @@ See `TODO(hardware)` markers in source code for details.
 ### Phase 0B — Real miniDSP Verification (needs powered USB hub + miniDSP)
 - [ ] Full config descriptor captured from real miniDSP 2x4 HD
 - [ ] Enumeration and clock queries succeed on real device
-- [ ] Streaming works on real device (may need POST-SET_INTERFACE delay)
+- [ ] Verify if real XMOS needs explicit SET_INTERFACE (may work without it like the simulator)
+- [ ] Streaming works on real device
 - [ ] Feedback format confirmed (3-byte 10.14 vs 4-byte 16.16)
 
 ### Phase 4 — Polish + Integration
-- [ ] Proper URB in-flight tracking for clean shutdown
+- [ ] Fix SET_INTERFACE: either fix TinyUSB DWC2 crash or find alternative for simulator
+- [ ] HID integration testing (once host driver has HID support)
 - [ ] Error recovery (transfer errors, stalls)
 - [ ] Integration with minidsp-open Rust FFI
 
