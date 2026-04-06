@@ -1,6 +1,7 @@
 /*
  * TinyUSB configuration for miniDSP 2x4 HD simulator
- * Composite device: UAC2 audio (playback) + HID (vendor control)
+ * Composite device: UAC2 audio (playback + capture) + HID (vendor control)
+ * Matches real miniDSP 2x4 HD: 5 interfaces (AC, AS_PB, AS_CAP, DFU, HID)
  */
 
 #pragma once
@@ -26,15 +27,17 @@ extern "C" {
 #define CFG_TUD_HID             1
 #define CFG_TUD_MIDI            0
 #define CFG_TUD_VENDOR          0
+#define CFG_TUD_DFU             0
 
 // ── Audio class config ──────────────────────────────────────────────
 
 #define CFG_TUD_AUDIO                               1
 
-// Audio function descriptor length — playback only.
-// IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(53) + AS_PB_alt2(53) = 259
-#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN               259
-#define CFG_TUD_AUDIO_FUNC_1_N_AS_INT               1   // playback only
+// Audio function descriptor length — playback + capture AS interfaces.
+// IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(53) + AS_PB_alt2(53)
+//   + AS_CAP_alt0(9) + AS_CAP_alt1(46) = 314
+#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN               314
+#define CFG_TUD_AUDIO_FUNC_1_N_AS_INT               2   // playback + capture
 #define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ            64
 
 // Playback (host → device, EP OUT)
@@ -44,13 +47,18 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX          294     // 48kHz/24-bit/2ch + async headroom
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (294 * 4)
 
-// Capture NOT enabled — DWC2 FIFO too small for 294-byte ISO IN + ISO OUT.
-// Capture AS interface removed from config descriptor entirely (N_AS_INT=1).
-#define CFG_TUD_AUDIO_ENABLE_EP_IN                  0
+// Capture (device → host, EP IN) — present in descriptor to match real device.
+// Not functionally used (ESP32-S3 FIFO too small for simultaneous ISO IN+OUT).
+#define CFG_TUD_AUDIO_ENABLE_EP_IN                  1
+#define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX  3       // 24-bit
+#define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX          2       // stereo
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX           294
+#define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (294 * 2)  // minimal buffer, never used
 
 // Feedback endpoint — sends rate feedback to host
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            1
-#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 1   // auto-convert 16.16 ↔ 10.14 at FS
+// Disable format correction: real miniDSP sends 4-byte 16.16 even at Full Speed
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 0
 
 // Sample rate
 #define CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE            48000

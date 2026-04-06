@@ -11,8 +11,8 @@
  * - Fault injection modes for robustness testing
  *
  * VID=0x2752 PID=0x0011 bcdDevice=0x0185
- * Config descriptor: 300 bytes (playback-only — capture AS + DFU removed for TinyUSB compat)
- * Real device is 373 bytes with 5 interfaces; simulator has 3 (AC, AS playback, HID)
+ * Config descriptor: 373 bytes — matches real device exactly (5 interfaces)
+ * Feedback: 4-byte 16.16 format (matching real XMOS behavior, not default TinyUSB 10.14)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -60,13 +60,16 @@ static esp_err_t usb_phy_init(void)
 enum {
     ITF_NUM_AUDIO_CONTROL = 0,
     ITF_NUM_AUDIO_STREAMING_PB = 1,     // Playback
-    ITF_NUM_HID = 2,
-    ITF_NUM_TOTAL = 3
+    ITF_NUM_AUDIO_STREAMING_CAP = 2,    // Capture
+    ITF_NUM_DFU = 3,                    // DFU (XMOS firmware update)
+    ITF_NUM_HID = 4,                    // HID (miniDSP vendor control)
+    ITF_NUM_TOTAL = 5
 };
 
 #define EPNUM_AUDIO_OUT     0x01    // Playback data
 #define EPNUM_AUDIO_FB      0x81    // Feedback
-#define EPNUM_HID_IN        0x82    // HID responses
+#define EPNUM_AUDIO_CAP     0x82    // Capture data
+#define EPNUM_HID_IN        0x83    // HID responses (matches real device)
 #define EPNUM_HID_OUT       0x02    // HID commands
 
 // ── Audio control state ───────────────────────────────────────────
@@ -189,7 +192,7 @@ tusb_desc_device_t const desc_device = {
     .iManufacturer      = 1,
     .iProduct           = 11,           // Matches real device (iProduct=11)
     .iSerialNumber      = 0,            // Real miniDSP has no serial string
-    .bNumConfigurations = 1             // Real device has 2, but TinyUSB only supports 1
+    .bNumConfigurations = 2             // Real device has 2 (identical configs)
 };
 
 uint8_t const *tud_descriptor_device_cb(void)
@@ -197,7 +200,7 @@ uint8_t const *tud_descriptor_device_cb(void)
     return (uint8_t const *)&desc_device;
 }
 
-// --- Configuration Descriptor (300 bytes, playback-only) ---
+// --- Configuration Descriptor (373 bytes, matches real miniDSP 2x4 HD) ---
 
 // AC entity lengths
 #define AC_HEADER_LEN           9
@@ -218,43 +221,49 @@ uint8_t const *tud_descriptor_device_cb(void)
 #define FORMAT_TYPE_LEN     6
 #define CS_EP_LEN           8
 
-// Per-alt-setting lengths
-#define AS_ALT_24BIT_LEN    (9 + AS_GENERAL_LEN + FORMAT_TYPE_LEN + 7 + CS_EP_LEN + 7)  // 53
-#define AS_ALT_16BIT_LEN    (9 + AS_GENERAL_LEN + FORMAT_TYPE_LEN + 7 + CS_EP_LEN + 7)  // 53
+// Playback per-alt lengths
+#define AS_PB_ALT1_LEN     (9 + AS_GENERAL_LEN + FORMAT_TYPE_LEN + 7 + CS_EP_LEN + 7)  // 53
+#define AS_PB_ALT2_LEN     (9 + AS_GENERAL_LEN + FORMAT_TYPE_LEN + 7 + CS_EP_LEN + 7)  // 53
+
+// Capture alt 1: no feedback EP (only data EP + CS EP)
+#define AS_CAP_ALT1_LEN    (9 + AS_GENERAL_LEN + FORMAT_TYPE_LEN + 7 + CS_EP_LEN)       // 46
 
 // Audio function total (for CFG_TUD_AUDIO_FUNC_1_DESC_LEN)
-// IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(53) + AS_PB_alt2(53) = 259
-#define AUDIO_FUNC_DESC_LEN (8 + 9 + AC_TOTAL_LEN + 9 + AS_ALT_24BIT_LEN + AS_ALT_16BIT_LEN)  // = 259
+// IAD(8) + AC_IF(9) + AC(127) + PB_alt0(9) + PB_alt1(53) + PB_alt2(53) + CAP_alt0(9) + CAP_alt1(46) = 314
+#define AUDIO_FUNC_DESC_LEN (8 + 9 + AC_TOTAL_LEN + 9 + AS_PB_ALT1_LEN + AS_PB_ALT2_LEN + 9 + AS_CAP_ALT1_LEN)
+
+// DFU portion (interface + DFU functional descriptor)
+#define DFU_DESC_LEN        (9 + 9)     // = 18
 
 // HID portion
 #define HID_DESC_LEN        (9 + 9 + 7 + 7)    // interface + HID desc + 2 EPs = 32
 
-// Total (no DFU — no test value, and TinyUSB asserts on unclaimed interfaces)
-#define CONFIG_TOTAL_LEN    (9 + AUDIO_FUNC_DESC_LEN + HID_DESC_LEN)  // = 300
+// Total: matches real miniDSP 2x4 HD (373 bytes)
+#define CONFIG_TOTAL_LEN    (9 + AUDIO_FUNC_DESC_LEN + DFU_DESC_LEN + HID_DESC_LEN)
 
 // Verify at compile time
 _Static_assert(AC_TOTAL_LEN == 127, "AC total length mismatch");
-_Static_assert(AUDIO_FUNC_DESC_LEN == 259, "Audio function desc length mismatch");
-_Static_assert(CONFIG_TOTAL_LEN == 300, "Config total length mismatch");
+_Static_assert(AUDIO_FUNC_DESC_LEN == 314, "Audio function desc length mismatch");
+_Static_assert(CONFIG_TOTAL_LEN == 373, "Config total must be 373 bytes (real device)");
 
 static uint8_t const desc_configuration[] = {
     // ═══════════════════════════════════════════════════════════════
-    //  Configuration Descriptor (9 bytes) [offset 0]
+    //  Configuration Descriptor (9 bytes)
     // ═══════════════════════════════════════════════════════════════
     9, TUSB_DESC_CONFIGURATION,
-    U16_TO_U8S_LE(CONFIG_TOTAL_LEN),    // wTotalLength = 300
-    ITF_NUM_TOTAL,                       // bNumInterfaces = 3
+    U16_TO_U8S_LE(CONFIG_TOTAL_LEN),    // wTotalLength = 373
+    ITF_NUM_TOTAL,                       // bNumInterfaces = 5
     1,                                   // bConfigurationValue
     0,                                   // iConfiguration
     0xC0,                                // bmAttributes = self-powered
     0,                                   // bMaxPower = 0
 
     // ═══════════════════════════════════════════════════════════════
-    //  IAD: Audio function (IF0-IF1) [offset 9]
+    //  IAD: Audio function (IF0-IF2)
     // ═══════════════════════════════════════════════════════════════
     8, TUSB_DESC_INTERFACE_ASSOCIATION,
     ITF_NUM_AUDIO_CONTROL,               // bFirstInterface = 0
-    2,                                   // bInterfaceCount = 2 (AC + 1×AS)
+    3,                                   // bInterfaceCount = 3 (AC + PB + CAP)
     TUSB_CLASS_AUDIO,                    // bFunctionClass
     0x00,                                // bFunctionSubClass
     0x20,                                // bFunctionProtocol = UAC2
@@ -430,7 +439,60 @@ static uint8_t const desc_configuration[] = {
     0x11, U16_TO_U8S_LE(4), 4,
 
     // ═══════════════════════════════════════════════════════════════
-    //  HID Interface 2 [offset 268]
+    //  AS Interface 2 (Capture) — Alt 0 (zero-bandwidth)
+    // ═══════════════════════════════════════════════════════════════
+    9, TUSB_DESC_INTERFACE,
+    ITF_NUM_AUDIO_STREAMING_CAP, 0, 0,
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11,
+
+    // ═══════════════════════════════════════════════════════════════
+    //  AS Interface 2, Alt 1 — 24-bit stereo capture
+    // ═══════════════════════════════════════════════════════════════
+    9, TUSB_DESC_INTERFACE,
+    ITF_NUM_AUDIO_STREAMING_CAP, 1, 1,  // alt 1, 1 endpoint (no feedback for capture)
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11,
+
+    // AS General (16 bytes) — capture
+    AS_GENERAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_AS_GENERAL,
+    OUTPUT_TERMINAL_CAP_ID,              // bTerminalLink = 22
+    0x00,                                // bmControls
+    AUDIO_FORMAT_TYPE_I,
+    U32_TO_U8S_LE(0x00000001),          // bmFormats = PCM
+    2,                                   // bNrChannels
+    U32_TO_U8S_LE(0x00000000),          // bmChannelConfig
+    0x18,                                // iChannelNames (matches real device)
+
+    // Format Type I — 24-bit (6 bytes)
+    FORMAT_TYPE_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
+    AUDIO_FORMAT_TYPE_I, 3, 24,          // 3-byte subslot, 24-bit
+
+    // EP 0x82 IN — async iso, MPS=294 (7 bytes)
+    7, TUSB_DESC_ENDPOINT, EPNUM_AUDIO_CAP,
+    0x05, U16_TO_U8S_LE(294), 1,        // async iso, interval=1
+
+    // CS EP General (8 bytes)
+    CS_EP_LEN, TUSB_DESC_CS_ENDPOINT, AUDIO_CS_EP_SUBTYPE_GENERAL,
+    0x00, 0x00, 0x02, U16_TO_U8S_LE(0x0008),
+
+    // ═══════════════════════════════════════════════════════════════
+    //  DFU Interface 3 (XMOS firmware update)
+    // ═══════════════════════════════════════════════════════════════
+    9, TUSB_DESC_INTERFACE,
+    ITF_NUM_DFU, 0, 0,                  // no endpoints
+    0xFE,                                // bInterfaceClass = Application Specific
+    0x01,                                // bInterfaceSubClass = DFU
+    0x01,                                // bInterfaceProtocol = Runtime
+    0x0A,                                // iInterface
+
+    // DFU Functional Descriptor (9 bytes)
+    9, 0x21,                             // bDescriptorType = DFU FUNCTIONAL
+    0x07,                                // bmAttributes
+    U16_TO_U8S_LE(0x00FA),              // wDetachTimeOut = 250
+    U16_TO_U8S_LE(0x0040),              // wTransferSize = 64
+    U16_TO_U8S_LE(0x0110),              // bcdDFUVersion = 1.10
+
+    // ═══════════════════════════════════════════════════════════════
+    //  HID Interface 4
     // ═══════════════════════════════════════════════════════════════
     9, TUSB_DESC_INTERFACE,
     ITF_NUM_HID, 0, 2,                  // 2 endpoints (IN + OUT)
@@ -439,26 +501,24 @@ static uint8_t const desc_configuration[] = {
     0x00,                                // bInterfaceProtocol
     0x00,                                // iInterface
 
-    // HID Descriptor (9 bytes) [offset 277]
+    // HID Descriptor (9 bytes)
     9, 0x21,                             // bDescriptorType = HID
     U16_TO_U8S_LE(0x0110),              // bcdHID = 1.10
     0x00,                                // bCountryCode
     1,                                   // bNumDescriptors
     0x22,                                // bDescriptorType = Report
-    U16_TO_U8S_LE(34),                  // wDescriptorLength (real=28, sim=34 — couldn't capture exact bytes)
+    U16_TO_U8S_LE(34),                  // wDescriptorLength (real=28, couldn't capture exact bytes)
 
-    // EP 0x82 IN — interrupt, MPS=64 (7 bytes) [offset 286]
+    // EP 0x83 IN — interrupt, MPS=64 (7 bytes)
     7, TUSB_DESC_ENDPOINT, EPNUM_HID_IN,
     0x03, U16_TO_U8S_LE(64), 1,         // interrupt, 1ms
 
-    // EP 0x02 OUT — interrupt, MPS=64 (7 bytes) [offset 293]
+    // EP 0x02 OUT — interrupt, MPS=64 (7 bytes)
     7, TUSB_DESC_ENDPOINT, EPNUM_HID_OUT,
     0x03, U16_TO_U8S_LE(64), 1,
-
-    // DFU interface omitted — no test value, and TinyUSB asserts on unclaimed interfaces
 };
 
-_Static_assert(sizeof(desc_configuration) == 300, "Config descriptor must be 300 bytes");
+_Static_assert(sizeof(desc_configuration) == 373, "Config descriptor must be 373 bytes (real device)");
 
 uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 {
