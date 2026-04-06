@@ -8,8 +8,25 @@
  * @file uac2_host.h
  * @brief USB Audio Class 2.0 host driver for ESP32-S3
  *
- * Provides device management, clock control, volume/mute, and
- * isochronous audio streaming (playback and capture) for UAC2 devices.
+ * Espressif-pattern class driver: install/uninstall lifecycle with internal
+ * device discovery. Provides clock control, volume/mute, and isochronous
+ * audio streaming (playback and capture) for UAC2 devices.
+ *
+ * Usage:
+ *   1. usb_host_install()
+ *   2. uac2_host_install(&driver_config)   — driver registers USB client
+ *   3. Driver fires callback on connect: UAC2_HOST_DRIVER_EVENT_TX_CONNECTED
+ *   4. uac2_host_device_open(&device_config, &handle)
+ *   5. uac2_host_device_start(handle, &stream_config)
+ *   6. uac2_host_device_write(handle, data, size, timeout)
+ *   7. uac2_host_device_stop(handle)
+ *   8. uac2_host_device_close(handle)
+ *   9. uac2_host_uninstall()
+ *
+ * TX (playback) silence behavior: when the ring buffer is empty, isochronous
+ * URBs are filled with zeros (silence) and never stop. The stream remains
+ * active until explicitly stopped. UAC2_HOST_DEVICE_EVENT_TX_DONE fires
+ * when the ring buffer needs more data.
  */
 
 #pragma once
@@ -27,8 +44,8 @@ extern "C" {
 
 // ── Version ───────────────────────────────────────────────────────
 
-#define UAC2_HOST_VER_MAJOR  1
-#define UAC2_HOST_VER_MINOR  0
+#define UAC2_HOST_VER_MAJOR  0
+#define UAC2_HOST_VER_MINOR  1
 #define UAC2_HOST_VER_PATCH  0
 
 // ── Configuration defaults ─────────────────────────────────────────
@@ -66,9 +83,18 @@ extern "C" {
 //   Simultaneous capture (iso IN ~294) DOES NOT FIT in RX FIFO (128 max).
 //   Full duplex audio requires ESP32-P4 (4KB FIFO) or alternating directions.
 
+/**
+ * @brief Flag that starts the stream in a suspended state.
+ *
+ * When set in uac2_host_stream_config_t::flags, uac2_host_device_start()
+ * claims the interface and prepares resources without submitting stream
+ * transfers. Call uac2_host_device_resume() later to start transfers.
+ */
+#define UAC2_FLAG_STREAM_SUSPEND_AFTER_START  (1 << 0)
+
 // ── Types ──────────────────────────────────────────────────────────
 
-typedef struct uac2_host_device *uac2_host_device_handle_t;
+typedef struct uac2_interface *uac2_host_device_handle_t;
 
 /** Stream direction */
 typedef enum {
@@ -76,33 +102,78 @@ typedef enum {
     UAC2_STREAM_RX,         /**< Capture:  device -> host (isochronous IN) */
 } uac2_stream_dir_t;
 
-/** Device-level events */
+// ── Driver-level events and callback ───────────────────────────────
+
+/** Driver-level events (fired during device discovery) */
 typedef enum {
-    UAC2_HOST_EVENT_TX_DONE = 0,        /**< Playback ringbuf needs more data */
-    UAC2_HOST_EVENT_RX_DONE,            /**< Capture ringbuf has data ready */
-    UAC2_HOST_EVENT_TRANSFER_ERROR,     /**< Isochronous transfer error */
-    UAC2_HOST_EVENT_DISCONNECTED,       /**< Device disconnected */
-} uac2_host_event_t;
+    UAC2_HOST_DRIVER_EVENT_TX_CONNECTED = 0, /**< UAC2 playback interface found */
+    UAC2_HOST_DRIVER_EVENT_RX_CONNECTED,     /**< UAC2 capture interface found */
+} uac2_host_driver_event_t;
 
 /**
- * Event callback. Called from the USB Host client event task context.
+ * Driver-level event callback. Fired when a UAC2 device connects and
+ * streaming interfaces are discovered. Use addr + iface_num to open
+ * the interface via uac2_host_device_open().
  *
- * @warning Must not block. Must not call uac2_host_stream_stop(),
- *          uac2_host_device_close(), or any control request APIs
- *          (set/get sample rate, volume, mute) from this callback —
- *          doing so will deadlock the USB event task.
+ * @warning Called from the USB Host client event task. Must not block.
  */
-typedef void (*uac2_host_event_cb_t)(uac2_host_device_handle_t dev,
-                                     uac2_host_event_t event, void *arg);
+typedef void (*uac2_host_driver_event_cb_t)(uint8_t addr, uint8_t iface_num,
+                                            const uac2_host_driver_event_t event,
+                                            void *arg);
 
-/** Stream configuration */
+// ── Device-level events and callback ───────────────────────────────
+
+/** Device/interface-level events (fired during streaming) */
+typedef enum {
+    UAC2_HOST_DEVICE_EVENT_TX_DONE = 0,     /**< Playback ringbuf needs more data */
+    UAC2_HOST_DEVICE_EVENT_RX_DONE,         /**< Capture ringbuf has data ready */
+    UAC2_HOST_DEVICE_EVENT_TRANSFER_ERROR,  /**< Isochronous transfer error */
+    UAC2_HOST_DEVICE_EVENT_DISCONNECTED,    /**< Device disconnected. Caller MUST call
+                                                 uac2_host_device_close() from a non-callback
+                                                 context to release stream resources. */
+    UAC2_HOST_DEVICE_EVENT_STREAM_ERROR,    /**< Stream dead after max consecutive errors */
+} uac2_host_device_event_t;
+
+/**
+ * Device/interface event callback. Fired from USB Host client event task.
+ *
+ * @warning Must not block. Must not call uac2_host_device_stop(),
+ *          uac2_host_device_close(), or any control request APIs
+ *          from this callback — doing so will deadlock.
+ */
+typedef void (*uac2_host_device_event_cb_t)(uac2_host_device_handle_t dev,
+                                            const uac2_host_device_event_t event,
+                                            void *arg);
+
+// ── Configuration structs ──────────────────────────────────────────
+
+/** UAC2 driver configuration (passed to uac2_host_install) */
 typedef struct {
-    uint32_t sample_rate;           /**< Sample rate in Hz (e.g. 48000) */
-    uint8_t  channels;              /**< Number of channels */
-    uint8_t  bit_resolution;        /**< Bits per sample (16 or 24) */
-    uint32_t ringbuf_size;          /**< Ring buffer size in bytes (0 = auto) */
-    uint32_t ringbuf_threshold;     /**< Threshold for TX_DONE / RX_DONE events (0 = half) */
-} uac2_stream_config_t;
+    bool create_background_task;       /**< true: driver creates event task; false: caller pumps events */
+    size_t task_priority;              /**< Priority of background task (if created) */
+    size_t stack_size;                 /**< Stack size of background task (if created) */
+    BaseType_t core_id;                /**< Core affinity of background task, or tskNO_AFFINITY */
+    uac2_host_driver_event_cb_t callback; /**< Driver event callback. Must not be NULL. */
+    void *callback_arg;                /**< User argument passed to driver callback */
+} uac2_host_driver_config_t;
+
+/** UAC2 device/interface open configuration */
+typedef struct {
+    uint8_t addr;                      /**< USB device address (from driver callback) */
+    uint8_t iface_num;                 /**< Interface number (from driver callback) */
+    uint32_t buffer_size;              /**< Ring buffer size in bytes (0 = auto ~100ms) */
+    uint32_t buffer_threshold;         /**< Threshold for TX_DONE/RX_DONE events (0 = half) */
+    uac2_host_device_event_cb_t callback; /**< Device event callback (may be NULL) */
+    void *callback_arg;                /**< User argument passed to device callback */
+} uac2_host_device_config_t;
+
+/** Stream configuration (passed to uac2_host_device_start) */
+typedef struct {
+    uint8_t  channels;                 /**< Number of channels (0 = match any) */
+    uint8_t  bit_resolution;           /**< Bits per sample: 16 or 24 (0 = match best) */
+    uint32_t sample_freq;              /**< Sample rate in Hz (e.g. 48000) */
+    uint16_t flags;                    /**< Control flags (e.g. UAC2_FLAG_STREAM_SUSPEND_AFTER_START) */
+} uac2_host_stream_config_t;
 
 /** Sample rate range (from GET_RANGE) */
 typedef struct {
@@ -122,119 +193,174 @@ typedef struct {
 
 #define UAC2_MAX_VOLUME_RANGES  8
 
+/** Alternate setting parameters (from uac2_host_get_device_alt_param) */
+typedef struct {
+    uint8_t  alt_setting;              /**< Alternate setting number */
+    uint8_t  channels;                 /**< Number of channels */
+    uint8_t  bit_resolution;           /**< Bits per sample */
+    uint8_t  sub_slot_size;            /**< Bytes per sample slot */
+    uint16_t ep_max_packet_size;       /**< Endpoint max packet size */
+    uint8_t  ep_addr;                  /**< Endpoint address */
+    uint8_t  fb_ep_addr;              /**< Feedback endpoint address (0 if none) */
+} uac2_host_dev_alt_param_t;
+
+// ── Driver lifecycle ───────────────────────────────────────────────
+
+/**
+ * Install the UAC2 host class driver.
+ * Registers a USB Host client, optionally creates a background event task.
+ * Call after usb_host_install().
+ */
+esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);
+
+/**
+ * Uninstall the UAC2 host class driver.
+ * All devices must be closed first.
+ */
+esp_err_t uac2_host_uninstall(void);
+
+/**
+ * Handle USB Host events for the UAC2 driver.
+ * Call periodically when create_background_task = false.
+ *
+ * @return ESP_OK on success, ESP_FAIL when driver is being uninstalled
+ */
+esp_err_t uac2_host_handle_events(TickType_t timeout);
+
 // ── Device management ──────────────────────────────────────────────
 
 /**
- * Open a UAC2 device. Parses descriptors, allocates control transfer,
- * and prepares the device for streaming and control requests.
+ * Open a UAC2 audio interface. Obtain addr and iface_num from the
+ * driver event callback (UAC2_HOST_DRIVER_EVENT_TX/RX_CONNECTED).
  *
- * @param client    USB Host client handle (from usb_host_client_register)
- * @param dev       USB device handle (from usb_host_device_open)
- * @param cb        Event callback (may be NULL)
- * @param cb_arg    User argument passed to callback
- * @param out_dev   Output: UAC2 device handle
+ * If this is the first interface opened for the device address, the
+ * USB device is opened and descriptors are parsed. Subsequent opens
+ * for the same address share the physical device (reference counted).
  */
-esp_err_t uac2_host_device_open(usb_host_client_handle_t client,
-                                usb_device_handle_t dev,
-                                uac2_host_event_cb_t cb, void *cb_arg,
-                                uac2_host_device_handle_t *out_dev);
+esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
+                                uac2_host_device_handle_t *out_handle);
 
 /**
- * Close a UAC2 device. Stops any active streams, frees driver resources.
- *
- * @note Does NOT call usb_host_device_close() on the underlying USB device.
- *       The caller must close the USB device handle separately.
+ * Close a UAC2 interface. Stops any active stream. When the last
+ * interface for a device is closed, the USB device is released.
  */
 esp_err_t uac2_host_device_close(uac2_host_device_handle_t dev);
 
 /**
- * Get parsed descriptor info for the device.
+ * Get parsed descriptor info for the device (all interfaces, topology).
  */
 esp_err_t uac2_host_device_get_info(uac2_host_device_handle_t dev,
                                     uac2_device_info_t *info);
+
+/**
+ * Get alternate setting parameters for this interface.
+ *
+ * @param alt  Alternate setting number (1-based: first alt is 1).
+ */
+esp_err_t uac2_host_get_device_alt_param(uac2_host_device_handle_t dev,
+                                         uint8_t alt,
+                                         uac2_host_dev_alt_param_t *param);
+
+/**
+ * Print full device info: topology, clock, feature unit capabilities,
+ * stream state, endpoints, and cached volume range.
+ */
+void uac2_host_device_print_info(uac2_host_device_handle_t dev);
 
 // ── Clock control ──────────────────────────────────────────────────
 
 /**
  * Get current sample rate from the device's clock source.
  */
-esp_err_t uac2_host_get_sample_rate(uac2_host_device_handle_t dev,
-                                    uint32_t *sample_rate);
+esp_err_t uac2_host_device_get_sample_rate(uac2_host_device_handle_t dev,
+                                           uint32_t *sample_rate);
 
 /**
  * Set sample rate on the device's clock source.
  */
-esp_err_t uac2_host_set_sample_rate(uac2_host_device_handle_t dev,
-                                    uint32_t sample_rate);
+esp_err_t uac2_host_device_set_sample_rate(uac2_host_device_handle_t dev,
+                                           uint32_t sample_rate);
 
 /**
  * Query supported sample rate ranges.
- *
- * @param ranges     Output array (caller provides UAC2_MAX_SAMPLE_RATE_RANGES)
- * @param num_ranges Output: number of ranges filled
  */
-esp_err_t uac2_host_get_sample_rate_range(uac2_host_device_handle_t dev,
-                                          uac2_sample_rate_range_t *ranges,
-                                          uint8_t *num_ranges);
+esp_err_t uac2_host_device_get_sample_rate_range(uac2_host_device_handle_t dev,
+                                                 uac2_sample_rate_range_t *ranges,
+                                                 uint8_t *num_ranges);
 
 /**
  * Check if the clock source is valid (synced).
  */
-esp_err_t uac2_host_get_clock_valid(uac2_host_device_handle_t dev,
-                                    bool *valid);
+esp_err_t uac2_host_device_get_clock_valid(uac2_host_device_handle_t dev,
+                                           bool *valid);
 
 // ── Streaming ──────────────────────────────────────────────────────
 
 /**
- * Start an audio stream. Claims interface, sets alternate setting,
- * allocates URBs, and begins isochronous transfers.
- *
- * For TX (playback): transfers start silent, waiting for data via
- * uac2_host_stream_write(). The UAC2_HOST_EVENT_TX_DONE event fires
- * when the ring buffer needs data.
- *
- * For RX (capture): transfers start immediately. The
- * UAC2_HOST_EVENT_RX_DONE event fires when audio data is available.
+ * Start the audio stream. Claims interface, sets alternate setting,
+ * allocates URBs and ring buffer, begins isochronous transfers.
+ * Stream direction is determined by the interface (TX or RX).
  */
-esp_err_t uac2_host_stream_start(uac2_host_device_handle_t dev,
-                                 uac2_stream_dir_t dir,
-                                 const uac2_stream_config_t *config);
+esp_err_t uac2_host_device_start(uac2_host_device_handle_t dev,
+                                 const uac2_host_stream_config_t *config);
 
 /**
- * Stop a stream. Releases interface, frees URBs and ring buffer.
+ * Stop the stream. Releases interface, frees URBs and ring buffer.
  */
-esp_err_t uac2_host_stream_stop(uac2_host_device_handle_t dev,
-                                uac2_stream_dir_t dir);
+esp_err_t uac2_host_device_stop(uac2_host_device_handle_t dev);
+
+/**
+ * Suspend an active stream without freeing resources.
+ * Stream transitions from ACTIVE to READY.
+ */
+esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t dev);
+
+/**
+ * Resume a suspended stream. No reallocation needed.
+ * Stream transitions from READY to ACTIVE.
+ */
+esp_err_t uac2_host_device_resume(uac2_host_device_handle_t dev);
 
 /**
  * Write audio data to the playback ring buffer.
- * Data format must match the stream config (interleaved PCM).
+ *
+ * @note For performance, this function does NOT validate the handle against
+ *       the internal device list. The caller must ensure the handle is valid
+ *       (not closed or disconnected) before calling.
  */
-esp_err_t uac2_host_stream_write(uac2_host_device_handle_t dev,
+esp_err_t uac2_host_device_write(uac2_host_device_handle_t dev,
                                  const uint8_t *data, uint32_t size,
                                  uint32_t timeout_ms);
 
 /**
  * Read audio data from the capture ring buffer.
+ *
+ * @note For performance, this function does NOT validate the handle against
+ *       the internal device list. The caller must ensure the handle is valid
+ *       (not closed or disconnected) before calling.
  */
-esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
+esp_err_t uac2_host_device_read(uac2_host_device_handle_t dev,
                                 uint8_t *data, uint32_t size,
                                 uint32_t *bytes_read,
                                 uint32_t timeout_ms);
 
 /**
- * Get the hardware timestamp (microseconds) of when the first isochronous
- * URB was submitted for the active TX stream. Returns 0 if no stream is active.
- * Used by callers that need precise playback start timing (e.g., measurement sweeps).
+ * Get the hardware timestamp of when the first isochronous URB was submitted.
+ * Returns 0 if no stream is active.
+ *
+ * @note For performance, this function does NOT validate the handle.
+ *       Caller must ensure the handle is valid (not closed or disconnected).
  */
-int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev);
+int64_t uac2_host_device_get_start_time(uac2_host_device_handle_t dev);
 
 /**
- * Get the current feedback value from the device (async playback only).
- * Returns the feedback in 16.16 fixed-point format (samples per frame).
- * For 48kHz: nominal = 0x00300000 (48.0000). Returns 0 if no feedback received.
+ * Get the current feedback value (async playback only).
+ * Returns 16.16 fixed-point (samples per frame). 0 if no feedback.
+ *
+ * @note For performance, this function does NOT validate the handle.
+ *       Caller must ensure the handle is valid (not closed or disconnected).
  */
-uint32_t uac2_host_stream_get_feedback(uac2_host_device_handle_t dev);
+uint32_t uac2_host_device_get_feedback(uac2_host_device_handle_t dev);
 
 // ── Volume / Mute ──────────────────────────────────────────────────
 
@@ -242,39 +368,57 @@ uint32_t uac2_host_stream_get_feedback(uac2_host_device_handle_t dev);
  * Set mute on a feature unit channel.
  * @param channel  0 = master, 1+ = individual channels
  */
-esp_err_t uac2_host_set_mute(uac2_host_device_handle_t dev,
-                             uint8_t channel, bool mute);
+esp_err_t uac2_host_device_set_mute(uac2_host_device_handle_t dev,
+                                    uint8_t channel, bool mute);
 
 /**
  * Get current mute state.
  */
-esp_err_t uac2_host_get_mute(uac2_host_device_handle_t dev,
-                             uint8_t channel, bool *mute);
+esp_err_t uac2_host_device_get_mute(uac2_host_device_handle_t dev,
+                                    uint8_t channel, bool *mute);
 
 /**
  * Set volume on a feature unit channel.
  * @param volume_db256  Volume in 1/256 dB units (e.g. 0x0100 = +1 dB)
  */
-esp_err_t uac2_host_set_volume(uac2_host_device_handle_t dev,
-                               uint8_t channel, int16_t volume_db256);
+esp_err_t uac2_host_device_set_volume(uac2_host_device_handle_t dev,
+                                      uint8_t channel, int16_t volume_db256);
 
 /**
  * Get current volume.
  */
-esp_err_t uac2_host_get_volume(uac2_host_device_handle_t dev,
-                               uint8_t channel, int16_t *volume_db256);
+esp_err_t uac2_host_device_get_volume(uac2_host_device_handle_t dev,
+                                      uint8_t channel, int16_t *volume_db256);
 
 /**
  * Query supported volume ranges from the feature unit.
- *
- * @param channel     0 = master, 1+ = individual channels
- * @param ranges      Output array (caller provides UAC2_MAX_VOLUME_RANGES)
- * @param num_ranges  Output: number of ranges filled
  */
-esp_err_t uac2_host_get_volume_range(uac2_host_device_handle_t dev,
-                                     uint8_t channel,
-                                     uac2_volume_range_t *ranges,
-                                     uint8_t *num_ranges);
+esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t dev,
+                                            uint8_t channel,
+                                            uac2_volume_range_t *ranges,
+                                            uint8_t *num_ranges);
+
+/**
+ * Set volume as a percentage (0-100). Maps linearly from min to max dB.
+ */
+esp_err_t uac2_host_device_set_volume_percent(uac2_host_device_handle_t dev,
+                                              uint8_t channel, uint8_t percent);
+
+/**
+ * Get current volume as a percentage (0-100).
+ */
+esp_err_t uac2_host_device_get_volume_percent(uac2_host_device_handle_t dev,
+                                              uint8_t channel, uint8_t *percent);
+
+/**
+ * Set volume on all channels that support volume control.
+ * Iterates channels based on the feature unit's bmaControls bitmap.
+ * Stops on first error and returns that error code.
+ *
+ * @param volume_db256  Volume in 1/256 dB units (applied to every channel)
+ */
+esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t dev,
+                                                   int16_t volume_db256);
 
 #ifdef __cplusplus
 }

@@ -134,15 +134,33 @@ static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
     if (desc[0] < 10) return;  // minimum: header(6) + 1 bmaControls(4)
     if (info->num_feature_units >= UAC2_MAX_FEATURE_UNITS) return;
     uac2_feature_unit_t *fu = &info->feature_units[info->num_feature_units++];
+    memset(fu, 0, sizeof(*fu));
     fu->unit_id = desc[3];
     fu->source_id = desc[4];
     uint8_t bLength = desc[0];
     int controls_bytes = bLength - 6;
     if (controls_bytes < 4) {
         fu->nr_channels = 0;
-    } else {
-        fu->nr_channels = (controls_bytes / 4) - 1;
-        if (fu->nr_channels > 32) fu->nr_channels = 0;
+        return;
+    }
+    int num_entries = controls_bytes / 4;  // entry 0=master, 1..N=channels
+    fu->nr_channels = (num_entries > 1) ? (uint8_t)(num_entries - 1) : 0;
+    if (fu->nr_channels > 32) fu->nr_channels = 0;
+
+    // Cap to 33 entries (master + 32 channels) to avoid UB in 1u << i
+    if (num_entries > 33) num_entries = 33;
+
+    // Parse bmaControls: each entry is 4 bytes (UAC2), bits 0-1=mute, bits 2-3=volume
+    for (int i = 0; i < num_entries && (5 + i * 4 + 3) < bLength; i++) {
+        uint32_t ctrl = read_u32(&desc[5 + i * 4]);
+        bool mute = (ctrl & 0x03) != 0;
+        bool volume = (ctrl & 0x0C) != 0;
+        if (i == 0) {
+            fu->has_mute = mute;
+            fu->has_volume = volume;
+        }
+        if (mute)   fu->mute_ch_map |= (1u << i);
+        if (volume) fu->volume_ch_map |= (1u << i);
     }
 }
 
@@ -190,6 +208,10 @@ static void parse_format_type_i(const uint8_t *desc, uac2_as_iface_t *as)
 {
     if (desc[0] < 6) return;  // Format Type I minimum
     as->sub_slot_size = desc[4];
+    if (as->sub_slot_size == 0 || as->sub_slot_size > 4) {
+        ESP_LOGW(TAG, "Invalid sub_slot_size %d, clamping to 4", as->sub_slot_size);
+        as->sub_slot_size = 4;
+    }
     as->bit_resolution = desc[5];
 }
 
@@ -347,8 +369,13 @@ void uac2_log_device_info(const uac2_device_info_t *info)
     ESP_LOGI(TAG, "--- Feature Units ---");
     for (int i = 0; i < info->num_feature_units; i++) {
         const uac2_feature_unit_t *fu = &info->feature_units[i];
-        ESP_LOGI(TAG, "  Feature Unit ID=%d: src=%d, %dch",
-                 fu->unit_id, fu->source_id, fu->nr_channels);
+        ESP_LOGI(TAG, "  Feature Unit ID=%d: src=%d, %dch, mute=%s, volume=%s",
+                 fu->unit_id, fu->source_id, fu->nr_channels,
+                 fu->has_mute ? "yes" : "no", fu->has_volume ? "yes" : "no");
+        if (fu->mute_ch_map || fu->volume_ch_map) {
+            ESP_LOGI(TAG, "    mute_ch_map=0x%08" PRIX32 " volume_ch_map=0x%08" PRIX32,
+                     fu->mute_ch_map, fu->volume_ch_map);
+        }
     }
 
     // Audio streaming interfaces

@@ -242,6 +242,10 @@ typedef struct {
     uint8_t  unit_id;
     uint8_t  source_id;
     uint8_t  nr_channels;           // derived from bLength
+    bool     has_mute;              // master channel supports mute control
+    bool     has_volume;            // master channel supports volume control
+    uint32_t mute_ch_map;           // bitmask: bit N set if channel N supports mute
+    uint32_t volume_ch_map;         // bitmask: bit N set if channel N supports volume
 } uac2_feature_unit_t;
 
 typedef struct {

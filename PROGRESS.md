@@ -1,8 +1,41 @@
 # Progress
 
-## Status: Real hardware verified. All 12 tests pass against real miniDSP 2x4 HD (766s stability run, zero errors). Simulator updated to byte-exact match (373 bytes, 5 interfaces). Driver ready for minidsp-open integration.
+## Status: v0.1.0 — Install/uninstall lifecycle refactor complete and simulator-verified. Espressif class driver pattern with internal device discovery, linked lists, reference counting. All 12 tests pass against ESP32-to-ESP32 simulator, zero errors. 4-agent code review completed, all findings fixed.
 
 ## Completed
+
+### Phase 5 — Install/Uninstall Lifecycle Refactor (April 6, 2026)
+- [x] Refactored to Espressif USB host class driver pattern (matching CDC-ACM, HID, MSC, UAC1)
+- [x] `uac2_host_install(config)` / `uac2_host_uninstall()` — singleton driver, internal USB Host client
+- [x] `uac2_host_handle_events(timeout)` — manual or background task event pumping
+- [x] Internal device discovery: parses config descriptor on NEW_DEV, fires driver callbacks per AS interface
+- [x] Internal disconnect handling: iterates interfaces, stops streams, fires per-interface DISCONNECTED event
+- [x] Two-level struct split: `uac2_device_t` (physical, shared) + `uac2_iface_t` (per-interface, user handle)
+- [x] `uac2_stream_t` fields folded into `uac2_iface_t` — no more separate allocation
+- [x] Singleton `uac2_driver_t` with STAILQ linked lists (devices + interfaces)
+- [x] Lazy physical device creation with reference counting (opened_cnt)
+- [x] New `uac2_host_device_open(config, &handle)` — takes addr+iface_num from driver callback
+- [x] All public API renamed: `stream_*` → `device_*`, direction implicit from interface
+- [x] Device handle validation: `is_interface_in_list()` on all public functions
+- [x] `uac2_host_get_device_alt_param()` convenience function
+- [x] TX silence behavior documented in header
+- [x] `FLAG_STREAM_SUSPEND_AFTER_START` support in `uac2_host_device_start()`
+- [x] `main.c` rewritten: no manual USB client, driver callback creates device task
+- [x] LICENSE copied into `components/uac2_host/`
+- [x] Version set to 0.1.0 (pre-release)
+- [x] All battle-tested logic preserved: URB callbacks, feedback, state machine, error handling
+- [x] Both host and simulator build clean with zero warnings (`-Werror -Wextra`)
+- [x] `uac2_host_device_set_volume_all_channels()` — iterates bmaControls bitmap
+- [x] 4-agent code review: all 12 findings fixed (handle validation, disconnect race, gone flag, URB leak state, refcount safety, 5s timeout fix)
+- [x] Device discovery close-before-callback fix (USB device must be released before firing connect callback)
+- [x] All 12 tests pass against ESP32-to-ESP32 simulator (zero errors, zero disconnects)
+- [x] All 12 tests pass against real miniDSP 2x4 HD (zero errors, real feedback 48.0000 Hz)
+- [x] 3 disconnect/reconnect cycles verified: zero heap growth (220 bytes constant, ESP-IDF internal)
+- [x] Stack watermark: 4004 bytes free of 12288 (67% headroom)
+- [x] Fixed `atomic_init` UB on reused interface struct (was `atomic_init`, now `atomic_store`)
+- [x] Fixed stream resource leak on disconnect (stream_stop_internal now frees resources when state is IDLE but resources exist)
+- [x] Documented ESP-IDF v5.4 hot-unplug limitation: `abort()` in `usb_dwc_hal.c:548` during iso channel disconnect (not fixable in driver code)
+- [x] TODO-part2.md fully completed and deleted
 
 ### Phase 0A — Scaffold + Compile (April 5, 2026)
 - [x] ESP-IDF project scaffolded (CMake, sdkconfig.defaults, Kconfig overrides)
@@ -198,15 +231,17 @@ See `TODO(hardware)` markers in source code for details.
 - [x] 6 LOW: descriptor parser bounds checks, ep_interval no-mutate, duplicate vid/pid removed, Kconfig text, tone_gen assert
 - [x] Review fixes: stream_write/read signal-before-access ordering, semaphore leak in error paths, calc_packet_size==0 guard, ctrl_xfer_submitted_gen made atomic
 
-### Outstanding Features (see `docs/TODO-part2.md`)
+### TODO Part 2 Features — IMPLEMENTED (April 6, 2026)
+- [x] Suspend/resume (`uac2_host_stream_suspend`/`uac2_host_stream_resume`) — no URB/ringbuf realloc
+- [x] API mutex on all public functions (except stream_write/stream_read which use ringbuf sync)
+- [x] Stream dead notification: `UAC2_STREAM_STATE_ERROR` + `UAC2_HOST_EVENT_STREAM_ERROR` on max errors
+- [x] Volume/mute hardening: bmaControls parsed, capability checks, range caching+validation, percent API
+- [x] Debug print (`uac2_host_device_print_info`) — topology, runtime state, stream info
+- [x] Sample rate validation at stream_start (warns if rate not in advertised ranges)
+
+### Deferred (requires API break or external packaging)
 - [ ] Install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`) — Espressif class driver pattern
-- [ ] Suspend/resume without full teardown (for measurement sweep cycles)
-- [ ] Device handle validation (linked list walk)
-- [ ] Full state mutex for public API (partially done: per-stream spinlock, closing flag, state recheck)
-- [ ] Stream dead notification (`UAC2_HOST_EVENT_STREAM_DEAD` or error state)
-- [ ] Volume/mute hardening (range caching, feature unit capability detection, normalized API)
-- [ ] Debug print function (`uac2_host_device_printf_info`)
-- [ ] Sample rate validation at stream start (query RANGE, reject unsupported)
+- [ ] Device handle validation (linked list walk — requires install/uninstall)
 - [ ] Component registry packaging (examples directory, Doxygen, `-Werror -Wextra`)
 
 ## Hardware
