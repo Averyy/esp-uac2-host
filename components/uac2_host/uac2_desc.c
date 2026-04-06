@@ -1,12 +1,16 @@
-/**
- * @file uac2_desc.c
- * @brief USB Audio Class 2.0 descriptor parser
+/*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
  *
  * SPDX-License-Identifier: MIT
  */
 
+/**
+ * @file uac2_desc.c
+ * @brief USB Audio Class 2.0 descriptor parser
+ */
+
 #include <string.h>
-#include "uac2_desc.h"
+#include "usb/uac2_desc.h"
 #include "esp_log.h"
 
 static const char *TAG = "uac2-desc";
@@ -216,6 +220,7 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
         const uint8_t *desc = &config_desc[offset];
 
         if (type == 0x04) { // INTERFACE descriptor
+            if (len < 9) { offset += len; continue; }  // Standard interface descriptor is 9 bytes
             current_iface_num = desc[2];
             current_alt_setting = desc[3];
             current_num_endpoints = desc[4];

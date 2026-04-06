@@ -1,11 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 /**
  * @file uac2_host.h
  * @brief USB Audio Class 2.0 host driver for ESP32-S3
  *
  * Provides device management, clock control, volume/mute, and
  * isochronous audio streaming (playback and capture) for UAC2 devices.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #pragma once
@@ -15,19 +19,46 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "usb/usb_host.h"
-#include "uac2_desc.h"
+#include "usb/uac2_desc.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+// ── Version ───────────────────────────────────────────────────────
+
+#define UAC2_HOST_VER_MAJOR  1
+#define UAC2_HOST_VER_MINOR  0
+#define UAC2_HOST_VER_PATCH  0
+
 // ── Configuration defaults ─────────────────────────────────────────
 
-#define UAC2_NUM_ISOC_URBS          3       // URBs kept in flight
+// Configurable via Kconfig (menuconfig -> UAC2 Host Driver)
+#ifdef CONFIG_UAC2_NUM_ISOC_URBS
+#define UAC2_NUM_ISOC_URBS          CONFIG_UAC2_NUM_ISOC_URBS
+#else
+#define UAC2_NUM_ISOC_URBS          3
+#endif
+
 #define UAC2_NUM_PACKETS_PER_URB    1       // Packets per URB (1 = 1ms per URB at FS)
+
+#ifdef CONFIG_UAC2_CTRL_XFER_TIMEOUT_MS
+#define UAC2_CTRL_XFER_TIMEOUT_MS   CONFIG_UAC2_CTRL_XFER_TIMEOUT_MS
+#else
 #define UAC2_CTRL_XFER_TIMEOUT_MS   5000
-#define UAC2_CTRL_XFER_MAX_SIZE     256     // Max control transfer data size
-#define UAC2_MAX_CONSECUTIVE_ERRORS 10      // Stop URB re-submission after this many errors
+#endif
+
+#ifdef CONFIG_UAC2_CTRL_XFER_MAX_SIZE
+#define UAC2_CTRL_XFER_MAX_SIZE     CONFIG_UAC2_CTRL_XFER_MAX_SIZE
+#else
+#define UAC2_CTRL_XFER_MAX_SIZE     256
+#endif
+
+#ifdef CONFIG_UAC2_MAX_CONSECUTIVE_ERRORS
+#define UAC2_MAX_CONSECUTIVE_ERRORS CONFIG_UAC2_MAX_CONSECUTIVE_ERRORS
+#else
+#define UAC2_MAX_CONSECUTIVE_ERRORS 10
+#endif
 
 // ESP32-S3 DWC_OTG FIFO limits (1024 bytes total, bias-dependent):
 //   PERIODIC_OUT bias: PTX=600, RX=128, NPTX=64
@@ -53,7 +84,14 @@ typedef enum {
     UAC2_HOST_EVENT_DISCONNECTED,       /**< Device disconnected */
 } uac2_host_event_t;
 
-/** Event callback */
+/**
+ * Event callback. Called from the USB Host client event task context.
+ *
+ * @warning Must not block. Must not call uac2_host_stream_stop(),
+ *          uac2_host_device_close(), or any control request APIs
+ *          (set/get sample rate, volume, mute) from this callback —
+ *          doing so will deadlock the USB event task.
+ */
 typedef void (*uac2_host_event_cb_t)(uac2_host_device_handle_t dev,
                                      uac2_host_event_t event, void *arg);
 
@@ -93,7 +131,10 @@ esp_err_t uac2_host_device_open(usb_host_client_handle_t client,
                                 uac2_host_device_handle_t *out_dev);
 
 /**
- * Close a UAC2 device. Stops any active streams, frees resources.
+ * Close a UAC2 device. Stops any active streams, frees driver resources.
+ *
+ * @note Does NOT call usb_host_device_close() on the underlying USB device.
+ *       The caller must close the USB device handle separately.
  */
 esp_err_t uac2_host_device_close(uac2_host_device_handle_t dev);
 

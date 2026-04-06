@@ -1,6 +1,6 @@
 # Progress
 
-## Status: Phase 3 complete. Isochronous streaming verified end-to-end (48kHz/24-bit/stereo, 40+ seconds sustained, zero errors).
+## Status: Phase 3 complete + cleanup/hardening pass. All 5 tests pass, live-verified against simulator (55k+ frames, zero errors). 14 cleanup items + 29 code review findings fixed.
 
 ## Completed
 
@@ -112,6 +112,52 @@
 - [x] Added HID frame decode buffer size validation
 - [x] All 5 host driver tests pass with SET_INTERFACE fully working
 
+### ESP-IDF Convention Cleanup + Code Review (April 6, 2026)
+- [x] Headers moved to `include/usb/` (matches Espressif convention)
+- [x] SPDX copyright headers on all source files
+- [x] Espressif naming conventions: `s_` prefix for statics, no `_` prefix on file-scope functions
+- [x] `heap_caps_calloc`/`heap_caps_free` for explicit memory control
+- [x] `<inttypes.h>` format specifiers (`PRIu32` replaces `(unsigned long)` casts)
+- [x] `esp_check.h` macros (`ESP_RETURN_ON_FALSE`) on all public API functions
+- [x] Control transfer debug hex dump (`ESP_LOG_BUFFER_HEXDUMP` at DEBUG level)
+- [x] EP0 halt/flush/clear recovery after control transfer timeout
+- [x] Safe ringbuffer deletion (unblock waiting tasks before delete, conditional delay)
+- [x] VID/PID and string descriptors exposed in `uac2_device_info_t`
+- [x] Version macros (`UAC2_HOST_VER_MAJOR/MINOR/PATCH`)
+- [x] bInterval fixup for Full Speed data endpoints (warn + patch, skip feedback EPs)
+- [x] Low-speed device rejection
+- [x] Kconfig for tunable parameters (URB count, timeout, max size, error limit)
+- [x] `idf_component.yml` manifest for ESP Component Registry
+- [x] 5-agent code review: all critical/high/medium/low findings fixed
+- [x] Fixed swapped ringbuffer unblock logic (TX drains for space, RX sends dummy for data)
+- [x] Fixed feedback URB `urbs_in_flight` leak on state transition
+- [x] Set stream state to ACTIVE before URB submission (prevents callback race)
+- [x] Safe stream stop: don't free if URBs still in-flight (leak instead of use-after-free)
+- [x] Protected `device_close` from concurrent control requests (`closing` flag)
+- [x] Per-stream spinlock (replaces global `s_uac2_stream_lock`)
+- [x] State recheck in `stream_write`/`stream_read` after blocking ringbuf call
+- [x] TX_DONE single-shot flag (prevents event spam during underrun)
+- [x] Feedback callback consecutive error limit check
+- [x] Atomic `first_frame_us` for 32-bit safety
+- [x] Event callback context documented (must not block or call driver APIs)
+- [x] `device_close` contract documented (doesn't close underlying USB device)
+- [x] Interface descriptor minimum length check in parser
+- [x] URB drain wait in `stream_start` error path
+- [x] Stale semaphore drain after EP0 timeout recovery
+- [x] Reduced stack usage in `device_open` (parse directly into heap)
+- [x] All builds pass with zero errors, zero warnings
+
+### Live Test Verification (April 6, 2026)
+- [x] Flashed host + simulator on two ESP32-S3-DevKitC-1 boards
+- [x] Test 1 PASS: 48kHz/24-bit/stereo, 10 sec sustained
+- [x] Test 2 PASS: Volume/mute control during streaming (set/get mute, set/get volume -12dB)
+- [x] Test 3 PASS: Stop/restart cycle (5s 440Hz → stop → 2s pause → 5s 880Hz)
+- [x] Test 4 PASS: 44.1kHz sample rate switch, 5 sec sustained
+- [x] Test 5 PASS: Long-running stability, 55,000+ frames, zero errors
+- [x] Simulator confirms: all SET_INTERFACE transitions, sample rate switching, volume/mute, zero faults
+- [x] Frame math verified: 288 bytes/frame at 48kHz, 270 bytes/frame at 44.1kHz
+- [x] Identical behavior to pre-cleanup code — zero regressions
+
 ### Known Issues
 - [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
 - [ ] Feedback format confirmation (expect 3 bytes / 10.14 from XMOS at FS)
@@ -127,10 +173,22 @@ See `TODO(hardware)` markers in source code for details.
 - [ ] Streaming works on real device
 - [ ] Feedback format confirmed (3-byte 10.14 vs 4-byte 16.16)
 
-### Phase 4 — Polish + Integration
-- [ ] HID host driver support (for miniDSP control commands from ESP32)
-- [ ] Integration with minidsp-open Rust FFI
-- [ ] ESP-to-ESP streaming verification with real miniDSP device
+### Phase 4 — minidsp-open Integration
+- [ ] Integration with minidsp-open Rust FFI (`~/code/minidsp-open/docs/TODO-esp32-usb-audio.md`)
+- [ ] Sweep generator (Farina ESS, real-time on ESP32)
+- [ ] `POST /play` HTTP endpoint
+
+### Outstanding TODOs (see `docs/TODO.md` for details)
+- [ ] Install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`) — Espressif class driver pattern
+- [ ] Suspend/resume without full teardown (for measurement sweep cycles)
+- [ ] Device handle validation (linked list walk)
+- [ ] Full state mutex for public API (partially done: per-stream spinlock, closing flag, state recheck)
+- [ ] Stream dead notification (`UAC2_HOST_EVENT_STREAM_DEAD` or error state)
+- [ ] Fire `UAC2_HOST_EVENT_DISCONNECTED` (declared but never sent)
+- [ ] Volume/mute hardening (range caching, feature unit capability detection, normalized API)
+- [ ] Debug print function (`uac2_host_device_printf_info`)
+- [ ] Sample rate validation at stream start (query RANGE, reject unsupported)
+- [ ] Component registry packaging (examples directory, Doxygen, `-Werror -Wextra`)
 
 ## Hardware
 

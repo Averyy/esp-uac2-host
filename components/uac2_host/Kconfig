@@ -1,0 +1,35 @@
+menu "UAC2 Host Driver"
+
+    config UAC2_NUM_ISOC_URBS
+        int "Number of isochronous URBs kept in flight"
+        default 3
+        range 2 8
+        help
+            Number of isochronous transfer URBs kept in flight simultaneously.
+            More URBs reduce the chance of underrun but use more memory.
+
+    config UAC2_CTRL_XFER_TIMEOUT_MS
+        int "Control transfer timeout (ms)"
+        default 5000
+        range 1000 30000
+        help
+            Timeout for USB control transfers (SET_CUR, GET_CUR, GET_RANGE, etc.).
+
+    config UAC2_CTRL_XFER_MAX_SIZE
+        int "Max control transfer data size (bytes)"
+        default 256
+        range 64 1024
+        help
+            Maximum data payload size for control transfers.
+            Increase to 512+ if your device has a large configuration descriptor
+            (e.g., miniDSP 2x4 HD is 373 bytes).
+
+    config UAC2_MAX_CONSECUTIVE_ERRORS
+        int "Max consecutive transfer errors before stopping"
+        default 10
+        range 1 100
+        help
+            Stop URB re-submission after this many consecutive isochronous
+            transfer errors.
+
+endmenu

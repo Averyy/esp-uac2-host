@@ -6,17 +6,19 @@ USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component written in C. MI
 
 A generic UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio to/from any USB Audio Class 2.0 device (DACs, audio interfaces, miniDSP hardware). The primary use case is playing measurement sweeps through a miniDSP 2x4 HD for automated subwoofer optimization.
 
-The driver is complete and verified end-to-end against a TinyUSB-based simulator running on a second ESP32-S3. 487,000+ audio frames delivered with zero errors. Not yet tested with real hardware.
+v1.0.0 — complete, hardened, live-tested. All 5 automated tests pass against a TinyUSB-based miniDSP simulator (55k+ frames, zero errors). Full ESP-IDF convention cleanup + 5-agent code review with 29 findings fixed. Not yet tested with real hardware.
 
 ## Architecture
 
 ```
 components/uac2_host/           ESP-IDF component (the driver)
-  include/uac2_host.h           Public API: device open/close, stream start/stop/read/write, clock, volume
-  include/uac2_desc.h           UAC2 descriptor structs (clock source, terminals, feature unit, AS, format type)
-  uac2_host.c                   Driver implementation (~1200 lines)
-  uac2_desc.c                   Descriptor parser (~400 lines)
-  CMakeLists.txt                Component build file (REQUIRES usb, PRIV_REQUIRES esp_ringbuf)
+  include/usb/uac2_host.h      Public API: device open/close, stream start/stop/read/write, clock, volume
+  include/usb/uac2_desc.h      UAC2 descriptor structs (clock source, terminals, feature unit, AS, format type)
+  uac2_host.c                  Driver implementation (~1400 lines)
+  uac2_desc.c                  Descriptor parser (~400 lines)
+  CMakeLists.txt               Component build file (REQUIRES usb, PRIV_REQUIRES esp_ringbuf)
+  Kconfig                      Tunable parameters (URB count, timeout, max size, error limit)
+  idf_component.yml            Component registry manifest
 
 main/                           Test application
   main.c                        5 automated tests: 48kHz, volume/mute, stop/restart, 44.1kHz, long-running
@@ -41,7 +43,7 @@ ref/                            Reference code (read-only, not compiled)
 - `uac2_stream_config_t` — `{ sample_rate, bit_resolution, channels }`
 - `uac2_host_event_t` — `TX_DONE`, `RX_DONE`, `TRANSFER_ERROR`, `DISCONNECTED`
 - `uac2_host_event_cb_t` — callback signature `void(dev, event, arg)`
-- `uac2_device_info_t` — parsed descriptor info (AS interfaces, clock sources, terminals)
+- `uac2_device_info_t` — parsed descriptor info (AS interfaces, clock sources, terminals) + VID/PID/strings (populated by device_open)
 - `uac2_sample_rate_range_t` — `{ min, max, res }`
 
 ### Functions
@@ -70,18 +72,22 @@ esp_err_t uac2_host_get_volume(handle, channel, &volume_db256);
 esp_err_t uac2_host_set_mute(handle, channel, mute);
 esp_err_t uac2_host_get_mute(handle, channel, &mute);
 
-// Event callback
-esp_err_t uac2_host_device_set_event_cb(handle, cb, arg);
+// Event callback set via uac2_host_device_open() — called from USB host task,
+// must not block or call stream_stop/device_close/control request APIs.
 ```
 
-### Constants
+### Constants (configurable via Kconfig)
 ```c
-#define UAC2_NUM_ISOC_URBS          3       // URBs in flight
+#define UAC2_HOST_VER_MAJOR         1
+#define UAC2_HOST_VER_MINOR         0
+#define UAC2_HOST_VER_PATCH         0
+#define UAC2_NUM_ISOC_URBS          3       // URBs in flight (Kconfig: UAC2_NUM_ISOC_URBS)
 #define UAC2_NUM_PACKETS_PER_URB    1       // 1 packet per URB (1ms at Full Speed)
-#define UAC2_CTRL_XFER_TIMEOUT_MS   5000
-#define UAC2_CTRL_XFER_MAX_SIZE     256
-#define UAC2_MAX_CONSECUTIVE_ERRORS 10      // stops URB re-submission
+#define UAC2_CTRL_XFER_TIMEOUT_MS   5000    // Kconfig: UAC2_CTRL_XFER_TIMEOUT_MS
+#define UAC2_CTRL_XFER_MAX_SIZE     256     // Kconfig: UAC2_CTRL_XFER_MAX_SIZE
+#define UAC2_MAX_CONSECUTIVE_ERRORS 10      // Kconfig: UAC2_MAX_CONSECUTIVE_ERRORS
 #define UAC2_MAX_SAMPLE_RATE_RANGES 16
+#define UAC2_MAX_STRING_LEN         64      // VID/PID/strings in uac2_device_info_t
 ```
 
 ## Internal Design
@@ -98,11 +104,14 @@ Async playback uses a feedback endpoint (EP IN, isochronous). The device reports
 All control requests go through `ctrl_request()` which serializes access via a mutex + completion semaphore. For requests with no response data (SET_INTERFACE, SET_CUR), use `ctrl_request_no_data()` which auto-releases the mutex. For GET requests, `ctrl_get_cur`/`ctrl_get_range` wrappers copy response data then release.
 
 ### Thread Safety
-- `uac2_stream_lock` (portMUX spinlock): protects `stream->state` transitions. Callbacks check state under this lock before resubmitting URBs.
-- `ctrl_mutex` (FreeRTOS mutex): serializes control transfer access.
+- `stream->state_lock` (portMUX spinlock, per-stream): protects `stream->state` transitions. Callbacks check state under this lock before resubmitting URBs.
+- `ctrl_mutex` (FreeRTOS mutex): serializes control transfer access. WARNING: `ctrl_request()` holds mutex after success — caller must release after reading response data.
+- `dev->closing` (volatile bool): set during `device_close()` to reject new control requests.
 - `urbs_in_flight` (atomic_int): tracks in-flight URBs for clean shutdown.
-- `consecutive_errors` (atomic_int): counts errors, stops re-submission at threshold.
+- `consecutive_errors` (atomic_int): counts errors, stops re-submission at threshold (TX, RX, and feedback).
 - `fb_value` (atomic_uint): feedback value written by feedback callback, read by TX submit.
+- `first_frame_us` (_Atomic int64_t): microsecond timestamp, write-once.
+- `tx_done_pending` (bool): single-shot flag to prevent TX_DONE event spam during underrun.
 
 ## Hardware Constraints
 
@@ -134,10 +143,13 @@ Full composite USB device simulator at `simulators/minidsp-2x4hd/`. Runs on a se
 
 ## Known Issues / Limitations
 
-- Not tested with real hardware yet (only simulator)
+- Not tested with real hardware yet (only simulator — all 5 tests pass, 55k+ frames, zero errors)
+- No `uac2_host_install()`/`uac2_host_uninstall()` lifecycle — caller manages USB Host client directly
 - No HID host support in the driver (HID is separate — the simulator implements the device side)
 - `UAC2_HOST_EVENT_DISCONNECTED` is declared but never fired (disconnect detected via USB Host Library client events)
 - No suspend/resume API — every stop/start cycle reallocates URBs and ringbuf
+- `device_close()` does NOT call `usb_host_device_close()` — caller must close USB device separately
+- Event callback must not block or call stream_stop/device_close/control APIs (deadlock)
 - ESP-IDF bug #17707: `usb_host_interface_release()` can fail with ESP_ERR_INVALID_STATE. Driver has retry logic (5 attempts, 20ms between).
 
 ## Related Projects

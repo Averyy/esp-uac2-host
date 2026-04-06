@@ -179,7 +179,7 @@ esp_err_t uac2_host_set_mute(handle, channel, mute);
 esp_err_t uac2_host_get_mute(handle, channel, &mute);
 ```
 
-Note: The current API requires the caller to manage the USB Host client and device enumeration. A future release will add `uac2_host_install()`/`uac2_host_uninstall()` matching the Espressif driver pattern. See `docs/TODO-prep-driver-for-release.md`.
+Note: The current API requires the caller to manage the USB Host client and device enumeration. `uac2_host_device_close()` does NOT call `usb_host_device_close()` — the caller must close the USB device separately. A future release will add `uac2_host_install()`/`uac2_host_uninstall()` matching the Espressif driver pattern. See `docs/TODO.md`.
 
 ## Key References
 

@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**Phase 3 complete + miniDSP simulator fully working.** Full driver stack end-to-end: descriptor parser, control requests (CUR/RANGE), SET_INTERFACE, isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Two simulators: `simulators/simple/` (minimal UAC2) and `simulators/minidsp-2x4hd/` (full composite device: UAC2 audio + HID control with complete command protocol, EEPROM/DSP state, fault injection). All 5 host tests pass. Simulator receives audio frames end-to-end (487k+ verified). SET_INTERFACE crash was ISR logging bug (ESP_LOGI in USB ISR context), now fixed. Next: test with real miniDSP 2x4 HD. See `PROGRESS.md` for detailed status.
+**v1.0.0 — Complete, hardened, live-tested.** Full driver stack: descriptor parser, control requests (CUR/RANGE), SET_INTERFACE, isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Two simulators: `simulators/simple/` and `simulators/minidsp-2x4hd/` (full composite). All 5 tests pass live against simulator (55k+ frames, zero errors, zero regressions). 14 cleanup items (ESP-IDF conventions) + 29 code review findings fixed. Headers at `include/usb/uac2_host.h` and `include/usb/uac2_desc.h`. Kconfig + idf_component.yml added. Next: test with real miniDSP 2x4 HD, then integrate with minidsp-open. See `PROGRESS.md` for detailed status, `docs/TODO.md` for remaining work.
 
 ## Related Projects
 

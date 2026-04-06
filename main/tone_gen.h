@@ -1,11 +1,15 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 /**
  * @file tone_gen.h
  * @brief Simple sine tone generator for audio testing
  *
  * Generates interleaved PCM sine waves at a specified frequency.
  * Used to verify playback through the UAC2 driver.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #pragma once

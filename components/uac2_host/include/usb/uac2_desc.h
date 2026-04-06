@@ -1,3 +1,9 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 /**
  * @file uac2_desc.h
  * @brief USB Audio Class 2.0 descriptor definitions and parser
@@ -5,8 +11,6 @@
  * Struct definitions derived from USBX ux_class_audio20.h (MIT) and
  * CherryUSB usb_audio.h (Apache-2.0), rewritten with standard C types
  * for ESP-IDF.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #pragma once
@@ -259,11 +263,22 @@ typedef struct {
     uint8_t  fb_ep_interval;
 } uac2_as_iface_t;
 
+#define UAC2_MAX_STRING_LEN 64
+
 typedef struct {
     bool     is_uac2;
     uint16_t bcdADC;
     uint8_t  category;
     uint8_t  ac_iface_num;          // Audio Control interface number
+
+    // Device identification — NOT populated by uac2_parse_config_descriptor().
+    // These fields are filled by uac2_host_device_open() from the device descriptor
+    // and USB string descriptors. They will be zero/empty after parse-only calls.
+    uint16_t vid;
+    uint16_t pid;
+    char     manufacturer[UAC2_MAX_STRING_LEN];
+    char     product[UAC2_MAX_STRING_LEN];
+    char     serial[UAC2_MAX_STRING_LEN];
 
     // Clock topology
     uint8_t              num_clock_sources;

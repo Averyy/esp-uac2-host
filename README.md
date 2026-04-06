@@ -6,7 +6,7 @@ Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, mini
 
 ## Status
 
-**Driver complete, verified end-to-end against simulator.** SET_INTERFACE, isochronous streaming, feedback-based adaptive packet sizing, volume/mute, sample rate switching, stop/restart — all working. 487,000+ audio frames delivered to simulator with zero errors. 6-agent code review completed, all findings fixed. Next: test with real miniDSP 2x4 HD hardware.
+**v1.0.0 — Driver complete, hardened, live-tested.** All 5 automated tests pass against miniDSP 2x4 HD simulator (55k+ frames, zero errors). Full cleanup pass (ESP-IDF conventions, Kconfig, idf_component.yml) + 5-agent code review with all 29 findings fixed. Next: test with real miniDSP 2x4 HD hardware, then integrate with minidsp-open.
 
 See [PROGRESS.md](PROGRESS.md) for detailed history and [docs/TODO.md](docs/TODO.md) for remaining work.
 
@@ -27,11 +27,11 @@ See [PROGRESS.md](PROGRESS.md) for detailed history and [docs/TODO.md](docs/TODO
 ## Quick Start
 
 ```c
-#include "uac2_host.h"
+#include "usb/uac2_host.h"
 
 // After USB enumeration...
 uac2_host_device_handle_t dev;
-uac2_host_device_open(client, usb_dev, &dev);
+uac2_host_device_open(client, usb_dev, event_cb, NULL, &dev);
 
 // Start 48kHz/24-bit/stereo playback
 uac2_stream_config_t cfg = { .sample_rate = 48000, .bit_resolution = 24, .channels = 2 };
@@ -41,7 +41,7 @@ uac2_host_stream_start(dev, UAC2_STREAM_TX, &cfg);
 uac2_host_stream_write(dev, pcm_data, num_bytes, timeout_ms);
 
 // Get hardware timestamp of first audio frame
-int64_t start_us = uac2_host_stream_get_start_time(dev, UAC2_STREAM_TX);
+int64_t start_us = uac2_host_stream_get_start_time(dev);
 
 // Stop
 uac2_host_stream_stop(dev, UAC2_STREAM_TX);
@@ -52,10 +52,12 @@ uac2_host_device_close(dev);
 
 ```
 components/uac2_host/       # The driver (ESP-IDF component)
-  include/uac2_host.h       #   Public API
-  include/uac2_desc.h       #   Descriptor structs
+  include/usb/uac2_host.h   #   Public API
+  include/usb/uac2_desc.h   #   Descriptor structs
   uac2_host.c               #   Driver implementation
   uac2_desc.c               #   Descriptor parser
+  Kconfig                   #   Tunable parameters (menuconfig)
+  idf_component.yml         #   Component registry manifest
 main/                        # Test harness (5 automated tests)
   main.c                    #   Enumeration + streaming test suite
   tone_gen.c/h              #   Sine wave generator

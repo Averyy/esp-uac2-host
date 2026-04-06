@@ -1,8 +1,12 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
 /**
  * @file tone_gen.c
  * @brief Simple sine tone generator for audio testing
- *
- * SPDX-License-Identifier: MIT
  */
 
 #include <math.h>

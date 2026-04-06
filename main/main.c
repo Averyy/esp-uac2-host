@@ -1,20 +1,25 @@
 /*
+ * SPDX-FileCopyrightText: 2026 Avery Levitt
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+/*
  * esp-uac2-host — USB Host enumeration + UAC2 driver
  *
  * Initializes USB Host mode on ESP32-S3, enumerates connected USB devices,
  * and drives them through the UAC2 host driver. Runs a self-test against
  * static miniDSP 2x4 HD descriptors at boot.
- *
- * SPDX-License-Identifier: MIT
  */
 
 #include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "usb/usb_host.h"
-#include "uac2_desc.h"
-#include "uac2_host.h"
+#include "usb/uac2_desc.h"
+#include "usb/uac2_host.h"
 #include "tone_gen.h"
 
 // Static miniDSP descriptor dump for self-test (ref/ added to include path in CMakeLists)
@@ -190,9 +195,8 @@ static int stream_tone(class_driver_t *driver, uint32_t sample_rate,
     uint32_t bytes_per_ms = (sample_rate / 1000) * TONE_CHANNELS * (TONE_BIT_DEPTH / 8);
     uint32_t buf_size = bytes_per_ms * TONE_BUF_MS;
 
-    ESP_LOGI(TAG, "Streaming %d Hz @ %lu Hz for %d sec (pkt=%lu bytes)",
-             (int)freq_hz, (unsigned long)sample_rate, duration_sec,
-             (unsigned long)bytes_per_ms);
+    ESP_LOGI(TAG, "Streaming %d Hz @ %" PRIu32 " Hz for %d sec (pkt=%" PRIu32 " bytes)",
+             (int)freq_hz, sample_rate, duration_sec, bytes_per_ms);
 
     tone_gen_t gen;
     tone_gen_config_t tone_cfg = {
@@ -228,8 +232,8 @@ static int stream_tone(class_driver_t *driver, uint32_t sample_rate,
         if (wr == ESP_OK) {
             writes++;
             if (writes % writes_per_sec == 0) {
-                ESP_LOGI(TAG, "  %lu sec",
-                         (unsigned long)(writes / writes_per_sec));
+                ESP_LOGI(TAG, "  %" PRIu32 " sec",
+                         writes / writes_per_sec);
             }
         }
     }
@@ -425,7 +429,7 @@ static void handle_new_device_task(void *arg)
         uint32_t sample_rate = 0;
         err = uac2_host_get_sample_rate(driver->uac2_dev, &sample_rate);
         if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Current sample rate: %lu Hz", (unsigned long)sample_rate);
+            ESP_LOGI(TAG, "Current sample rate: %" PRIu32 " Hz", sample_rate);
         } else {
             ESP_LOGW(TAG, "Could not read sample rate: %s", esp_err_to_name(err));
         }
