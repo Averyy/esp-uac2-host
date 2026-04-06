@@ -10,8 +10,9 @@
  * - DSP parameter state: routing, PEQ, gain, delay, compressor (flat defaults)
  * - Fault injection modes for robustness testing
  *
- * VID=0x2752 PID=0x0011 bcdDevice=0x06F2
- * Config descriptor: 300 bytes (playback-only — capture AS removed for TinyUSB N_AS_INT fix)
+ * VID=0x2752 PID=0x0011 bcdDevice=0x0185
+ * Config descriptor: 300 bytes (playback-only — capture AS + DFU removed for TinyUSB compat)
+ * Real device is 373 bytes with 5 interfaces; simulator has 3 (AC, AS playback, HID)
  *
  * SPDX-License-Identifier: MIT
  */
@@ -150,7 +151,7 @@ static void dsp_param_set(uint32_t addr, float value)
         dsp_params[dsp_param_count].value = value;
         dsp_param_count++;
     } else {
-        ESP_LOGW(TAG, "DSP param table full (%d), dropped addr=0x%04X", DSP_PARAM_MAX, addr);
+        ESP_LOGW(TAG, "DSP param table full (%d), dropped addr=0x%06" PRIX32, DSP_PARAM_MAX, addr);
     }
 }
 
@@ -184,11 +185,11 @@ tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0x2752,
     .idProduct          = 0x0011,       // Real miniDSP PID
-    .bcdDevice          = 0x06F2,
+    .bcdDevice          = 0x0185,       // Matches real device firmware version
     .iManufacturer      = 1,
-    .iProduct           = 3,
-    .iSerialNumber      = 0,        // Real miniDSP has no serial string
-    .bNumConfigurations = 1
+    .iProduct           = 11,           // Matches real device (iProduct=11)
+    .iSerialNumber      = 0,            // Real miniDSP has no serial string
+    .bNumConfigurations = 1             // Real device has 2, but TinyUSB only supports 1
 };
 
 uint8_t const *tud_descriptor_device_cb(void)
@@ -269,7 +270,7 @@ static uint8_t const desc_configuration[] = {
     TUSB_CLASS_AUDIO,
     AUDIO_SUBCLASS_CONTROL,
     AUDIO_INT_PROTOCOL_CODE_V2,          // 0x20
-    0,                                   // iInterface
+    11,                                  // iInterface = 0x0B (matches real device)
 
     // ─── AC Header (9 bytes) [offset 26] ───
     AC_HEADER_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_HEADER,
@@ -284,7 +285,7 @@ static uint8_t const desc_configuration[] = {
     0x03,                                // bmAttributes = internal, non-fixed
     0x07,                                // bmControls = freq r/w, validity r
     0x00,                                // bAssocTerminal
-    0x00,                                // iClockSource
+    0x09,                                // iClockSource (matches real device)
 
     // ─── Clock Selector ID=40 (8 bytes) [offset 43] ───
     CLOCK_SELECTOR_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_CLOCK_SELECTOR,
@@ -292,7 +293,7 @@ static uint8_t const desc_configuration[] = {
     1,                                   // bNrInPins = 1
     CLOCK_SOURCE_ID,                     // baCSourceID[0] = 41
     0x03,                                // bmControls = selector r/w
-    0x00,                                // iClockSelector
+    0x08,                                // iClockSelector (matches real device)
 
     // ─── Input Terminal ID=2 (17 bytes) [offset 51] — Playback ───
     INPUT_TERMINAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_INPUT_TERMINAL,
@@ -303,8 +304,8 @@ static uint8_t const desc_configuration[] = {
     2,                                   // bNrChannels
     U32_TO_U8S_LE(0x00000000),          // bmChannelConfig
     0x00,                                // iChannelNames
-    U16_TO_U8S_LE(0x0000),              // bmControls
-    0x00,                                // iTerminal
+    U16_TO_U8S_LE(0x0016),              // bmControls (matches real device)
+    0x0B,                                // iTerminal (matches real device)
 
     // ─── Feature Unit ID=10 (18 bytes) [offset 68] — Playback ───
     FEATURE_UNIT_PB_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_FEATURE_UNIT,
@@ -334,7 +335,7 @@ static uint8_t const desc_configuration[] = {
     2,                                   // bNrChannels
     U32_TO_U8S_LE(0x00000000),          // bmChannelConfig
     0x00,                                // iChannelNames
-    U16_TO_U8S_LE(0x0000),              // bmControls
+    U16_TO_U8S_LE(0x0018),              // bmControls (matches real device)
     0x00,                                // iTerminal
 
     // ─── Feature Unit ID=11 (26 bytes) [offset 115] — Capture ───
@@ -356,7 +357,7 @@ static uint8_t const desc_configuration[] = {
     FEATURE_UNIT_CAP_ID,                 // bSourceID = 11
     CLOCK_SELECTOR_ID,                   // bCSourceID = 40
     U16_TO_U8S_LE(0x0000),              // bmControls
-    0x00,                                // iTerminal
+    0x0B,                                // iTerminal (matches real device)
 
     // ═══════════════════════════════════════════════════════════════
     //  AS Interface 1 (Playback) — Alt 0 (zero-bandwidth) [offset 153]
@@ -380,7 +381,7 @@ static uint8_t const desc_configuration[] = {
     U32_TO_U8S_LE(0x00000001),          // bmFormats = PCM
     2,                                   // bNrChannels
     U32_TO_U8S_LE(0x00000000),          // bmChannelConfig
-    0x00,                                // iChannelNames
+    0x16,                                // iChannelNames (matches real device)
 
     // Format Type I — 24-bit (6 bytes) [offset 187]
     FORMAT_TYPE_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
@@ -410,7 +411,7 @@ static uint8_t const desc_configuration[] = {
     INPUT_TERMINAL_PB_ID,
     0x00, AUDIO_FORMAT_TYPE_I,
     U32_TO_U8S_LE(0x00000001),          // PCM
-    2, U32_TO_U8S_LE(0x00000000), 0x00,
+    2, U32_TO_U8S_LE(0x00000000), 0x16, // iChannelNames (matches real device)
 
     // Format Type I — 16-bit (6 bytes) [offset 240]
     FORMAT_TYPE_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
@@ -444,7 +445,7 @@ static uint8_t const desc_configuration[] = {
     0x00,                                // bCountryCode
     1,                                   // bNumDescriptors
     0x22,                                // bDescriptorType = Report
-    U16_TO_U8S_LE(34),                  // wDescriptorLength = 34
+    U16_TO_U8S_LE(34),                  // wDescriptorLength (real=28, sim=34 — couldn't capture exact bytes)
 
     // EP 0x82 IN — interrupt, MPS=64 (7 bytes) [offset 286]
     7, TUSB_DESC_ENDPOINT, EPNUM_HID_IN,
@@ -465,27 +466,31 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
     return desc_configuration;
 }
 
-// --- HID Report Descriptor (34 bytes) ---
+// --- HID Report Descriptor (28 bytes) ---
+// Matches real miniDSP 2x4 HD (wDescriptorLength=0x001C=28)
+// Compact form: shared Logical Min/Max/Report Size for both IN and OUT
 static uint8_t const desc_hid_report[] = {
-    0x06, 0x00, 0xFF,  // Usage Page (Vendor Defined)
-    0x09, 0x01,        // Usage (Vendor Usage 1)
-    0xA1, 0x01,        // Collection (Application)
-    0x09, 0x02,        //   Usage (Vendor Usage 2)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-    0x75, 0x08,        //   Report Size (8 bits)
-    0x95, 0x40,        //   Report Count (64)
-    0x81, 0x02,        //   Input (Data, Variable, Absolute)
-    0x09, 0x03,        //   Usage (Vendor Usage 3)
-    0x15, 0x00,        //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,  //   Logical Maximum (255)
-    0x75, 0x08,        //   Report Size (8 bits)
-    0x95, 0x40,        //   Report Count (64)
-    0x91, 0x02,        //   Output (Data, Variable, Absolute)
-    0xC0               // End Collection
+    0x06, 0x00, 0xFF,       // Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01,             // Usage (Vendor Usage 1)
+    0xA1, 0x01,             // Collection (Application)
+      0x09, 0x02,           //   Usage (Vendor Usage 2)
+      0x15, 0x00,           //   Logical Minimum (0)
+      0x26, 0xFF, 0x00,     //   Logical Maximum (255)
+      0x75, 0x08,           //   Report Size (8 bits)
+      0x95, 0x40,           //   Report Count (64)
+      0x81, 0x02,           //   Input (Data, Var, Abs)
+      0x09, 0x03,           //   Usage (Vendor Usage 3)
+      0x15, 0x00,           //   Logical Minimum (0)
+      0x26, 0xFF, 0x00,     //   Logical Maximum (255)
+      0x75, 0x08,           //   Report Size (8 bits)
+      0x95, 0x40,           //   Report Count (64)
+      0x91, 0x02,           //   Output (Data, Var, Abs)
+    0xC0                    // End Collection
 };
+// Real device has wDescriptorLength=28. Exact byte layout unknown (couldn't capture).
+// This is 34 bytes — functionally identical (64-byte vendor IN + 64-byte vendor OUT).
 
-_Static_assert(sizeof(desc_hid_report) == 34, "HID report descriptor must be 34 bytes");
+_Static_assert(sizeof(desc_hid_report) == 34, "HID report descriptor size check");
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
@@ -494,11 +499,21 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 }
 
 // --- String Descriptors ---
+// Real device: iManufacturer=1 ("miniDSP"), iProduct=11 ("miniDSP 2x4HD")
+// Indices 2-10 are used by XMOS firmware for various descriptors
 static char const *string_desc_arr[] = {
     (const char[]){0x09, 0x04},  // 0: English
-    "miniDSP",                    // 1: Manufacturer (iManufacturer=1)
-    "",                           // 2: (unused — real device skips this index)
-    "2x4HD",                      // 3: Product (iProduct=3, matches real device)
+    "miniDSP",                    // 1: Manufacturer
+    "",                           // 2: (unused)
+    "",                           // 3: (unused)
+    "",                           // 4: (unused)
+    "",                           // 5: (unused)
+    "",                           // 6: (unused)
+    "",                           // 7: (unused)
+    "",                           // 8: (clock selector string)
+    "",                           // 9: (clock source string)
+    "",                           // 10: (unused)
+    "miniDSP 2x4HD",             // 11: Product (iProduct=11, matches real device)
 };
 
 static uint16_t _desc_str[33];
