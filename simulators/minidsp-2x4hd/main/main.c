@@ -507,7 +507,7 @@ static uint8_t const desc_configuration[] = {
     0x00,                                // bCountryCode
     1,                                   // bNumDescriptors
     0x22,                                // bDescriptorType = Report
-    U16_TO_U8S_LE(34),                  // wDescriptorLength (real=28, couldn't capture exact bytes)
+    U16_TO_U8S_LE(28),                  // wDescriptorLength = 28 (matches real device)
 
     // EP 0x83 IN — interrupt, MPS=64 (7 bytes)
     7, TUSB_DESC_ENDPOINT, EPNUM_HID_IN,
@@ -527,30 +527,25 @@ uint8_t const *tud_descriptor_configuration_cb(uint8_t index)
 }
 
 // --- HID Report Descriptor (28 bytes) ---
-// Matches real miniDSP 2x4 HD (wDescriptorLength=0x001C=28)
-// Compact form: shared Logical Min/Max/Report Size for both IN and OUT
+// Captured from real miniDSP 2x4 HD via hidapi get_report_descriptor()
 static uint8_t const desc_hid_report[] = {
     0x06, 0x00, 0xFF,       // Usage Page (Vendor Defined 0xFF00)
     0x09, 0x01,             // Usage (Vendor Usage 1)
     0xA1, 0x01,             // Collection (Application)
-      0x09, 0x02,           //   Usage (Vendor Usage 2)
-      0x15, 0x00,           //   Logical Minimum (0)
-      0x26, 0xFF, 0x00,     //   Logical Maximum (255)
+      0x19, 0x01,           //   Usage Minimum (1)
+      0x29, 0x40,           //   Usage Maximum (64)
+      0x15, 0x01,           //   Logical Minimum (1)
+      0x25, 0x40,           //   Logical Maximum (64)
       0x75, 0x08,           //   Report Size (8 bits)
       0x95, 0x40,           //   Report Count (64)
-      0x81, 0x02,           //   Input (Data, Var, Abs)
-      0x09, 0x03,           //   Usage (Vendor Usage 3)
-      0x15, 0x00,           //   Logical Minimum (0)
-      0x26, 0xFF, 0x00,     //   Logical Maximum (255)
-      0x75, 0x08,           //   Report Size (8 bits)
-      0x95, 0x40,           //   Report Count (64)
-      0x91, 0x02,           //   Output (Data, Var, Abs)
+      0x81, 0x00,           //   Input (Data, Array, Abs)
+      0x19, 0x01,           //   Usage Minimum (1)
+      0x29, 0x40,           //   Usage Maximum (64)
+      0x91, 0x00,           //   Output (Data, Array, Abs)
     0xC0                    // End Collection
 };
-// Real device has wDescriptorLength=28. Exact byte layout unknown (couldn't capture).
-// This is 34 bytes — functionally identical (64-byte vendor IN + 64-byte vendor OUT).
 
-_Static_assert(sizeof(desc_hid_report) == 34, "HID report descriptor size check");
+_Static_assert(sizeof(desc_hid_report) == 28, "HID report descriptor must be 28 bytes (real device)");
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
 {
