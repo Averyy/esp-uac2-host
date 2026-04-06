@@ -192,26 +192,11 @@ See `TODO(hardware)` markers in source code for details.
 - [ ] Sweep generator (Farina ESS, real-time on ESP32)
 - [ ] `POST /play` HTTP endpoint
 
-### Code Review Findings (see `docs/TODO-part1.md`)
-- [ ] **HIGH**: `device_close()` skips SET_INTERFACE(alt=0) — `closing` flag blocks internal control requests
-- [ ] **HIGH**: Integer underflow in `usb_string_to_ascii` — OOB read from hostile USB device (one-line fix)
-- [ ] **HIGH**: `UAC2_HOST_EVENT_DISCONNECTED` declared but never fired — broken API contract
-- [ ] **HIGH**: `stream_write`/`stream_read` use-after-free — 20ms heuristic in `stream_free` is not safe
-- [ ] **MED**: Clock selector `nr_pins` OOB read in log loop
-- [ ] **MED**: `calc_packet_size` integer overflow with rogue device inputs
-- [ ] **MED**: Feedback value not validated — device can force zero-length packets
-- [ ] **MED**: `tx_done_pending` data race (plain `bool`, should be `_Atomic`)
-- [ ] **MED**: `volatile bool closing` insufficient for cross-core (should be `_Atomic`)
-- [ ] **MED**: `stream_get_start_time` TOCTOU null deref
-- [ ] **MED**: `UAC2_MAX_AS_INTERFACES = 4` silently truncates without logging
-- [ ] **MED**: Control transfer timeout recovery can corrupt next request (stale semaphore)
-- [ ] **MED**: `fb_accumulator` not atomic — fragile single-threaded assumption
-- [ ] **LOW**: Descriptor parser reads `desc[2]` without `len >= 3` check
-- [ ] **LOW**: Descriptor parser `bLength = 1` doesn't terminate loop
-- [ ] **LOW**: `ep_interval` patch mutates canonical `desc_info` in-place
-- [ ] **LOW**: Duplicate `vid`/`pid` fields on device struct
-- [ ] **LOW**: Kconfig help text for `UAC2_CTRL_XFER_MAX_SIZE` is misleading
-- [ ] **LOW**: `tone_gen.c` silently mishandles bit depths other than 16 or 24
+### Code Review Findings — ALL FIXED (April 6, 2026)
+- [x] 4 HIGH: device_close SET_INTERFACE fix, usb_string_to_ascii underflow guard, DISCONNECTED event firing, stream_free use-after-free (semaphore handshake)
+- [x] 9 MED: nr_pins OOB, calc_packet_size overflow, feedback validation, tx_done_pending atomic, closing atomic, TOCTOU fixes, AS truncation logging, ctrl timeout gen counter, fb_accumulator documented
+- [x] 6 LOW: descriptor parser bounds checks, ep_interval no-mutate, duplicate vid/pid removed, Kconfig text, tone_gen assert
+- [x] Review fixes: stream_write/read signal-before-access ordering, semaphore leak in error paths, calc_packet_size==0 guard, ctrl_xfer_submitted_gen made atomic
 
 ### Outstanding Features (see `docs/TODO-part2.md`)
 - [ ] Install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`) — Espressif class driver pattern

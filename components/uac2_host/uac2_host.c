@@ -68,7 +68,7 @@ typedef struct {
     uint8_t  fb_ep_addr;        // 0 if no feedback
     usb_transfer_t *fb_xfer;
     atomic_uint fb_value;       // latest feedback in 16.16 format (written by fb callback, read by TX submit)
-    uint32_t fb_accumulator;    // fractional sample accumulator for adaptive sizing
+    uint32_t fb_accumulator;    // fractional sample accumulator (only accessed from USB callback task)
 
     // Isochronous URBs
     usb_transfer_t *xfer[UAC2_NUM_ISOC_URBS];
@@ -83,7 +83,12 @@ typedef struct {
     RingbufHandle_t ringbuf;
     uint32_t ringbuf_size;
     uint32_t ringbuf_threshold;
-    bool tx_done_pending;       // single-shot flag: true after TX_DONE fired, cleared by stream_write
+    _Atomic bool tx_done_pending; // single-shot flag: true after TX_DONE fired, cleared by stream_write
+
+    // Synchronization for safe stream_free: signaled by stream_write/stream_read
+    // when they return from a blocking ringbuf call, so stream_free can wait.
+    SemaphoreHandle_t user_task_done;
+    _Atomic bool user_task_blocked;  // true while a task is blocked in stream_write/stream_read
 } uac2_stream_t;
 
 struct uac2_host_device {
@@ -92,8 +97,6 @@ struct uac2_host_device {
     usb_device_handle_t usb_dev;
 
     // Device info
-    uint16_t vid;
-    uint16_t pid;
     uac2_device_info_t desc_info;
     uint8_t ac_iface_num;       // Audio Control interface number
 
@@ -108,11 +111,16 @@ struct uac2_host_device {
     usb_transfer_t *ctrl_xfer;
     SemaphoreHandle_t ctrl_xfer_done;    // signaled on transfer completion
     SemaphoreHandle_t ctrl_mutex;        // serializes control transfer access
-    volatile bool closing;               // set during device_close to reject new requests
+    _Atomic bool closing;                // set during device_close to reject new requests
+    atomic_uint ctrl_xfer_gen;           // incremented on timeout to invalidate stale callbacks
+    atomic_uint ctrl_xfer_submitted_gen; // gen at time of last submit (written under mutex, read by callback)
 
     // Event callback
     uac2_host_event_cb_t event_cb;
     void *event_cb_arg;
+
+    // Disconnect tracking
+    _Atomic bool disconnect_fired;       // ensures DISCONNECTED event fires exactly once
 
     // Streams
     uac2_stream_t *tx_stream;
@@ -124,6 +132,11 @@ struct uac2_host_device {
 static void ctrl_xfer_cb(usb_transfer_t *xfer)
 {
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
+    // If a timeout advanced the generation counter, this callback is stale —
+    // don't signal, so the next ctrl_request doesn't get a premature wakeup.
+    if (atomic_load(&dev->ctrl_xfer_gen) != atomic_load(&dev->ctrl_xfer_submitted_gen)) {
+        return;
+    }
     xSemaphoreGive(dev->ctrl_xfer_done);
 }
 
@@ -145,7 +158,7 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
                               uint16_t w_length,
                               const uint8_t *data_out)
 {
-    if (!dev || !dev->ctrl_xfer || dev->closing) {
+    if (!dev || !dev->ctrl_xfer || atomic_load(&dev->closing)) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -184,6 +197,9 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
     xfer->context = dev;
     xfer->timeout_ms = UAC2_CTRL_XFER_TIMEOUT_MS;
 
+    // Snapshot generation so the callback can detect staleness after timeout
+    atomic_store(&dev->ctrl_xfer_submitted_gen, atomic_load(&dev->ctrl_xfer_gen));
+
     esp_err_t err = usb_host_transfer_submit_control(dev->client, xfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Control submit failed: %s", esp_err_to_name(err));
@@ -194,19 +210,16 @@ static esp_err_t ctrl_request(uac2_host_device_handle_t dev,
     // Wait for completion
     if (xSemaphoreTake(dev->ctrl_xfer_done, pdMS_TO_TICKS(UAC2_CTRL_XFER_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Control transfer timeout");
-        // Drain any late callback signal to prevent next transfer from seeing stale data.
-        // The USB transfer may still complete after our timeout — when its callback fires
-        // and signals the semaphore, we don't want the NEXT ctrl_request to see it.
-        xSemaphoreTake(dev->ctrl_xfer_done, pdMS_TO_TICKS(100));
+        // Advance generation so late callback won't signal the semaphore
+        atomic_fetch_add(&dev->ctrl_xfer_gen, 1);
         // Recover the control pipe (EP0) — without this, subsequent control transfers
         // may fail if the pipe is left in an error state after timeout.
-        // Only flush/clear if halt succeeds (device may already be gone).
         esp_err_t halt_err = usb_host_endpoint_halt(dev->usb_dev, 0);
         if (halt_err == ESP_OK) {
             usb_host_endpoint_flush(dev->usb_dev, 0);
             usb_host_endpoint_clear(dev->usb_dev, 0);
         }
-        // Drain any stale semaphore signal from the cancelled transfer's callback
+        // Drain any semaphore signal that snuck in before gen increment
         xSemaphoreTake(dev->ctrl_xfer_done, 0);
         xSemaphoreGive(dev->ctrl_mutex);
         return ESP_ERR_TIMEOUT;
@@ -356,6 +369,10 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
         atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE &&
+            dev->event_cb && !atomic_exchange(&dev->disconnect_fired, true)) {
+            dev->event_cb(dev, UAC2_HOST_EVENT_DISCONNECTED, dev->event_cb_arg);
+        }
         return;
 
     default: {
@@ -400,6 +417,11 @@ static void stream_tx_xfer_submit(uac2_stream_t *stream,
     if (fb > 0) {
         uint16_t nominal_samples = (uint16_t)(fb >> 16);
         uint16_t fraction = (uint16_t)(fb & 0xFFFF);
+        // Reject bogus feedback: zero samples or wildly out of range
+        if (nominal_samples == 0 || nominal_samples > 1000) {
+            pkt_size = stream->packet_size;
+            goto send_packet;
+        }
 
         stream->fb_accumulator += fraction;
         uint16_t extra = (uint16_t)(stream->fb_accumulator >> 16);
@@ -411,6 +433,7 @@ static void stream_tx_xfer_submit(uac2_stream_t *stream,
     } else {
         pkt_size = stream->packet_size;
     }
+send_packet:
 
     // Try to read one packet worth of data from ring buffer
     void *data = xRingbufferReceiveUpTo(stream->ringbuf, &item_size,
@@ -427,15 +450,15 @@ static void stream_tx_xfer_submit(uac2_stream_t *stream,
 
         // Notify when ringbuf drops below threshold (single-shot to avoid spam)
         size_t rb_used = stream->ringbuf_size - xRingbufferGetCurFreeSize(stream->ringbuf);
-        if (rb_used < stream->ringbuf_threshold && dev->event_cb && !stream->tx_done_pending) {
-            stream->tx_done_pending = true;
+        if (rb_used < stream->ringbuf_threshold && dev->event_cb && !atomic_load(&stream->tx_done_pending)) {
+            atomic_store(&stream->tx_done_pending, true);
             dev->event_cb(dev, UAC2_HOST_EVENT_TX_DONE, dev->event_cb_arg);
         }
     } else {
         // No data: send silence, notify once
         memset(xfer->data_buffer, 0, pkt_size);
-        if (dev->event_cb && !stream->tx_done_pending) {
-            stream->tx_done_pending = true;
+        if (dev->event_cb && !atomic_load(&stream->tx_done_pending)) {
+            atomic_store(&stream->tx_done_pending, true);
             dev->event_cb(dev, UAC2_HOST_EVENT_TX_DONE, dev->event_cb_arg);
         }
     }
@@ -507,6 +530,10 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
         atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE &&
+            dev->event_cb && !atomic_exchange(&dev->disconnect_fired, true)) {
+            dev->event_cb(dev, UAC2_HOST_EVENT_DISCONNECTED, dev->event_cb_arg);
+        }
         return;
 
     default: {
@@ -546,22 +573,22 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
         return;
     }
 
-    // TODO(hardware): Verify feedback format with actual miniDSP. XMOS source code
-    // confirms 3 bytes / 10.14 format at Full Speed (16.16 >> 2), despite MPS=4
-    // (MPS=4 is for Windows UAC2 driver compatibility). Feedback arrives every
-    // 2^(bInterval-1) = 8 frames = 8ms. For 48kHz, nominal = 0x0C0000 in 10.14.
-    // Log actual_num_bytes on first callbacks to confirm 3 vs 4.
+    // Real miniDSP 2x4 HD confirmed: 4-byte 16.16 feedback at Full Speed.
+    // 48kHz value: 0x00300000 (48.0000). Both 3-byte (10.14) and 4-byte (16.16) handled.
     if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        if (xfer->status != USB_TRANSFER_STATUS_NO_DEVICE &&
-            xfer->status != USB_TRANSFER_STATUS_CANCELED) {
-            int errs = atomic_fetch_add(&stream->consecutive_errors, 1) + 1;
-            ESP_LOGD(TAG, "Feedback transfer error, status=%d (consecutive: %d)", xfer->status, errs);
-            if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
-                ESP_LOGE(TAG, "Feedback: %d consecutive errors, stopping re-submission", errs);
-                atomic_fetch_sub(&stream->urbs_in_flight, 1);
-                return;
+        if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+            xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+            atomic_fetch_sub(&stream->urbs_in_flight, 1);
+            if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE &&
+                dev->event_cb && !atomic_exchange(&dev->disconnect_fired, true)) {
+                dev->event_cb(dev, UAC2_HOST_EVENT_DISCONNECTED, dev->event_cb_arg);
             }
-        } else {
+            return;
+        }
+        int errs = atomic_fetch_add(&stream->consecutive_errors, 1) + 1;
+        ESP_LOGD(TAG, "Feedback transfer error, status=%d (consecutive: %d)", xfer->status, errs);
+        if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
+            ESP_LOGE(TAG, "Feedback: %d consecutive errors, stopping re-submission", errs);
             atomic_fetch_sub(&stream->urbs_in_flight, 1);
             return;
         }
@@ -652,7 +679,13 @@ static uint16_t calc_packet_size(uint32_t sample_rate, uint8_t channels,
     // = (sample_rate / 1000) * channels * bytes_per_sample
     // Add 1 sample worth of space for rounding (async jitter)
     uint32_t samples_per_frame = (sample_rate + 999) / 1000;
-    return (uint16_t)(samples_per_frame * channels * sub_slot_size);
+    uint32_t result = samples_per_frame * channels * sub_slot_size;
+    if (result > UINT16_MAX) {
+        ESP_LOGE(TAG, "Packet size overflow: %" PRIu32 " (rate=%" PRIu32 " ch=%d ss=%d)",
+                 result, sample_rate, channels, sub_slot_size);
+        return 0;
+    }
+    return (uint16_t)result;
 }
 
 static esp_err_t stream_alloc(uac2_stream_t **out_stream,
@@ -679,16 +712,23 @@ static esp_err_t stream_alloc(uac2_stream_t **out_stream,
     stream->fb_accumulator = 0;
     atomic_init(&stream->urbs_in_flight, 0);
     atomic_init(&stream->consecutive_errors, 0);
+    atomic_init(&stream->user_task_blocked, false);
     stream->first_frame_us = 0;
+    stream->user_task_done = xSemaphoreCreateBinary();
+    if (!stream->user_task_done) {
+        heap_caps_free(stream);
+        return ESP_ERR_NO_MEM;
+    }
 
     stream->packet_size = calc_packet_size(config->sample_rate,
                                            as->nr_channels,
                                            as->sub_slot_size);
 
-    // Reject if packet size exceeds endpoint MPS
-    if (stream->packet_size > stream->ep_mps) {
-        ESP_LOGE(TAG, "Packet size %d exceeds endpoint MPS %d — config not supported",
+    // Reject if packet size is invalid (0 = overflow in calc) or exceeds endpoint MPS
+    if (stream->packet_size == 0 || stream->packet_size > stream->ep_mps) {
+        ESP_LOGE(TAG, "Packet size %d invalid (MPS %d) — config not supported",
                  stream->packet_size, stream->ep_mps);
+        vSemaphoreDelete(stream->user_task_done);
         heap_caps_free(stream);
         return ESP_ERR_INVALID_SIZE;
     }
@@ -707,6 +747,7 @@ static esp_err_t stream_alloc(uac2_stream_t **out_stream,
 
     stream->ringbuf = xRingbufferCreate(rb_size, RINGBUF_TYPE_BYTEBUF);
     if (!stream->ringbuf) {
+        vSemaphoreDelete(stream->user_task_done);
         heap_caps_free(stream);
         return ESP_ERR_NO_MEM;
     }
@@ -724,6 +765,7 @@ static esp_err_t stream_alloc(uac2_stream_t **out_stream,
                 usb_host_transfer_free(stream->xfer[j]);
             }
             vRingbufferDelete(stream->ringbuf);
+            vSemaphoreDelete(stream->user_task_done);
             heap_caps_free(stream);
             return err;
         }
@@ -757,9 +799,6 @@ static void stream_free(uac2_stream_t *stream)
     }
     if (stream->ringbuf) {
         // Unblock any task waiting on the ringbuffer before deleting it.
-        // Without this, a task blocked in stream_write/stream_read will crash
-        // when the ringbuffer is deleted from under it.
-        bool did_unblock = false;
         if (stream->dir == UAC2_STREAM_TX) {
             // Unblock xRingbufferSend by draining buffer to free space
             size_t item_size;
@@ -767,20 +806,20 @@ static void stream_free(uac2_stream_t *stream)
             while ((item = xRingbufferReceiveUpTo(stream->ringbuf, &item_size, 0,
                                                    stream->ringbuf_size)) != NULL) {
                 vRingbufferReturnItem(stream->ringbuf, item);
-                did_unblock = true;
             }
         } else {
             // Unblock xRingbufferReceiveUpTo by sending a dummy byte
             uint8_t dummy = 0;
-            if (xRingbufferSend(stream->ringbuf, &dummy, 1, 0) == pdTRUE) {
-                did_unblock = true;
-            }
+            xRingbufferSend(stream->ringbuf, &dummy, 1, 0);
         }
-        // Brief delay only if we actually unblocked something
-        if (did_unblock) {
-            vTaskDelay(pdMS_TO_TICKS(20));
+        // Wait for stream_write/stream_read to return if a task was blocked
+        if (atomic_load(&stream->user_task_blocked)) {
+            xSemaphoreTake(stream->user_task_done, pdMS_TO_TICKS(200));
         }
         vRingbufferDelete(stream->ringbuf);
+    }
+    if (stream->user_task_done) {
+        vSemaphoreDelete(stream->user_task_done);
     }
     heap_caps_free(stream);
 }
@@ -892,6 +931,7 @@ static void usb_string_to_ascii(const usb_str_desc_t *str_desc, char *out, size_
 {
     if (!str_desc || !out || out_size == 0) return;
     out[0] = '\0';
+    if (str_desc->bLength < 2) return;
     // bLength includes 2-byte header, each char is 2 bytes (UTF-16LE)
     int num_chars = (str_desc->bLength - 2) / 2;
     if (num_chars <= 0) return;
@@ -966,10 +1006,11 @@ esp_err_t uac2_host_device_open(usb_host_client_handle_t client,
 
     dev->client = client;
     dev->usb_dev = usb_dev;
-    dev->vid = dev_desc->idVendor;
-    dev->pid = dev_desc->idProduct;
     dev->event_cb = cb;
     dev->event_cb_arg = cb_arg;
+    atomic_init(&dev->closing, false);
+    atomic_init(&dev->disconnect_fired, false);
+    atomic_init(&dev->ctrl_xfer_gen, 0);
 
     // AC interface number was extracted by the descriptor parser
     dev->ac_iface_num = dev->desc_info.ac_iface_num;
@@ -1009,7 +1050,7 @@ esp_err_t uac2_host_device_open(usb_host_client_handle_t client,
     ESP_LOGI(TAG, "UAC2 host driver v%d.%d.%d",
              UAC2_HOST_VER_MAJOR, UAC2_HOST_VER_MINOR, UAC2_HOST_VER_PATCH);
     ESP_LOGI(TAG, "UAC2 device opened: VID=0x%04X PID=0x%04X \"%s\"",
-             dev->vid, dev->pid,
+             dev->desc_info.vid, dev->desc_info.pid,
              dev->desc_info.product[0] ? dev->desc_info.product : "Unknown");
     ESP_LOGI(TAG, "  AC iface=%d, clock_source=%d, feature_unit=%d",
              dev->ac_iface_num, dev->clock_source_id,
@@ -1026,16 +1067,17 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t dev)
 {
     ESP_RETURN_ON_FALSE(dev, ESP_ERR_INVALID_ARG, TAG, "Invalid device handle");
 
-    // Reject new control requests from other tasks
-    dev->closing = true;
-
-    // Stop any active streams (uses ctrl_mutex internally for SET_INTERFACE)
+    // Stop any active streams first — stream_stop sends SET_INTERFACE(alt=0) via
+    // ctrl_request, which checks the closing flag. Must happen before closing=true.
     if (dev->tx_stream) {
         uac2_host_stream_stop(dev, UAC2_STREAM_TX);
     }
     if (dev->rx_stream) {
         uac2_host_stream_stop(dev, UAC2_STREAM_RX);
     }
+
+    // Now reject any new external control requests
+    atomic_store(&dev->closing, true);
 
     // Wait for any in-progress control request to finish
     if (dev->ctrl_mutex) {
@@ -1198,14 +1240,12 @@ esp_err_t uac2_host_stream_start(uac2_host_device_handle_t dev,
     }
 
     // Full Speed isochronous data endpoints must use bInterval=1 (every frame = 1ms).
-    // Some devices report incorrect values. Patch the descriptor copy in memory.
-    // NOTE: feedback endpoints legitimately use bInterval > 1 — do NOT patch those.
+    // Some devices report incorrect values. Log a warning; stream_alloc uses packet_size
+    // which doesn't depend on bInterval, and EP configuration uses the value from the
+    // claimed interface. The canonical desc_info is not mutated.
     if (as->ep_interval != 1) {
-        ESP_LOGW(TAG, "Data EP 0x%02X bInterval=%d (expected 1 at FS), patching to 1",
+        ESP_LOGW(TAG, "Data EP 0x%02X bInterval=%d (expected 1 at FS), using 1ms framing",
                  as->ep_addr, as->ep_interval);
-        // Patch through the mutable desc_info array directly (avoids casting away const)
-        int as_idx = (int)(as - dev->desc_info.as_ifaces);
-        dev->desc_info.as_ifaces[as_idx].ep_interval = 1;
     }
 
     ESP_LOGI(TAG, "Starting %s stream: iface %d alt %d, %dch %d-bit, ep 0x%02X (MPS %d)",
@@ -1375,17 +1415,24 @@ esp_err_t uac2_host_stream_write(uac2_host_device_handle_t dev,
         return ESP_ERR_INVALID_STATE;
     }
 
+    atomic_store(&stream->user_task_blocked, true);
     BaseType_t ok = xRingbufferSend(stream->ringbuf, data, size,
                                     pdMS_TO_TICKS(timeout_ms));
-    // Recheck state — stream_stop may have run while we were blocked
-    if (stream->state != UAC2_STREAM_STATE_ACTIVE) {
-        return ESP_ERR_INVALID_STATE;
+
+    // Capture result BEFORE signaling stream_free — after the signal,
+    // stream_free may delete the stream and ringbuf immediately.
+    bool still_active = (stream->state == UAC2_STREAM_STATE_ACTIVE);
+    if (ok == pdTRUE && still_active) {
+        atomic_store(&stream->tx_done_pending, false);  // re-arm TX_DONE notification
     }
-    if (ok == pdTRUE) {
-        stream->tx_done_pending = false;  // re-arm TX_DONE notification
-        return ESP_OK;
-    }
-    return ESP_ERR_TIMEOUT;
+
+    // Signal stream_free that we've returned from the blocking call.
+    // Must not access stream after this point.
+    atomic_store(&stream->user_task_blocked, false);
+    xSemaphoreGive(stream->user_task_done);
+
+    if (!still_active) return ESP_ERR_INVALID_STATE;
+    return ok == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
 
 esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
@@ -1400,38 +1447,51 @@ esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
         return ESP_ERR_INVALID_STATE;
     }
 
+    atomic_store(&stream->user_task_blocked, true);
     size_t item_size = 0;
     void *item = xRingbufferReceiveUpTo(stream->ringbuf, &item_size,
                                         pdMS_TO_TICKS(timeout_ms), size);
-    // Recheck state — stream_stop may have run while we were blocked
-    if (stream->state != UAC2_STREAM_STATE_ACTIVE) {
+
+    // Complete all stream/ringbuf access BEFORE signaling stream_free.
+    // After the signal, stream_free may free the stream immediately.
+    esp_err_t ret;
+    bool still_active = (stream->state == UAC2_STREAM_STATE_ACTIVE);
+    if (!still_active) {
         if (item) {
             vRingbufferReturnItem(stream->ringbuf, item);
         }
         *bytes_read = 0;
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!item) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else if (!item) {
         *bytes_read = 0;
-        return ESP_ERR_TIMEOUT;
+        ret = ESP_ERR_TIMEOUT;
+    } else {
+        memcpy(data, item, item_size);
+        vRingbufferReturnItem(stream->ringbuf, item);
+        *bytes_read = (uint32_t)item_size;
+        ret = ESP_OK;
     }
 
-    memcpy(data, item, item_size);
-    vRingbufferReturnItem(stream->ringbuf, item);
-    *bytes_read = (uint32_t)item_size;
-    return ESP_OK;
+    // Signal stream_free. Must not access stream after this point.
+    atomic_store(&stream->user_task_blocked, false);
+    xSemaphoreGive(stream->user_task_done);
+    return ret;
 }
 
 int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev)
 {
-    if (!dev || !dev->tx_stream) return 0;
-    return dev->tx_stream->first_frame_us;
+    if (!dev) return 0;
+    uac2_stream_t *s = dev->tx_stream;
+    if (!s) return 0;
+    return atomic_load(&s->first_frame_us);
 }
 
 uint32_t uac2_host_stream_get_feedback(uac2_host_device_handle_t dev)
 {
-    if (!dev || !dev->tx_stream) return 0;
-    return atomic_load(&dev->tx_stream->fb_value);
+    if (!dev) return 0;
+    uac2_stream_t *s = dev->tx_stream;
+    if (!s) return 0;
+    return atomic_load(&s->fb_value);
 }
 
 // ── Public API: Volume / Mute ──────────────────────────────────────

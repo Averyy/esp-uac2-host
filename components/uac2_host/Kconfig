@@ -20,9 +20,11 @@ menu "UAC2 Host Driver"
         default 256
         range 64 1024
         help
-            Maximum data payload size for control transfers.
-            Increase to 512+ if your device has a large configuration descriptor
-            (e.g., miniDSP 2x4 HD is 373 bytes).
+            Maximum data payload for class-specific control transfers
+            (GET_CUR, GET_RANGE, SET_CUR). Increase if your device returns
+            large GET_RANGE responses (e.g., many sample rate triplets).
+            Note: config descriptor fetching uses USB_HOST_CONTROL_TRANSFER_MAX_SIZE,
+            not this setting.
 
     config UAC2_MAX_CONSECUTIVE_ERRORS
         int "Max consecutive transfer errors before stopping"

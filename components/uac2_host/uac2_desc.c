@@ -96,8 +96,8 @@ static void parse_clock_selector(const uint8_t *desc, uac2_device_info_t *info)
     if (info->num_clock_selectors >= UAC2_MAX_CLOCK_SELECTORS) return;
     uac2_clock_selector_t *cx = &info->clock_selectors[info->num_clock_selectors++];
     cx->clock_id = desc[3];
-    cx->nr_pins = desc[4];
-    for (int i = 0; i < cx->nr_pins && i < 4; i++) {
+    cx->nr_pins = desc[4] < 4 ? desc[4] : 4;
+    for (int i = 0; i < cx->nr_pins; i++) {
         if (5 + i >= desc[0]) break;  // bounds check against bLength
         cx->source_ids[i] = desc[5 + i];
     }
@@ -148,6 +148,7 @@ static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
 
 static void parse_ac_entity(const uint8_t *desc, uac2_device_info_t *info)
 {
+    if (desc[0] < 3) return;  // Need at least bLength + bDescriptorType + bDescriptorSubtype
     uint8_t subtype = desc[2];
 
     switch (subtype) {
@@ -213,7 +214,7 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
     int offset = 0;
     while (offset < total_length) {
         uint8_t len = config_desc[offset];
-        if (len == 0) break;
+        if (len < 2) break;  // Need at least bLength + bDescriptorType
         if (offset + len > total_length) break;
 
         uint8_t type = config_desc[offset + 1];
@@ -246,9 +247,12 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
                     memset(current_as, 0, sizeof(*current_as));
                     current_as->interface_num = current_iface_num;
                     current_as->alt_setting = current_alt_setting;
+                } else {
+                    ESP_LOGW(TAG, "AS interface limit reached (%d), skipping iface %d alt %d",
+                             UAC2_MAX_AS_INTERFACES, current_iface_num, current_alt_setting);
                 }
             }
-        } else if (type == UAC2_CS_INTERFACE) { // Class-specific INTERFACE
+        } else if (type == UAC2_CS_INTERFACE && len >= 3) { // Class-specific INTERFACE
             if (current_iface_class == UAC2_CLASS_AUDIO) {
                 if (current_iface_subclass == UAC2_SUBCLASS_AUDIOCONTROL) {
                     parse_ac_entity(desc, info);

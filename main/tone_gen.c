@@ -9,6 +9,7 @@
  * @brief Simple sine tone generator for audio testing
  */
 
+#include <assert.h>
 #include <math.h>
 #include <string.h>
 #include "tone_gen.h"
@@ -19,6 +20,7 @@
 
 void tone_gen_init(tone_gen_t *gen, const tone_gen_config_t *config)
 {
+    assert(config->bit_depth == 16 || config->bit_depth == 24);
     gen->config = *config;
     gen->phase = 0.0f;
     gen->phase_inc = (2.0f * (float)M_PI * config->frequency) / (float)config->sample_rate;
