@@ -1,6 +1,6 @@
-# TODO — Remaining Work
+# TODO Part 2 — New Features & Architectural Changes
 
-New features, architectural changes, and significant new code. Do after real miniDSP 2x4 HD hardware testing. See also `TODO-real-device-testing.md` and `TODO-publish-component-registry.md`.
+New features, architectural changes, and significant new code. Do after real miniDSP 2x4 HD hardware testing. See also `TODO-part1.md` (code review findings), `TODO-real-device-testing.md`, and `TODO-publish-component-registry.md`.
 
 ---
 

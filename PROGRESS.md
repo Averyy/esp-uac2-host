@@ -1,6 +1,6 @@
 # Progress
 
-## Status: Phase 3 complete + cleanup/hardening pass. All 5 tests pass, live-verified against simulator (55k+ frames, zero errors). 14 cleanup items + 29 code review findings fixed.
+## Status: Phase 3 complete + cleanup/hardening pass. All 5 tests pass, live-verified against simulator (55k+ frames, zero errors). 14 cleanup items + 29 code review findings fixed. Full codebase review completed: 4 high, 9 medium, 6 low issues documented in `docs/TODO-part1.md`.
 
 ## Completed
 
@@ -178,13 +178,33 @@ See `TODO(hardware)` markers in source code for details.
 - [ ] Sweep generator (Farina ESS, real-time on ESP32)
 - [ ] `POST /play` HTTP endpoint
 
-### Outstanding TODOs (see `docs/TODO.md` for details)
+### Code Review Findings (see `docs/TODO-part1.md`)
+- [ ] **HIGH**: `device_close()` skips SET_INTERFACE(alt=0) — `closing` flag blocks internal control requests
+- [ ] **HIGH**: Integer underflow in `usb_string_to_ascii` — OOB read from hostile USB device (one-line fix)
+- [ ] **HIGH**: `UAC2_HOST_EVENT_DISCONNECTED` declared but never fired — broken API contract
+- [ ] **HIGH**: `stream_write`/`stream_read` use-after-free — 20ms heuristic in `stream_free` is not safe
+- [ ] **MED**: Clock selector `nr_pins` OOB read in log loop
+- [ ] **MED**: `calc_packet_size` integer overflow with rogue device inputs
+- [ ] **MED**: Feedback value not validated — device can force zero-length packets
+- [ ] **MED**: `tx_done_pending` data race (plain `bool`, should be `_Atomic`)
+- [ ] **MED**: `volatile bool closing` insufficient for cross-core (should be `_Atomic`)
+- [ ] **MED**: `stream_get_start_time` TOCTOU null deref
+- [ ] **MED**: `UAC2_MAX_AS_INTERFACES = 4` silently truncates without logging
+- [ ] **MED**: Control transfer timeout recovery can corrupt next request (stale semaphore)
+- [ ] **MED**: `fb_accumulator` not atomic — fragile single-threaded assumption
+- [ ] **LOW**: Descriptor parser reads `desc[2]` without `len >= 3` check
+- [ ] **LOW**: Descriptor parser `bLength = 1` doesn't terminate loop
+- [ ] **LOW**: `ep_interval` patch mutates canonical `desc_info` in-place
+- [ ] **LOW**: Duplicate `vid`/`pid` fields on device struct
+- [ ] **LOW**: Kconfig help text for `UAC2_CTRL_XFER_MAX_SIZE` is misleading
+- [ ] **LOW**: `tone_gen.c` silently mishandles bit depths other than 16 or 24
+
+### Outstanding Features (see `docs/TODO-part2.md`)
 - [ ] Install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`) — Espressif class driver pattern
 - [ ] Suspend/resume without full teardown (for measurement sweep cycles)
 - [ ] Device handle validation (linked list walk)
 - [ ] Full state mutex for public API (partially done: per-stream spinlock, closing flag, state recheck)
 - [ ] Stream dead notification (`UAC2_HOST_EVENT_STREAM_DEAD` or error state)
-- [ ] Fire `UAC2_HOST_EVENT_DISCONNECTED` (declared but never sent)
 - [ ] Volume/mute hardening (range caching, feature unit capability detection, normalized API)
 - [ ] Debug print function (`uac2_host_device_printf_info`)
 - [ ] Sample rate validation at stream start (query RANGE, reject unsupported)
