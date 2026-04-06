@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**v1.0.0 — Complete, hardened, live-tested.** Full driver stack: descriptor parser, control requests (CUR/RANGE), SET_INTERFACE, isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. Two simulators: `simulators/simple/` and `simulators/minidsp-2x4hd/` (full composite). All 5 tests pass live against simulator (55k+ frames, zero errors, zero regressions). 14 cleanup items (ESP-IDF conventions) + 29 code review findings fixed. Headers at `include/usb/uac2_host.h` and `include/usb/uac2_desc.h`. Kconfig + idf_component.yml added. Next: test with real miniDSP 2x4 HD, then integrate with minidsp-open. See `PROGRESS.md` for detailed status, `docs/TODO.md` for remaining work.
+**v1.1.0 — Real hardware verified.** Full driver stack: descriptor parser, control requests (CUR/RANGE), SET_INTERFACE, isochronous streaming with feedback-based adaptive packet sizing, ring buffer, and public API. **Tested against real miniDSP 2x4 HD** (2026-04-06): all 12 tests pass, 766-second stability run, zero errors. Simulator updated to byte-exact match (373-byte descriptor, 5 interfaces, 4-byte feedback). Headers at `include/usb/uac2_host.h` and `include/usb/uac2_desc.h`. Next: integrate with minidsp-open. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 
@@ -22,7 +22,7 @@ C (ESP-IDF component). Targets ESP32-S3. Built on top of ESP-IDF USB Host Librar
 - **Board:** ESP32-S3-DevKitC-1. Two USB-C ports:
   - **Right (UART):** CH340 USB-to-UART bridge (VID 0x1A86). Use for programming + serial monitor. Shows as `/dev/cu.usbmodem*`.
   - **Left (USB):** Built-in USB-Serial/JTAG on GPIO 19/20 (VID 0x303A). **This is also the USB OTG port** — when using USB Host mode (miniDSP), this port is unavailable for serial.
-- **VBUS:** The DevKitC-1 does not supply 5V to OTG port by default. Need external 5V to power connected USB device.
+- **VBUS:** The DevKitC-1 does not supply 5V to OTG port by default. **Bridge the `USB-OTG` solder pads** on the back of the board to route 5V from the power rail to the OTG port VBUS pin. Without this, USB devices won't enumerate even if self-powered.
 
 ## Key Facts
 
@@ -49,7 +49,7 @@ Local copies in `ref/` (read-only, not compiled). See `ref/README.md` for source
 - `ref/espressif-uac1/` — Espressif UAC1 host driver v1.3.3 (Apache-2.0). Architecture to fork. ~4,000 lines.
 - `ref/usbx-uac2/ux_class_audio20.h` — USBX UAC2 descriptor structs (MIT). The gold standard. 1694 lines.
 - `ref/cherryusb-uac2/usb_audio.h` — CherryUSB UAC1+UAC2 structs (Apache-2.0). Standard C types. 1347 lines.
-- `ref/minidsp_2x4hd_descriptors.h` �� Reconstructed raw descriptor bytes for offline parser testing. Complete (257 captured + 116 reconstructed = 373 bytes).
+- `ref/minidsp_2x4hd_descriptors.h` — Real miniDSP 2x4 HD descriptor bytes captured via ESP32-S3 USB Host (2026-04-06). Full 373-byte config descriptor + 18-byte device descriptor.
 
 ## ESP32 Serial (serial-mcp)
 

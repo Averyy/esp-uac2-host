@@ -1,6 +1,6 @@
 # Progress
 
-## Status: Phase 3 complete + cleanup/hardening pass. All 5 tests pass, live-verified against simulator (55k+ frames, zero errors). 14 cleanup items + 29 code review findings fixed. Full codebase review completed: 4 high, 9 medium, 6 low issues documented in `docs/TODO-part1.md`.
+## Status: Real hardware verified. All 12 tests pass against real miniDSP 2x4 HD (766s stability run, zero errors). Simulator updated to byte-exact match (373 bytes, 5 interfaces). Driver ready for minidsp-open integration.
 
 ## Completed
 
@@ -160,18 +160,32 @@
 
 ### Known Issues
 - [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
-- [ ] Feedback format confirmation (expect 3 bytes / 10.14 from XMOS at FS)
-- [ ] Full 373-byte config descriptor capture from real miniDSP (vs simulator)
 
 See `TODO(hardware)` markers in source code for details.
 
-## Next: Phase 4 — Real Hardware + Integration
+### Real miniDSP 2x4 HD Testing (April 6, 2026)
+- [x] Full 373-byte config descriptor captured from real device (replaces partial reconstruction)
+- [x] Enumeration and clock queries succeed (sample rates: 44100 + 48000 Hz discrete)
+- [x] Feedback format confirmed: **4-byte 16.16** (not 3-byte 10.14 as assumed). Value: 0x00300000 (48.0000). Locks immediately.
+- [x] Volume range confirmed: -127 to 0 dB, 1 dB resolution
+- [x] VBUS fix: bridge `USB-OTG` solder pads on DevKitC-1 back (no powered hub needed)
+- [x] 12-test comprehensive suite: basic streaming, volume/mute, stop/restart, 44.1kHz, start time precision, feedback convergence, 16-bit mode, 9x rapid measurement cycles, volume range exploration, sample rate switch stress, ring buffer starvation/recovery, long-running stability
+- [x] 766-second stability run, zero errors
+- [x] Disconnect/reconnect: clean teardown, automatic re-enumeration and test restart
+- [x] New driver APIs: `uac2_host_get_volume_range()`, `uac2_host_stream_get_feedback()`
 
-### Phase 0B — Real miniDSP Verification (needs powered USB hub + miniDSP)
-- [ ] Full config descriptor captured from real miniDSP 2x4 HD
-- [ ] Enumeration and clock queries succeed on real device
-- [ ] Streaming works on real device
-- [ ] Feedback format confirmed (3-byte 10.14 vs 4-byte 16.16)
+### Simulator Update to Match Real Device (April 6, 2026)
+- [x] Config descriptor: 300 → 373 bytes (matches real device exactly)
+- [x] 5 interfaces: AC, AS playback (24/16-bit), AS capture, DFU (stub driver), HID
+- [x] HID report descriptor: 28 bytes captured from real device via hidapi
+- [x] Feedback: 4-byte 16.16 (disabled TinyUSB format correction)
+- [x] HID endpoint: EP 0x83 IN (was 0x82, shifted by capture interface)
+- [x] bcdDevice=0x0185, iProduct=11, all string indices, terminal bmControls — byte-matched
+- [x] 3-byte HID address parsing fixed: ReadFloats, WriteDSP, WriteBiquad, BypassFilter
+- [x] DFU stub driver (`usbd_app_driver_get_cb`) prevents TinyUSB SET_CONFIGURATION assert
+- [x] Builds clean, static asserts verify 373-byte descriptor size
+
+## Next: Phase 4 — minidsp-open Integration
 
 ### Phase 4 — minidsp-open Integration
 - [ ] Integration with minidsp-open Rust FFI (`~/code/minidsp-open/docs/TODO-esp32-usb-audio.md`)
@@ -214,13 +228,14 @@ See `TODO(hardware)` markers in source code for details.
 
 - **MCU:** ESP32-S3-DevKitC-1 (Full Speed USB OTG, 1024B FIFO)
 - **Test device:** miniDSP 2x4 HD (XMOS XU216, UAC2, VID 0x2752 PID 0x0011)
-- **VBUS:** External power required (DevKitC-1 has Schottky diodes blocking VBUS out). Powered USB hub on order.
+- **VBUS:** Bridge `USB-OTG` solder pads on DevKitC-1 back to supply 5V on OTG port.
 - **Limitation:** No simultaneous TX+RX on ESP32-S3 (PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes)
 
 ## Key Research Findings
 
-- XMOS sends 3-byte feedback at FS (10.14 format), despite wMaxPacketSize=4
-- Feedback arrives every 8ms (bInterval=4 -> 2^3 frames)
-- XMOS averages feedback over 128 SOFs (128ms)
+- XMOS sends **4-byte feedback at FS (16.16 format)** — confirmed by real miniDSP testing (was assumed 3-byte 10.14)
+- Feedback value at 48kHz: 0x00300000 (48.0000 samples/frame), locks immediately, drift <0.002%
+- Feedback arrives every 8ms (bInterval=4 → 2^3 frames)
 - ESP-IDF USB Host interface release bug (#17707) — retry logic added
 - miniDSP is self-powered (bmAttributes=0xC0) — still needs VBUS present to enumerate
+- DevKitC-1 USB-OTG solder pads on back of board enable VBUS output (no powered hub needed)
