@@ -5,7 +5,7 @@
  * - UAC2 audio: playback (IF1, alt 1 = 24-bit, alt 2 = 16-bit)
  * - Feedback endpoint: TinyUSB sends 3-byte 10.14 at FS; real miniDSP sends 4-byte 16.16
  *   (driver handles both formats — see feedback_xfer_done() in uac2_host.c)
- * - HID interface (IF2): 64-byte vendor reports, full command protocol
+ * - HID interface (IF4): 64-byte vendor reports, full command protocol
  * - EEPROM state: preset, source, volume, mute, serial, mod tokens
  * - DSP parameter state: routing, PEQ, gain, delay, compressor (flat defaults)
  * - Fault injection modes for robustness testing
@@ -192,12 +192,64 @@ tusb_desc_device_t const desc_device = {
     .iManufacturer      = 1,
     .iProduct           = 11,           // Matches real device (iProduct=11)
     .iSerialNumber      = 0,            // Real miniDSP has no serial string
-    .bNumConfigurations = 2             // Real device has 2 (identical configs)
+    .bNumConfigurations = 1             // Real device has 2, but TinyUSB serves 1 (configs are identical)
 };
 
 uint8_t const *tud_descriptor_device_cb(void)
 {
     return (uint8_t const *)&desc_device;
+}
+
+// ── DFU stub driver ──────────────────────────────────────────────
+// TinyUSB requires every interface in the config descriptor to be claimed
+// by a driver during SET_CONFIGURATION. The real miniDSP has a DFU interface
+// (class 0xFE) that we include for descriptor fidelity. This stub claims it.
+
+#include "device/usbd_pvt.h"
+
+static void dfu_stub_init(void) {}
+static bool dfu_stub_deinit(void) { return true; }
+static void dfu_stub_reset(uint8_t rhport) { (void)rhport; }
+
+static uint16_t dfu_stub_open(uint8_t rhport, tusb_desc_interface_t const *desc_intf, uint16_t max_len)
+{
+    (void)rhport;
+    (void)max_len;
+    // Only claim DFU Runtime interfaces (class=0xFE, subclass=0x01, protocol=0x01)
+    if (desc_intf->bInterfaceClass != 0xFE ||
+        desc_intf->bInterfaceSubClass != 0x01) {
+        return 0;
+    }
+    // Consume interface descriptor (9) + DFU functional descriptor (9) = 18 bytes
+    return 18;
+}
+
+static bool dfu_stub_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request)
+{
+    (void)rhport; (void)stage; (void)request;
+    return false;  // STALL any DFU control requests
+}
+
+static bool dfu_stub_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes)
+{
+    (void)rhport; (void)ep_addr; (void)result; (void)xferred_bytes;
+    return false;
+}
+
+static usbd_class_driver_t const _dfu_stub_driver = {
+    .name             = "DFU-STUB",
+    .init             = dfu_stub_init,
+    .deinit           = dfu_stub_deinit,
+    .reset            = dfu_stub_reset,
+    .open             = dfu_stub_open,
+    .control_xfer_cb  = dfu_stub_control_xfer_cb,
+    .xfer_cb          = dfu_stub_xfer_cb,
+};
+
+usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count)
+{
+    *driver_count = 1;
+    return &_dfu_stub_driver;
 }
 
 // --- Configuration Descriptor (373 bytes, matches real miniDSP 2x4 HD) ---
@@ -1429,14 +1481,14 @@ void app_main(void)
              desc_device.idVendor, desc_device.idProduct, desc_device.bcdDevice);
     ESP_LOGI(TAG, "═══════════════════════════════════════════");
     ESP_LOGI(TAG, "Audio: Playback IF1 (24-bit alt1 + 16-bit alt2)");
-    ESP_LOGI(TAG, "HID:   IF2 (64-byte vendor reports, full command protocol)");
+    ESP_LOGI(TAG, "HID:   IF4 (64-byte vendor reports, full command protocol)");
     ESP_LOGI(TAG, "Clock: Source ID=%d, Selector ID=%d (44.1/48 kHz)",
              CLOCK_SOURCE_ID, CLOCK_SELECTOR_ID);
     ESP_LOGI(TAG, "Playback: IT%d → FU%d → OT%d (Speaker)",
              INPUT_TERMINAL_PB_ID, FEATURE_UNIT_PB_ID, OUTPUT_TERMINAL_PB_ID);
     ESP_LOGI(TAG, "Capture:  IT%d → FU%d → OT%d (USB Streaming)",
              INPUT_TERMINAL_CAP_ID, FEATURE_UNIT_CAP_ID, OUTPUT_TERMINAL_CAP_ID);
-    ESP_LOGI(TAG, "Endpoints: 0x01 OUT (pb), 0x81 IN (fb), 0x82/0x02 (HID)");
+    ESP_LOGI(TAG, "Endpoints: 0x01 OUT (pb), 0x81 IN (fb), 0x82 IN (cap), 0x83/0x02 (HID)");
     ESP_LOGI(TAG, "EEPROM: preset=%d source=%d vol=%d mute=%d serial=%d",
              eeprom.current_preset, eeprom.current_source,
              eeprom.master_volume, eeprom.master_mute, eeprom.serial_number);
