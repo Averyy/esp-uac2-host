@@ -28,7 +28,7 @@ Requires an ESP32-S3 board (same as the host). Uses the left USB-C port (OTG) fo
 ## Building
 
 ```sh
-cd test_device
+cd simulators/simple
 idf.py set-target esp32s3
 idf.py build
 idf.py -p /dev/cu.usbmodem* flash monitor

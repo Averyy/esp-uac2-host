@@ -334,12 +334,16 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->tx_stream;
 
+    // Null check before critical section — stream_stop() may have NULLed the
+    // pointer on the leak-timeout path while this callback was in-flight.
+    if (!stream) return;
+
     portENTER_CRITICAL(&stream->state_lock);
-    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    bool active = stream->state == UAC2_STREAM_STATE_ACTIVE;
     portEXIT_CRITICAL(&stream->state_lock);
 
     if (!active) {
-        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 
@@ -451,12 +455,14 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->rx_stream;
 
+    if (!stream) return;
+
     portENTER_CRITICAL(&stream->state_lock);
-    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    bool active = stream->state == UAC2_STREAM_STATE_ACTIVE;
     portEXIT_CRITICAL(&stream->state_lock);
 
     if (!active) {
-        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 
@@ -529,12 +535,14 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
     uac2_host_device_handle_t dev = (uac2_host_device_handle_t)xfer->context;
     uac2_stream_t *stream = dev->tx_stream;
 
+    if (!stream) return;
+
     portENTER_CRITICAL(&stream->state_lock);
-    bool active = stream && stream->state == UAC2_STREAM_STATE_ACTIVE;
+    bool active = stream->state == UAC2_STREAM_STATE_ACTIVE;
     portEXIT_CRITICAL(&stream->state_lock);
 
     if (!active) {
-        if (stream) atomic_fetch_sub(&stream->urbs_in_flight, 1);
+        atomic_fetch_sub(&stream->urbs_in_flight, 1);
         return;
     }
 

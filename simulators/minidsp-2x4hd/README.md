@@ -21,7 +21,7 @@ Full-fidelity ESP32-S3 TinyUSB device that replicates the real miniDSP 2x4 HD on
 | Capture AC entities | Present (IT1, FU11, OT22) | Present |
 | DFU interface | Not present | IF4 |
 | Config descriptor | 300 bytes | 373 bytes |
-| Audio data reception | Not functional (SET_INTERFACE crash) | Functional |
+| Audio data reception | Functional | Functional |
 
 ## Building
 
@@ -46,6 +46,3 @@ Press `h` during operation for fault injection commands:
 - `s`: Show simulator state
 - `h`: Show help
 
-## Known Issues
-
-- **SET_INTERFACE crash**: When the host sends a SET_INTERFACE standard request, TinyUSB's DWC2 driver aborts during isochronous endpoint activation. This is currently worked around by not sending SET_INTERFACE from the host driver. The host tests pass because isochronous OUT transfers on Full Speed USB are fire-and-forget.
