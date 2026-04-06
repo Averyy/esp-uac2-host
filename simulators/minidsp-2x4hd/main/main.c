@@ -3,7 +3,8 @@
  *
  * Faithful replica of the real miniDSP 2x4 HD on USB:
  * - UAC2 audio: playback (IF1, alt 1 = 24-bit, alt 2 = 16-bit)
- * - Feedback endpoint: 10.14 format at Full Speed (via TinyUSB auto-conversion)
+ * - Feedback endpoint: TinyUSB sends 3-byte 10.14 at FS; real miniDSP sends 4-byte 16.16
+ *   (driver handles both formats — see feedback_xfer_done() in uac2_host.c)
  * - HID interface (IF2): 64-byte vendor reports, full command protocol
  * - EEPROM state: preset, source, volume, mute, serial, mod tokens
  * - DSP parameter state: routing, PEQ, gain, delay, compressor (flat defaults)
@@ -122,12 +123,12 @@ static int8_t source_vol_offsets[3] = {0, 0, 0};   // analog, toslink, USB
 #define DSP_PARAM_MAX   256     // max distinct addresses we'll track
 
 static struct {
-    uint16_t addr;
+    uint32_t addr;
     float    value;
 } dsp_params[DSP_PARAM_MAX];
 static int dsp_param_count = 0;
 
-static float dsp_param_get(uint16_t addr)
+static float dsp_param_get(uint32_t addr)
 {
     for (int i = 0; i < dsp_param_count; i++) {
         if (dsp_params[i].addr == addr) return dsp_params[i].value;
@@ -136,7 +137,7 @@ static float dsp_param_get(uint16_t addr)
     return 0.0f;
 }
 
-static void dsp_param_set(uint16_t addr, float value)
+static void dsp_param_set(uint32_t addr, float value)
 {
     for (int i = 0; i < dsp_param_count; i++) {
         if (dsp_params[i].addr == addr) {
@@ -949,15 +950,16 @@ static void cmd_write_flash(const uint8_t *payload, uint8_t len, uint8_t *resp, 
 }
 
 // cmd 0x14: ReadFloats
+// Wire format (3-byte addr): [0x14, addr_hi, addr_mid, addr_lo, count]
 static void cmd_read_floats(const uint8_t *payload, uint8_t len, uint8_t *resp, uint8_t *resp_len)
 {
-    if (len < 4) { resp[0] = 0x00; *resp_len = 1; return; }
+    if (len < 5) { resp[0] = 0x00; *resp_len = 1; return; }
 
-    uint16_t addr = ((uint16_t)payload[1] << 8) | payload[2];
-    uint8_t count = payload[3];
+    uint32_t addr = ((uint32_t)payload[1] << 16) | ((uint32_t)payload[2] << 8) | payload[3];
+    uint8_t count = payload[4];
     if (count > 14) count = 14;  // protocol max
 
-    ESP_LOGI(TAG, "HID: ReadFloats addr=0x%04X count=%d", addr, count);
+    ESP_LOGI(TAG, "HID: ReadFloats addr=0x%06" PRIX32 " count=%d", addr, count);
 
     resp[0] = 0x14;
     for (int i = 0; i < count; i++) {
@@ -973,16 +975,14 @@ static void cmd_read_floats(const uint8_t *payload, uint8_t len, uint8_t *resp, 
 }
 
 // cmd 0x13: WriteDSP
+// Wire format (3-byte addr): [0x13, mode, addr_hi, addr_mid, addr_lo, val0..val3]
 static void cmd_write_dsp(const uint8_t *payload, uint8_t len, uint8_t *resp, uint8_t *resp_len)
 {
-    if (len < 5) { resp[0] = 0x00; *resp_len = 1; return; }
+    if (len < 6) { resp[0] = 0x00; *resp_len = 1; return; }
 
-    // payload[1] = 0x80 (save) or 0xA0 (RAM-only)
-    // payload[2..3] = address (2 bytes for hw_id=10, 2x4 HD)
-    // payload[4..7] = value (4 bytes float, LE)
     uint8_t mode = payload[1];
-    uint16_t addr = ((uint16_t)payload[2] << 8) | payload[3];
-    int val_offset = 4;
+    uint32_t addr = ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 8) | payload[4];
+    int val_offset = 5;
 
     if (val_offset + 4 <= len) {
         float val;
@@ -990,7 +990,7 @@ static void cmd_write_dsp(const uint8_t *payload, uint8_t len, uint8_t *resp, ui
                         ((uint32_t)payload[val_offset+2] << 16) | ((uint32_t)payload[val_offset+3] << 24);
         memcpy(&val, &bits, 4);
         dsp_param_set(addr, val);
-        ESP_LOGI(TAG, "HID: WriteDSP %s addr=0x%04X val=%.6f",
+        ESP_LOGI(TAG, "HID: WriteDSP %s addr=0x%06" PRIX32 " val=%.6f",
                  mode == 0x80 ? "SAVE" : "RAM", addr, val);
     }
 
@@ -999,17 +999,17 @@ static void cmd_write_dsp(const uint8_t *payload, uint8_t len, uint8_t *resp, ui
 }
 
 // cmd 0x30: WriteBiquad
+// Wire format (3-byte addr): [0x30, 0x80, addr_hi, addr_mid, addr_lo, 0x00, 0x00, 5×float32_LE]
 static void cmd_write_biquad(const uint8_t *payload, uint8_t len, uint8_t *resp, uint8_t *resp_len)
 {
-    // [0x30, 0x80, addr_hi, addr_lo, 0x00, 0x00, 5×float32_LE]
-    if (len < 26) { resp[0] = 0x00; *resp_len = 1; return; }
+    if (len < 27) { resp[0] = 0x00; *resp_len = 1; return; }
 
-    uint16_t addr = ((uint16_t)payload[2] << 8) | payload[3];
-    ESP_LOGI(TAG, "HID: WriteBiquad addr=0x%04X", addr);
+    uint32_t addr = ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 8) | payload[4];
+    ESP_LOGI(TAG, "HID: WriteBiquad addr=0x%06" PRIX32, addr);
 
     // Store 5 coefficients (b0, b1, b2, a1, a2)
     for (int i = 0; i < 5; i++) {
-        int off = 6 + i * 4;
+        int off = 7 + i * 4;
         uint32_t bits = (uint32_t)payload[off] | ((uint32_t)payload[off+1] << 8) |
                         ((uint32_t)payload[off+2] << 16) | ((uint32_t)payload[off+3] << 24);
         float val;
@@ -1073,12 +1073,13 @@ static void cmd_set_source(const uint8_t *payload, uint8_t len, uint8_t *resp, u
 }
 
 // cmd 0x19: BypassFilter
+// Wire format (3-byte addr): [0x19, bypass, addr_hi, addr_mid, addr_lo]
 static void cmd_bypass_filter(const uint8_t *payload, uint8_t len, uint8_t *resp, uint8_t *resp_len)
 {
-    if (len < 4) { resp[0] = 0x00; *resp_len = 1; return; }
+    if (len < 5) { resp[0] = 0x00; *resp_len = 1; return; }
     uint8_t bypass = payload[1];
-    uint16_t addr = ((uint16_t)payload[2] << 8) | payload[3];
-    ESP_LOGI(TAG, "HID: BypassFilter addr=0x%04X bypass=%s", addr, bypass ? "ON" : "OFF");
+    uint32_t addr = ((uint32_t)payload[2] << 16) | ((uint32_t)payload[3] << 8) | payload[4];
+    ESP_LOGI(TAG, "HID: BypassFilter addr=0x%06" PRIX32 " bypass=%s", addr, bypass ? "ON" : "OFF");
     resp[0] = 0x01;
     *resp_len = 1;
 }

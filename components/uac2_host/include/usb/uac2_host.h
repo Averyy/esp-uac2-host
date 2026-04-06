@@ -113,6 +113,15 @@ typedef struct {
 
 #define UAC2_MAX_SAMPLE_RATE_RANGES  16
 
+/** Volume range (from GET_RANGE on Feature Unit) */
+typedef struct {
+    int16_t min;    /**< Minimum volume in 1/256 dB */
+    int16_t max;    /**< Maximum volume in 1/256 dB */
+    int16_t res;    /**< Volume resolution in 1/256 dB */
+} uac2_volume_range_t;
+
+#define UAC2_MAX_VOLUME_RANGES  8
+
 // ── Device management ──────────────────────────────────────────────
 
 /**
@@ -220,6 +229,13 @@ esp_err_t uac2_host_stream_read(uac2_host_device_handle_t dev,
  */
 int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev);
 
+/**
+ * Get the current feedback value from the device (async playback only).
+ * Returns the feedback in 16.16 fixed-point format (samples per frame).
+ * For 48kHz: nominal = 0x00300000 (48.0000). Returns 0 if no feedback received.
+ */
+uint32_t uac2_host_stream_get_feedback(uac2_host_device_handle_t dev);
+
 // ── Volume / Mute ──────────────────────────────────────────────────
 
 /**
@@ -247,6 +263,18 @@ esp_err_t uac2_host_set_volume(uac2_host_device_handle_t dev,
  */
 esp_err_t uac2_host_get_volume(uac2_host_device_handle_t dev,
                                uint8_t channel, int16_t *volume_db256);
+
+/**
+ * Query supported volume ranges from the feature unit.
+ *
+ * @param channel     0 = master, 1+ = individual channels
+ * @param ranges      Output array (caller provides UAC2_MAX_VOLUME_RANGES)
+ * @param num_ranges  Output: number of ranges filled
+ */
+esp_err_t uac2_host_get_volume_range(uac2_host_device_handle_t dev,
+                                     uint8_t channel,
+                                     uac2_volume_range_t *ranges,
+                                     uint8_t *num_ranges);
 
 #ifdef __cplusplus
 }

@@ -32,7 +32,7 @@ C (ESP-IDF component). Targets ESP32-S3. Built on top of ESP-IDF USB Host Librar
 - The isochronous transfer layer in ESP-IDF works for audio (proven by `usb_host_uac` UAC1 driver and `esp32-rtp` community project, 78 stars).
 - Memory footprint estimate: ~40-50 KB internal SRAM (driver + ring buffers + URBs). ESP32-S3 has ~200-280 KB free after WiFi.
 - The JDS Labs Atom DAC+ has confirmed UAC1 fallback at Full Speed (`XUA_AUDIO_CLASS_FS=1`). Useful as a UAC1 comparison/baseline device.
-- **XMOS feedback at FS**: 3 bytes, 10.14 format (not 4 bytes despite wMaxPacketSize=4). Arrives every 8ms (bInterval=4). Averaged over 128 SOFs internally.
+- **XMOS feedback at FS**: 4 bytes, 16.16 format (confirmed by real miniDSP 2x4 HD testing, 2026-04-06). Value at 48kHz: 0x00300000 (48.0000 samples/frame). Locks immediately, drift <0.002%. Arrives every 8ms (bInterval=4). Previous assumption of 3-byte 10.14 was incorrect — driver handles both formats.
 - **ESP32-S3 FIFO limitation**: Total 1024 bytes. With PERIODIC_OUT bias: PTX=600 (iso OUT), RX=128 (iso IN), NPTX=64. **Cannot do simultaneous TX+RX** — audio capture packets (~294 bytes) exceed the 128-byte RX FIFO.
 - **ESP-IDF bug #17707**: `usb_host_interface_release()` can fail with ESP_ERR_INVALID_STATE when URBs are in-flight. Driver has retry logic.
 - miniDSP is self-powered (bmAttributes=0xC0, bMaxPower=0) but still needs VBUS present on the bus to enumerate.

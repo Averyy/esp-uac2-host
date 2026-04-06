@@ -1325,6 +1325,9 @@ esp_err_t uac2_host_stream_stop(uac2_host_device_handle_t dev,
     }
 
     // Release interface (cancels pending transfers). Retry for ESP-IDF bug #17707.
+    // Note: first attempt typically sees 1 URB in-flight because cancellation callbacks
+    // are dispatched via usb_host_client_handle_events() on the class driver task.
+    // The 20ms retry delay gives that task time to process the cancelled URB callbacks.
     for (int retry = 0; retry < 5; retry++) {
         esp_err_t rel_err = usb_host_interface_release(dev->client, dev->usb_dev, stream->iface_num);
         if (rel_err == ESP_OK) break;
@@ -1425,6 +1428,12 @@ int64_t uac2_host_stream_get_start_time(uac2_host_device_handle_t dev)
     return dev->tx_stream->first_frame_us;
 }
 
+uint32_t uac2_host_stream_get_feedback(uac2_host_device_handle_t dev)
+{
+    if (!dev || !dev->tx_stream) return 0;
+    return atomic_load(&dev->tx_stream->fb_value);
+}
+
 // ── Public API: Volume / Mute ──────────────────────────────────────
 
 esp_err_t uac2_host_set_mute(uac2_host_device_handle_t dev,
@@ -1479,5 +1488,39 @@ esp_err_t uac2_host_get_volume(uac2_host_device_handle_t dev,
     if (err != ESP_OK) return err;
 
     *volume_db256 = (int16_t)(data[0] | (data[1] << 8));
+    return ESP_OK;
+}
+
+esp_err_t uac2_host_get_volume_range(uac2_host_device_handle_t dev,
+                                     uint8_t channel,
+                                     uac2_volume_range_t *ranges,
+                                     uint8_t *num_ranges)
+{
+    ESP_RETURN_ON_FALSE(dev && ranges && num_ranges, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+
+    uint8_t buf[2 + UAC2_MAX_VOLUME_RANGES * 6];
+    memset(buf, 0, sizeof(buf));
+    esp_err_t err = ctrl_get_range(dev, dev->feature_unit_id,
+                                   UAC2_FU_VOLUME_CONTROL, channel,
+                                   buf, sizeof(buf));
+    if (err != ESP_OK) return err;
+
+    uint16_t count = buf[0] | (buf[1] << 8);
+    if (count > UAC2_MAX_VOLUME_RANGES) {
+        count = UAC2_MAX_VOLUME_RANGES;
+    }
+
+    for (int i = 0; i < count; i++) {
+        const uint8_t *p = buf + 2 + (i * 6);
+        ranges[i].min = (int16_t)(p[0] | (p[1] << 8));
+        ranges[i].max = (int16_t)(p[2] | (p[3] << 8));
+        ranges[i].res = (int16_t)(p[4] | (p[5] << 8));
+
+        ESP_LOGI(TAG, "Volume range %d: min=%.2f dB max=%.2f dB res=%.4f dB",
+                 i, ranges[i].min / 256.0, ranges[i].max / 256.0, ranges[i].res / 256.0);
+    }
+
+    *num_ranges = (uint8_t)count;
     return ESP_OK;
 }
