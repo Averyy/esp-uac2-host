@@ -1,8 +1,11 @@
 version: "0.1.0"
 description: "USB Audio Class 2.0 host driver for ESP32"
 url: "https://github.com/Averyy/esp-uac2-host"
+repository: "https://github.com/Averyy/esp-uac2-host.git"
+documentation: "https://github.com/Averyy/esp-uac2-host/tree/main/components/uac2_host"
+issues: "https://github.com/Averyy/esp-uac2-host/issues"
 dependencies:
   idf:
-    version: ">=5.0"
+    version: ">=5.4"
 targets:
   - esp32s3

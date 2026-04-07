@@ -1,9 +1,15 @@
 # ESP-IDF build artifacts
 build/
+**/build/
+**/build-*/
 sdkconfig
+**/sdkconfig
 sdkconfig.old
+**/sdkconfig.old
 managed_components/
+**/managed_components/
 dependencies.lock
+**/dependencies.lock
 
 # IDE
 .vscode/
@@ -20,3 +26,13 @@ dependencies.lock
 *.so
 *.pyc
 __pycache__/
+
+# ESP-IDF generated metadata
+*.bin
+*.elf
+*.map
+flasher_args.json
+flash_args
+bootloader-flash_args
+app-flash_args
+partition-table.bin

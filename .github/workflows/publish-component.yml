@@ -1,0 +1,47 @@
+name: Publish Component
+
+on:
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: "ESP Component Registry namespace"
+        required: true
+        default: "averyy"
+      execute_upload:
+        description: "Set true to actually attempt an upload"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build component example before upload
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.4
+          target: esp32s3
+          path: components/uac2_host/examples/basic_playback
+
+  upload:
+    needs: validate
+    if: ${{ inputs.execute_upload }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Upload component to registry
+        uses: espressif/upload-components-ci-action@v2
+        with:
+          components: |
+            usb_host_uac2: components/uac2_host
+          namespace: ${{ inputs.namespace }}

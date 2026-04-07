@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=5.4"
+  uac2_host:
+    path: ../../../
