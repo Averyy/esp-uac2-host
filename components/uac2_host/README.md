@@ -123,7 +123,7 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 ## Known Limitations
 
 - ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits.
-- ESP-IDF v5.4 has a hot-unplug limitation during active isochronous disconnect in the underlying USB HAL.
+- Active miniDSP hot-unplug/replug is verified working on ESP-IDF v5.4 with the current teardown path.
 - This component is UAC2-only. It does not fall back to UAC1.
 
 ## Tested Hardware

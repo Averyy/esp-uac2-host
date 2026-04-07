@@ -158,7 +158,7 @@ Full composite USB device simulator at `simulators/minidsp-2x4hd/`. Runs on a se
 ## Known Limitations
 
 - No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. Hardware limitation, requires ESP32-P4 (4KB FIFO).
-- ESP-IDF v5.4 hot-unplug: `abort()` in `usb_dwc_hal.c` during iso channel disconnect. Espressif HAL bug, not fixable in driver code.
+- Active miniDSP hot-unplug/replug is verified working on ESP-IDF v5.4 with the current teardown path. Repeated 3-second unplug/replug cycles and an immediate unplug/replug stress test completed without crash, with `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` observed before reconnect.
 - No HID host support in the driver (HID is separate — the simulator implements the device side)
 - `device_close()` releases the driver's interface handle but does NOT call `usb_host_device_close()`. The underlying USB device is released when all interfaces are closed.
 - Event callback must not block or call driver APIs (documented in header).
