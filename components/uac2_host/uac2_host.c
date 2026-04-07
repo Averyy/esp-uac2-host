@@ -964,11 +964,72 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
 
 static uint8_t resolve_clock_source(const uac2_device_info_t *info)
 {
-    if (info->num_clock_sources > 0) {
-        return info->clock_sources[0].clock_id;
+    // Walk UAC2 clock topology: terminal → selector/multiplier → clock source.
+    // Start from the first output terminal (playback sink) since that's the
+    // primary use case. Fall back to any terminal with a clock reference.
+    uint8_t entity_id = 0;
+    for (int i = 0; i < info->num_terminals; i++) {
+        if (!info->terminals[i].is_input && info->terminals[i].clock_source_id != 0) {
+            entity_id = info->terminals[i].clock_source_id;
+            break;
+        }
     }
-    if (info->num_clock_selectors > 0 && info->clock_selectors[0].nr_pins > 0) {
-        return info->clock_selectors[0].source_ids[0];
+    if (entity_id == 0) {
+        for (int i = 0; i < info->num_terminals; i++) {
+            if (info->terminals[i].clock_source_id != 0) {
+                entity_id = info->terminals[i].clock_source_id;
+                break;
+            }
+        }
+    }
+    if (entity_id == 0) {
+        if (info->num_clock_sources > 0) return info->clock_sources[0].clock_id;
+        ESP_LOGW(TAG, "No clock source found in descriptors");
+        return 0;
+    }
+
+    // Follow the chain through selectors/multipliers to the clock source.
+    // Max 8 hops prevents infinite loops from malformed descriptors.
+    for (int depth = 0; depth < 8; depth++) {
+        // Reached a clock source — done
+        for (int i = 0; i < info->num_clock_sources; i++) {
+            if (info->clock_sources[i].clock_id == entity_id) {
+                return entity_id;
+            }
+        }
+        // Clock selector — follow first input pin
+        // (can't query GET_CUR for active input at discovery time, no ctrl xfer yet)
+        bool followed = false;
+        for (int i = 0; i < info->num_clock_selectors; i++) {
+            if (info->clock_selectors[i].clock_id == entity_id && info->clock_selectors[i].nr_pins > 0) {
+                ESP_LOGD(TAG, "Clock walk: selector %d → source %d (pin 0)",
+                         entity_id, info->clock_selectors[i].source_ids[0]);
+                entity_id = info->clock_selectors[i].source_ids[0];
+                followed = true;
+                break;
+            }
+        }
+        if (followed) continue;
+        // Clock multiplier — follow upstream source
+        for (int i = 0; i < info->num_clock_multipliers; i++) {
+            if (info->clock_multipliers[i].clock_id == entity_id) {
+                ESP_LOGD(TAG, "Clock walk: multiplier %d → source %d",
+                         entity_id, info->clock_multipliers[i].source_id);
+                entity_id = info->clock_multipliers[i].source_id;
+                followed = true;
+                break;
+            }
+        }
+        if (followed) continue;
+        // Entity not found in any category — broken topology
+        ESP_LOGW(TAG, "Clock entity %d not found in topology", entity_id);
+        break;
+    }
+
+    // Fallback if walk didn't resolve
+    if (info->num_clock_sources > 0) {
+        ESP_LOGW(TAG, "Clock topology walk incomplete, using first clock source");
+        return info->clock_sources[0].clock_id;
     }
     ESP_LOGW(TAG, "No clock source found in descriptors");
     return 0;

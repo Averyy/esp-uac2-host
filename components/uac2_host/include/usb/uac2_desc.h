@@ -211,6 +211,7 @@ typedef struct __attribute__((packed)) {
 
 #define UAC2_MAX_CLOCK_SOURCES      4
 #define UAC2_MAX_CLOCK_SELECTORS    4
+#define UAC2_MAX_CLOCK_MULTIPLIERS  4
 #define UAC2_MAX_TERMINALS          8
 #define UAC2_MAX_FEATURE_UNITS      4
 #define UAC2_MAX_AS_INTERFACES      4
@@ -228,6 +229,12 @@ typedef struct {
     uint8_t  nr_pins;
     uint8_t  source_ids[4];         // up to 4 input clock sources
 } uac2_clock_selector_t;
+
+typedef struct {
+    uint8_t  clock_id;
+    uint8_t  source_id;             // bCSourceID — upstream clock entity
+    uint8_t  controls;
+} uac2_clock_multiplier_t;
 
 typedef struct {
     uint8_t  terminal_id;
@@ -289,6 +296,8 @@ typedef struct {
     uac2_clock_source_t  clock_sources[UAC2_MAX_CLOCK_SOURCES];
     uint8_t              num_clock_selectors;
     uac2_clock_selector_t clock_selectors[UAC2_MAX_CLOCK_SELECTORS];
+    uint8_t              num_clock_multipliers;
+    uac2_clock_multiplier_t clock_multipliers[UAC2_MAX_CLOCK_MULTIPLIERS];
 
     // Terminals
     uint8_t              num_terminals;

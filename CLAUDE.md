@@ -4,15 +4,15 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**v0.1.0 — Pre-release, simulator-verified.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). All API renamed: `stream_*` → `device_*`, direction implicit from interface handle. All 12 tests pass against ESP32-to-ESP32 simulator (zero errors). 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`. Next: test with real miniDSP 2x4 HD. See `PROGRESS.md` for detailed status.
+**v0.1.0 — Complete, hardware-verified.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). All 12 tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD (zero errors). 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`. Downstream integration (sweep generator, `POST /play`) lives in minidsp-open. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 
-- **minidsp-open** (`~/code/minidsp-open`) — primary consumer. Needs to play measurement sweeps through miniDSP from ESP32. See `docs/TODO-esp32-usb-audio.md`.
+- **minidsp-open** (`~/code/minidsp-open`) — primary consumer. Will integrate this driver via Rust FFI for measurement sweeps. See `docs/TODO-esp32-usb-audio.md`.
 - **open-sub-optimizer** (`~/code/open-sub-optimizer`) — calls minidsp-open's `POST /play` API. Doesn't interact with this driver directly.
-- **Espressif `usb_host_uac`** (`github.com/espressif/esp-usb`) — UAC1 host driver. Fork its architecture for UAC2. v1.3.3 is the baseline.
-- **USBX** (`github.com/eclipse-threadx/usbx`) — MIT. `ux_class_audio20.h` has complete UAC2 descriptor structs. Protocol reference, not code to import (requires ThreadX RTOS).
-- **CherryUSB** (`github.com/cherry-embedded/CherryUSB`) — Apache-2.0. `usb_audio.h` has complete UAC2 descriptor structs. `usbh_audio.c` is a clean UAC1 host driver pattern. `usbd_audio.c` shows UAC2 CUR/RANGE request handling (device-side, flip for host).
+- **Espressif `usb_host_uac`** (`github.com/espressif/esp-usb`) — UAC1 host driver v1.3.3 (Apache-2.0). Architecture was forked for this UAC2 driver. Reference copy in `ref/espressif-uac1/`.
+- **USBX** (`github.com/eclipse-threadx/usbx`) — MIT. `ux_class_audio20.h` has UAC2 descriptor structs. Used as protocol reference during development.
+- **CherryUSB** (`github.com/cherry-embedded/CherryUSB`) — Apache-2.0. `usb_audio.h` has UAC1+UAC2 structs. Used as protocol reference during development.
 
 ## Tech Stack
 

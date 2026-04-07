@@ -151,45 +151,17 @@ Key test scenario: composite device (HID already claimed), 48kHz/24-bit/stereo O
 
 ## API (Implemented)
 
-See `components/uac2_host/include/uac2_host.h` for the full API. Summary:
-
-```c
-// Device management
-esp_err_t uac2_host_device_open(client, usb_dev, cb, cb_arg, &handle);
-esp_err_t uac2_host_device_close(handle);
-esp_err_t uac2_host_device_get_info(handle, &info);
-
-// Clock control
-esp_err_t uac2_host_get_sample_rate(handle, &rate);
-esp_err_t uac2_host_set_sample_rate(handle, rate);
-esp_err_t uac2_host_get_sample_rate_range(handle, ranges, &count);
-esp_err_t uac2_host_get_clock_valid(handle, &valid);
-
-// Streaming
-esp_err_t uac2_host_stream_start(handle, dir, &config);
-esp_err_t uac2_host_stream_stop(handle, dir);
-esp_err_t uac2_host_stream_write(handle, data, size, timeout_ms);
-esp_err_t uac2_host_stream_read(handle, data, size, &bytes_read, timeout_ms);
-int64_t   uac2_host_stream_get_start_time(handle);  // microsecond timestamp
-
-// Volume/mute (raw 1/256 dB units)
-esp_err_t uac2_host_set_volume(handle, channel, volume_db256);
-esp_err_t uac2_host_get_volume(handle, channel, &volume_db256);
-esp_err_t uac2_host_set_mute(handle, channel, mute);
-esp_err_t uac2_host_get_mute(handle, channel, &mute);
-```
-
-Note: The current API requires the caller to manage the USB Host client and device enumeration. `uac2_host_device_close()` does NOT call `usb_host_device_close()` — the caller must close the USB device separately. A future release will add `uac2_host_install()`/`uac2_host_uninstall()` matching the Espressif driver pattern. See `docs/TODO.md`.
+See `components/uac2_host/include/usb/uac2_host.h` for the full API. The driver follows the Espressif class driver pattern — see `llms.txt` for complete API reference.
 
 ## Key References
 
-### Descriptor struct sources (copy/adapt directly)
-- **USBX UAC2 structs** (MIT): `github.com/eclipse-threadx/usbx` — `ux_class_audio20.h` has every UAC2 descriptor struct, control selector, and format code
-- **CherryUSB UAC2 structs** (Apache-2.0): `github.com/cherry-embedded/CherryUSB` — `class/audio/usb_audio.h` has UAC2 structs alongside UAC1
+### Descriptor struct sources (used during development)
+- **USBX UAC2 structs** (MIT): `github.com/eclipse-threadx/usbx` — `ux_class_audio20.h`
+- **CherryUSB UAC2 structs** (Apache-2.0): `github.com/cherry-embedded/CherryUSB` — `class/audio/usb_audio.h`
 
-### Architecture to fork
-- **Espressif UAC1 driver**: `github.com/espressif/esp-usb/tree/master/host/class/uac/usb_host_uac` — `uac_host.c` (~1400 lines), `uac_descriptors.c`, state machine, ring buffers, isochronous transfer management
-- **CherryUSB UAC1 host**: `github.com/cherry-embedded/CherryUSB` — `class/audio/usbh_audio.c` (~550 lines), clean UAC1 host pattern
+### Architecture reference (forked for this driver)
+- **Espressif UAC1 driver**: `github.com/espressif/esp-usb/tree/master/host/class/uac/usb_host_uac` — class driver pattern, state machine, ring buffers, isochronous transfer management
+- **CherryUSB UAC1 host**: `github.com/cherry-embedded/CherryUSB` — `class/audio/usbh_audio.c`
 
 ### Protocol reference (read-only, GPL)
 - **Linux `sound/usb/clock.c`**: Clock topology walking (`__uac_clock_find_source`)
@@ -226,19 +198,13 @@ Note: The current API requires the caller to manage the USB Host client and devi
 
 ## Resolved Questions
 
-- **miniDSP Full Speed enumeration**: Confirmed — presents UAC2 descriptors at Full Speed (Arduino USB Host Shield descriptor dump). Does NOT fall back to UAC1.
+- **miniDSP Full Speed enumeration**: Confirmed — presents UAC2 descriptors at Full Speed. Does NOT fall back to UAC1.
 - **Bandwidth**: 48kHz/24-bit/stereo = 288 bytes/frame = ~25% bus utilization. Comfortable margin.
 - **Memory**: ~40-50 KB internal SRAM. Fits easily on ESP32-S3 alongside WiFi.
 - **Isochronous transfers**: Proven working on ESP32-S3 by esp32-rtp and usb_host_uac.
-
-## Resolved Questions
-
-- **Composite device**: ESP-IDF supports multiple USB Host clients. The UAC2 driver can coexist with HID on the same composite device. Needs final verification on real miniDSP.
-- **Async mode feedback**: Implemented. Feedback endpoint handling works at Full Speed. 3-byte (10.14) and 4-byte (16.16) formats both supported. Adaptive packet sizing via accumulator pattern.
-- **miniDSP clock topology**: Known from descriptor dump: Clock Source ID=41 (internal programmable), Clock Selector ID=40 (1 input from source 41). Single clock path.
-- **DWC_OTG disconnect recovery**: Tested. Disconnect during streaming handled cleanly via atomic in-flight URB tracking + spinlock-protected state transitions. No crashes observed.
-
-## Remaining Open Questions
-
-- **Real miniDSP hardware**: All testing so far against simulator. Need to verify with actual miniDSP 2x4 HD (descriptor match, feedback format, POST-SET_INTERFACE timing).
-- **Full config descriptor**: Simulator provides a subset. Real miniDSP has 373-byte config descriptor with HID + DFU interfaces we haven't tested parsing against.
+- **Composite device**: ESP-IDF supports multiple USB Host clients. UAC2 driver coexists with HID on the same composite device. Verified on real miniDSP.
+- **Async mode feedback**: 4-byte 16.16 format confirmed with real XMOS hardware (previous 3-byte 10.14 assumption was incorrect). Adaptive packet sizing via accumulator pattern.
+- **miniDSP clock topology**: Clock Source ID=41 (internal programmable), Clock Selector ID=40 (1 input from source 41). Single clock path.
+- **DWC_OTG disconnect recovery**: Disconnect during streaming handled cleanly via atomic in-flight URB tracking + spinlock-protected state transitions. 3 disconnect/reconnect cycles verified with zero heap growth.
+- **Real miniDSP hardware**: Tested 2026-04-06. All 12 tests pass. 766-second stability run. VBUS solder pad required on DevKitC-1.
+- **Full config descriptor**: 373 bytes captured from real device. Simulator now byte-matches real device (5 interfaces including DFU stub).

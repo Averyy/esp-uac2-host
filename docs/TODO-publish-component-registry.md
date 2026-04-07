@@ -1,6 +1,6 @@
 # Publish to ESP Component Registry
 
-Publishing `usb_host_uac2` on [components.espressif.com](https://components.espressif.com). Deferred until after the install/uninstall lifecycle refactor and testing are complete.
+Publishing `usb_host_uac2` on [components.espressif.com](https://components.espressif.com). Driver is complete and hardware-verified — these are the remaining packaging tasks.
 
 ---
 
@@ -8,7 +8,7 @@ Publishing `usb_host_uac2` on [components.espressif.com](https://components.espr
 
 - [x] `idf_component.yml` created
 - [ ] Component-level `README.md` for the registry page (usage, API overview, quick start, hardware requirements)
-- [ ] Verify `CMakeLists.txt` uses `idf_component_register()` correctly for standalone consumption
+- [x] Verify `CMakeLists.txt` uses `idf_component_register()` correctly for standalone consumption
 
 ## 2. Examples Directory
 

@@ -1,6 +1,6 @@
 # Progress
 
-## Status: v0.1.0 — Install/uninstall lifecycle refactor complete and simulator-verified. Espressif class driver pattern with internal device discovery, linked lists, reference counting. All 12 tests pass against ESP32-to-ESP32 simulator, zero errors. 4-agent code review completed, all findings fixed.
+## Status: v0.1.0 — Complete. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, reference counting. All 12 tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD. 4-agent code review completed, all findings fixed. Driver is feature-complete for single-clock UAC2 devices.
 
 ## Completed
 
@@ -191,10 +191,17 @@
 - [x] Frame math verified: 288 bytes/frame at 48kHz, 270 bytes/frame at 44.1kHz
 - [x] Identical behavior to pre-cleanup code — zero regressions
 
-### Known Issues
-- [ ] Clock topology walk for multi-clock devices (works for miniDSP's single clock)
+### Known Limitations (hardware/framework — not fixable in driver code)
+- [ ] No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. Requires ESP32-P4 (4KB FIFO).
+- [ ] ESP-IDF v5.4 hot-unplug: `abort()` in `usb_dwc_hal.c:548` during iso channel disconnect. Espressif HAL bug, not fixable in driver code.
 
-See `TODO(hardware)` markers in source code for details.
+### Clock Topology Fixes (April 6, 2026)
+- [x] `resolve_clock_source()` rewritten: proper topology walk from terminal→selector/multiplier→clock source (was: blindly pick first clock source)
+- [x] Clock multiplier parsing added (`parse_clock_multiplier()`, subtype 0x0C) — was silently skipped
+- [x] Clock multiplier struct + storage in `uac2_device_info_t`
+- [x] Debug print includes clock multipliers
+- [x] Topology walk handles selectors (follows first input pin) and multipliers (follows upstream source)
+- [x] Max 8 hops with fallback prevents infinite loops from malformed descriptors
 
 ### Real miniDSP 2x4 HD Testing (April 6, 2026)
 - [x] Full 373-byte config descriptor captured from real device (replaces partial reconstruction)
@@ -218,12 +225,9 @@ See `TODO(hardware)` markers in source code for details.
 - [x] DFU stub driver (`usbd_app_driver_get_cb`) prevents TinyUSB SET_CONFIGURATION assert
 - [x] Builds clean, static asserts verify 373-byte descriptor size
 
-## Next: Phase 4 — minidsp-open Integration
+## Downstream Integration (not in this repo)
 
-### Phase 4 — minidsp-open Integration
-- [ ] Integration with minidsp-open Rust FFI (`~/code/minidsp-open/docs/TODO-esp32-usb-audio.md`)
-- [ ] Sweep generator (Farina ESS, real-time on ESP32)
-- [ ] `POST /play` HTTP endpoint
+Phase 4 items (Rust FFI integration, sweep generator, `POST /play` endpoint) are the responsibility of **minidsp-open** (`~/code/minidsp-open`). This project is the standalone UAC2 host driver component only. See `~/code/minidsp-open/docs/TODO-esp32-usb-audio.md`.
 
 ### Code Review Findings — ALL FIXED (April 6, 2026)
 - [x] 4 HIGH: device_close SET_INTERFACE fix, usb_string_to_ascii underflow guard, DISCONNECTED event firing, stream_free use-after-free (semaphore handshake)
@@ -239,10 +243,8 @@ See `TODO(hardware)` markers in source code for details.
 - [x] Debug print (`uac2_host_device_print_info`) — topology, runtime state, stream info
 - [x] Sample rate validation at stream_start (warns if rate not in advertised ranges)
 
-### Deferred (requires API break or external packaging)
-- [ ] Install/uninstall lifecycle (`uac2_host_install`/`uac2_host_uninstall`) — Espressif class driver pattern
-- [ ] Device handle validation (linked list walk — requires install/uninstall)
-- [ ] Component registry packaging (examples directory, Doxygen, `-Werror -Wextra`)
+### Future (optional, not blocking)
+- [ ] Component registry packaging: `examples/` directory and Doxygen docs (compiler flags and `idf_component.yml` already done)
 
 ## Hardware
 

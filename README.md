@@ -6,46 +6,56 @@ Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, mini
 
 ## Status
 
-**v1.0.0 — Driver complete, hardened, live-tested.** All 5 automated tests pass against miniDSP 2x4 HD simulator (55k+ frames, zero errors). Full cleanup pass (ESP-IDF conventions, Kconfig, idf_component.yml) + 5-agent code review with all 29 findings fixed. Next: test with real miniDSP 2x4 HD hardware, then integrate with minidsp-open.
+**v0.1.0 — Complete, hardware-verified.** All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD (zero errors, 766-second stability run). Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`.
 
-See [PROGRESS.md](PROGRESS.md) for detailed history and [docs/TODO.md](docs/TODO.md) for remaining work.
+See [PROGRESS.md](PROGRESS.md) for detailed history.
 
 ## Features
 
-- UAC2 descriptor parsing (clock sources, selectors, terminals, feature units, AS interfaces)
+- Espressif class driver pattern (`uac2_host_install`/`uac2_host_uninstall`) with internal device discovery
+- UAC2 descriptor parsing (clock sources, selectors, multipliers, terminals, feature units, AS interfaces)
+- Clock topology walk (terminal→selector/multiplier→clock source)
 - Clock control: get/set sample rate, query supported ranges, check clock validity
 - SET_INTERFACE for proper endpoint activation/deactivation
 - Isochronous TX (playback) and RX (capture) with ring buffer
-- Feedback endpoint handling (10.14 and 16.16 formats) with adaptive packet sizing
-- Volume/mute control via feature unit
+- Feedback endpoint handling (16.16 format, confirmed with real XMOS hardware) with adaptive packet sizing
+- Volume/mute control via feature unit with bmaControls validation and range caching
+- Suspend/resume without URB/ringbuf reallocation
 - First-frame timestamp (microsecond precision, for measurement sync)
-- Transfer error limiting (auto-stops after 10 consecutive errors)
+- Transfer error limiting (auto-stops after consecutive errors, fires STREAM_ERROR event)
 - Endpoint halt/flush/clear on stream stop
 - Atomic in-flight URB tracking for crash-free disconnect
-- Spinlock-protected stream state transitions
+- Per-stream spinlock-protected state transitions
 
 ## Quick Start
 
 ```c
 #include "usb/uac2_host.h"
 
-// After USB enumeration...
+// Install the driver (creates internal USB Host client)
+uac2_host_config_t config = {
+    .create_background_task = true,
+    .callback = device_event_cb,
+    .callback_arg = NULL,
+};
+uac2_host_install(&config);
+
+// In the callback, open a discovered interface:
 uac2_host_device_handle_t dev;
-uac2_host_device_open(client, usb_dev, event_cb, NULL, &dev);
+uac2_host_device_open(&open_config, &dev);
 
 // Start 48kHz/24-bit/stereo playback
-uac2_stream_config_t cfg = { .sample_rate = 48000, .bit_resolution = 24, .channels = 2 };
-uac2_host_stream_start(dev, UAC2_STREAM_TX, &cfg);
+uac2_host_device_start(dev, &stream_config);
 
 // Write PCM data (fills ring buffer, blocks if full)
-uac2_host_stream_write(dev, pcm_data, num_bytes, timeout_ms);
+uac2_host_device_write(dev, pcm_data, num_bytes, timeout_ms);
 
-// Get hardware timestamp of first audio frame
-int64_t start_us = uac2_host_stream_get_start_time(dev);
-
-// Stop
-uac2_host_stream_stop(dev, UAC2_STREAM_TX);
+// Stop and close
+uac2_host_device_stop(dev);
 uac2_host_device_close(dev);
+
+// When done
+uac2_host_uninstall();
 ```
 
 ## Project Structure
@@ -58,7 +68,7 @@ components/uac2_host/       # The driver (ESP-IDF component)
   uac2_desc.c               #   Descriptor parser
   Kconfig                   #   Tunable parameters (menuconfig)
   idf_component.yml         #   Component registry manifest
-main/                        # Test harness (5 automated tests)
+main/                        # Test harness (12 automated tests)
   main.c                    #   Enumeration + streaming test suite
   tone_gen.c/h              #   Sine wave generator
 simulators/
@@ -103,13 +113,20 @@ CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODICOUT=y
 
 ## Tests
 
-The test suite runs automatically on boot against any connected UAC2 device:
+The test suite runs automatically on boot against any connected UAC2 device (12 tests):
 
 1. **48kHz streaming** — 10 seconds, 1kHz tone
 2. **Volume/mute control** — set/get during streaming
 3. **Stop/restart cycle** — 5s stream → stop → 2s pause → 5s stream
 4. **44.1kHz streaming** — 5 seconds, sample rate switch
-5. **Long-running stability** — continuous until disconnect
+5. **Start time precision** — microsecond timestamp verification
+6. **Feedback convergence** — verify feedback locks to expected rate
+7. **16-bit mode** — alternate format streaming
+8. **Rapid measurement cycles** — 9x rapid start/stop
+9. **Volume range exploration** — full range sweep
+10. **Sample rate switch stress** — repeated 48kHz↔44.1kHz switching
+11. **Ring buffer starvation/recovery** — underrun and recovery test
+12. **Long-running stability** — continuous until disconnect (766s verified)
 
 ## Using as a Component
 

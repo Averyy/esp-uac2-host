@@ -5,7 +5,7 @@ Full-fidelity ESP32-S3 TinyUSB device that replicates the real miniDSP 2x4 HD on
 ## Features
 
 - **UAC2 Audio**: Playback IF1 (alt 1 = 24-bit, alt 2 = 16-bit), feedback EP 0x81
-- **HID Control**: IF2 with 64-byte vendor reports, full miniDSP command protocol
+- **HID Control**: IF3 with 64-byte vendor reports, full miniDSP command protocol
 - **AC Topology**: Matches real device — playback path (IT2→FU10→OT20) + capture path (IT1→FU11→OT22)
 - **HID Commands**: ReadHardwareId, ReadFlash, ReadFloats, SetVolume, SetMute, SetConfig, SetSource, WriteDSP, WriteBiquad, and 11 more
 - **EEPROM State**: Preset, source, volume, mute, serial number, mod tokens, DSP ID
@@ -17,11 +17,11 @@ Full-fidelity ESP32-S3 TinyUSB device that replicates the real miniDSP 2x4 HD on
 | Feature | Simulator | Real miniDSP |
 |---------|-----------|-------------|
 | PID | 0x0011 (same) | 0x0011 |
-| Capture AS interface | Not present (DWC2 FIFO limit) | IF2, EP 0x82 IN |
-| Capture AC entities | Present (IT1, FU11, OT22) | Present |
-| DFU interface | Not present | IF4 |
-| Config descriptor | 300 bytes | 373 bytes |
+| Config descriptor | 373 bytes (byte-matched) | 373 bytes |
+| Interfaces | AC, AS playback, AS capture, DFU stub, HID | Same |
+| Feedback | 4-byte 16.16 (software-generated) | 4-byte 16.16 (hardware PLL) |
 | Audio data reception | Functional | Functional |
+| HID report descriptor | 28 bytes (captured from real device) | 28 bytes |
 
 ## Building
 

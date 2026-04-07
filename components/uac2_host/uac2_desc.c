@@ -103,6 +103,16 @@ static void parse_clock_selector(const uint8_t *desc, uac2_device_info_t *info)
     }
 }
 
+static void parse_clock_multiplier(const uint8_t *desc, uac2_device_info_t *info)
+{
+    if (desc[0] < 7) return;  // UAC2 Clock Multiplier minimum
+    if (info->num_clock_multipliers >= UAC2_MAX_CLOCK_MULTIPLIERS) return;
+    uac2_clock_multiplier_t *cm = &info->clock_multipliers[info->num_clock_multipliers++];
+    cm->clock_id = desc[3];
+    cm->source_id = desc[4];
+    cm->controls = desc[5];
+}
+
 static void parse_input_terminal(const uint8_t *desc, uac2_device_info_t *info)
 {
     if (desc[0] < 17) return;  // UAC2 Input Terminal minimum
@@ -178,6 +188,9 @@ static void parse_ac_entity(const uint8_t *desc, uac2_device_info_t *info)
         break;
     case UAC2_AC_CLOCK_SELECTOR:
         parse_clock_selector(desc, info);
+        break;
+    case UAC2_AC_CLOCK_MULTIPLIER:
+        parse_clock_multiplier(desc, info);
         break;
     case UAC2_AC_INPUT_TERMINAL:
         parse_input_terminal(desc, info);
@@ -348,6 +361,11 @@ void uac2_log_device_info(const uac2_device_info_t *info)
         for (int j = 0; j < cx->nr_pins; j++) {
             ESP_LOGI(TAG, "    Input %d: Clock ID=%d", j, cx->source_ids[j]);
         }
+    }
+    for (int i = 0; i < info->num_clock_multipliers; i++) {
+        const uac2_clock_multiplier_t *cm = &info->clock_multipliers[i];
+        ESP_LOGI(TAG, "  Clock Multiplier ID=%d: source=%d, controls=0x%02X",
+                 cm->clock_id, cm->source_id, cm->controls);
     }
 
     // Terminals
