@@ -1,5 +1,8 @@
 # esp-uac2-host
 
+> [!WARNING]
+> This project is new and still under active testing. Expect breaking changes, behavior changes, and documentation updates as the driver is validated on more hardware.
+
 USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component (C).
 
 Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, miniDSP, etc.). Primary use case: playing measurement sweeps through a miniDSP 2x4 HD from an ESP32 for automated sub optimization.
