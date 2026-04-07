@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**v0.1.0 — Complete, hardware-verified.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). All 12 tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD (zero errors). 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`. Downstream integration (sweep generator, `POST /play`) lives in minidsp-open. See `PROGRESS.md` for detailed status.
+**v0.1.0 — validated on current hardware, still under active testing.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD, and active miniDSP hot-unplug/replug has been manually verified on hardware. Builds clean with `-Werror -Wextra`. Downstream integration (sweep generator, `POST /play`) lives in minidsp-open. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 
@@ -35,6 +35,7 @@ C (ESP-IDF component). Targets ESP32-S3. Built on top of ESP-IDF USB Host Librar
 - **XMOS feedback at FS**: 4 bytes, 16.16 format (confirmed by real miniDSP 2x4 HD testing, 2026-04-06). Value at 48kHz: 0x00300000 (48.0000 samples/frame). Locks immediately, drift <0.002%. Arrives every 8ms (bInterval=4). Previous assumption of 3-byte 10.14 was incorrect — driver handles both formats.
 - **ESP32-S3 FIFO limitation**: Total 1024 bytes. With PERIODIC_OUT bias: PTX=600 (iso OUT), RX=128 (iso IN), NPTX=64. **Cannot do simultaneous TX+RX** — audio capture packets (~294 bytes) exceed the 128-byte RX FIFO.
 - **ESP-IDF bug #17707**: `usb_host_interface_release()` can fail with ESP_ERR_INVALID_STATE when URBs are in-flight. Driver has retry logic.
+- **miniDSP hot-unplug status (2026-04-07)**: Active playback unplug/replug is verified working on ESP-IDF v5.4 with the current driver teardown path. Repeated 3-second unplug/replug cycles and an immediate unplug/replug stress test completed without crash, with `ALL_FREE` observed before reconnect.
 - miniDSP is self-powered (bmAttributes=0xC0, bMaxPower=0) but still needs VBUS present on the bus to enumerate.
 
 ## Kconfig Notes

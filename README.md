@@ -9,7 +9,7 @@ Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, mini
 
 ## Status
 
-**v0.1.0 — Complete, hardware-verified.** All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD (zero errors, 766-second stability run). Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`.
+**v0.1.0 — validated on current hardware, still under active testing.** The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD, including repeated hot-unplug/replug recovery on hardware. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
 
 See [PROGRESS.md](PROGRESS.md) for detailed history.
 
@@ -171,12 +171,16 @@ The test suite runs automatically on boot against any connected UAC2 device (12 
 9. **Volume range exploration** — full range sweep
 10. **Sample rate switch stress** — repeated 48kHz↔44.1kHz switching
 11. **Ring buffer starvation/recovery** — underrun and recovery test
-12. **Long-running stability** — continuous until disconnect (766s verified)
+12. **Long-running stability** — continuous until disconnect (766s sustained run verified, repeated hot-unplug/replug recovery verified)
+
+## Validation Notes
+
+- The boot-time harness is automated on device startup, but real miniDSP hot-unplug/replug validation is still manual hardware testing rather than CI automation.
+- Active miniDSP hot-unplug/replug during isochronous playback is verified working on ESP-IDF v5.4 with this driver's teardown path. `usb_host_interface_release()` still needs retry handling for ESP-IDF bug `#17707`.
 
 ## Known Limitations
 
 - ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits.
-- ESP-IDF v5.4 still has a hot-unplug limitation in the underlying USB HAL during active isochronous disconnect.
 - This component is UAC2-only. It does not provide a UAC1 fallback path.
 
 ## License

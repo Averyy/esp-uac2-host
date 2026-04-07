@@ -53,7 +53,6 @@
 #define TONE_AMPLITUDE      0.5f
 #define TONE_BUF_MS         10
 #define TONE_BUF_SIZE       ((TONE_SAMPLE_RATE / 1000) * TONE_BUF_MS * TONE_CHANNELS * (TONE_BIT_DEPTH / 8))
-
 static const char *TAG = "uac2-host";
 
 // ── App state ────────────────────────────────────────────────────
@@ -69,6 +68,8 @@ typedef struct {
 } app_state_t;
 
 static app_state_t s_app;
+
+#define HEAP_SETTLE_TIMEOUT_MS 3000
 
 // ── Event tracking ───────────────────────────────────────────────
 
@@ -872,7 +873,15 @@ done:
     ESP_LOGI(TAG, "Device task stack high watermark: %u bytes free (of %d)",
              (unsigned)(stack_hwm * sizeof(StackType_t)), DEV_TASK_STACK_SIZE);
 
-    // ── Heap after close ──
+    // Wait until the USB host library finishes asynchronous device cleanup
+    // so the heap check reflects the settled system state instead of
+    // transient host-owned allocations.
+    (void)ulTaskNotifyTake(pdTRUE, 0);
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(HEAP_SETTLE_TIMEOUT_MS)) == 0) {
+        ESP_LOGW(TAG, "Timed out waiting for USB_HOST_LIB_EVENT_FLAGS_ALL_FREE");
+    }
+
+    // ── Heap after host cleanup ──
     size_t heap_after = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
     int leak = (int)heap_before - (int)heap_after;
     ESP_LOGI(TAG, "Heap after close: %u free (leak this cycle: %d bytes, total from baseline: %d)",
@@ -940,6 +949,9 @@ static void usb_host_lib_task(void *arg)
         }
         if (event_flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) {
             ESP_LOGI(TAG, "All USB devices freed, ready for reconnect");
+            if (s_app.dev_task_hdl) {
+                xTaskNotifyGive((TaskHandle_t)s_app.dev_task_hdl);
+            }
         }
     }
 }

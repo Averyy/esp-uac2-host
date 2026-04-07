@@ -1,6 +1,6 @@
 # Progress
 
-## Status: v0.1.0 — Complete. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, reference counting. All 12 tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD. 4-agent code review completed, all findings fixed. Driver is feature-complete for single-clock UAC2 devices.
+## Status: v0.1.0 — validated on current hardware, still under active testing. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, and reference counting. The 12-test boot harness passes against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD hardware. Driver is feature-complete for single-clock UAC2 devices, but validation coverage is still expanding.
 
 ## Completed
 
@@ -26,15 +26,15 @@
 - [x] All battle-tested logic preserved: URB callbacks, feedback, state machine, error handling
 - [x] Both host and simulator build clean with zero warnings (`-Werror -Wextra`)
 - [x] `uac2_host_device_set_volume_all_channels()` — iterates bmaControls bitmap
-- [x] 4-agent code review: all 12 findings fixed (handle validation, disconnect race, gone flag, URB leak state, refcount safety, 5s timeout fix)
+- [x] 4-agent code review: all 12 findings from that review round fixed (handle validation, disconnect race, gone flag, URB leak state, refcount safety, 5s timeout fix)
 - [x] Device discovery close-before-callback fix (USB device must be released before firing connect callback)
 - [x] All 12 tests pass against ESP32-to-ESP32 simulator (zero errors, zero disconnects)
 - [x] All 12 tests pass against real miniDSP 2x4 HD (zero errors, real feedback 48.0000 Hz)
-- [x] 3 disconnect/reconnect cycles verified: zero heap growth (220 bytes constant, ESP-IDF internal)
+- [x] Repeated miniDSP hot-unplug/replug cycles verified on hardware: 3-second unplug/replug and immediate unplug/replug both recover cleanly, with `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` observed before reconnect and no heap baseline drift across cycles
 - [x] Stack watermark: 4004 bytes free of 12288 (67% headroom)
 - [x] Fixed `atomic_init` UB on reused interface struct (was `atomic_init`, now `atomic_store`)
 - [x] Fixed stream resource leak on disconnect (stream_stop_internal now frees resources when state is IDLE but resources exist)
-- [x] Documented ESP-IDF v5.4 hot-unplug limitation: `abort()` in `usb_dwc_hal.c:548` during iso channel disconnect (not fixable in driver code)
+- [x] Fixed driver teardown for active hot-unplug: release interface even after `DEV_GONE`, wait for host `ALL_FREE` before heap accounting, and verified clean reconnect on real miniDSP hardware
 - [x] TODO-part2.md fully completed and deleted
 
 ### Phase 0A — Scaffold + Compile (April 5, 2026)
@@ -165,7 +165,7 @@
 - [x] Fixed swapped ringbuffer unblock logic (TX drains for space, RX sends dummy for data)
 - [x] Fixed feedback URB `urbs_in_flight` leak on state transition
 - [x] Set stream state to ACTIVE before URB submission (prevents callback race)
-- [x] Safe stream stop: don't free if URBs still in-flight (leak instead of use-after-free)
+- [x] Safe stream stop groundwork: initially switched from unsafe free to resource retention when URBs were still in-flight
 - [x] Protected `device_close` from concurrent control requests (`closing` flag)
 - [x] Per-stream spinlock (replaces global `s_uac2_stream_lock`)
 - [x] State recheck in `stream_write`/`stream_read` after blocking ringbuf call
@@ -193,7 +193,6 @@
 
 ### Known Limitations (hardware/framework — not fixable in driver code)
 - [ ] No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. Requires ESP32-P4 (4KB FIFO).
-- [ ] ESP-IDF v5.4 hot-unplug: `abort()` in `usb_dwc_hal.c:548` during iso channel disconnect. Espressif HAL bug, not fixable in driver code.
 
 ### Clock Topology Fixes (April 6, 2026)
 - [x] `resolve_clock_source()` rewritten: proper topology walk from terminal→selector/multiplier→clock source (was: blindly pick first clock source)
@@ -213,6 +212,12 @@
 - [x] 766-second stability run, zero errors
 - [x] Disconnect/reconnect: clean teardown, automatic re-enumeration and test restart
 - [x] New driver APIs: `uac2_host_get_volume_range()`, `uac2_host_stream_get_feedback()`
+
+### Hot-Unplug Validation Updates (April 7, 2026)
+- [x] Heap accounting moved to after `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` so the harness no longer reports false leak warnings from asynchronous host cleanup
+- [x] Active unplug teardown fixed: release interface claims even after `DEV_GONE`, keep resources owned until callbacks are quiesced, and fail close instead of freeing live callback context
+- [x] Close-path lifetime hardening: normal APIs reject `closing` handles while `device_close()` performs privileged teardown
+- [x] Real miniDSP validation: repeated 3-second unplug/replug cycles and immediate unplug/replug both complete cleanly with no crash, `ALL_FREE` observed, and next-cycle heap baseline restored
 
 ### Simulator Update to Match Real Device (April 6, 2026)
 - [x] Config descriptor: 300 → 373 bytes (matches real device exactly)

@@ -118,6 +118,8 @@ typedef struct uac2_interface {
 
     // Disconnect tracking
     _Atomic bool disconnect_fired;
+    _Atomic bool closing;
+    atomic_uint io_users;
 
     // ── Stream state (folded from former uac2_stream_t) ──
 
@@ -182,6 +184,83 @@ static uac2_driver_t *s_uac2_driver;
 
 static esp_err_t stream_stop_internal(uac2_iface_t *iface);
 static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer);
+static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks);
+
+static inline bool stream_has_resources(const uac2_iface_t *iface)
+{
+    return iface->xfer_count > 0 ||
+           iface->fb_xfer != NULL ||
+           iface->ringbuf != NULL ||
+           iface->user_task_done != NULL;
+}
+
+static uac2_iface_t *acquire_iface_io_ref(uac2_host_device_handle_t handle)
+{
+    if (!handle || !s_uac2_driver) return NULL;
+
+    uac2_iface_t *target = (uac2_iface_t *)handle;
+    uac2_iface_t *iface = NULL;
+
+    UAC2_ENTER_CRITICAL();
+    STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
+        if (iface == target && !atomic_load(&iface->closing)) {
+            atomic_fetch_add(&iface->io_users, 1);
+            UAC2_EXIT_CRITICAL();
+            return iface;
+        }
+    }
+    UAC2_EXIT_CRITICAL();
+    return NULL;
+}
+
+static void release_iface_io_ref(uac2_iface_t *iface)
+{
+    if (iface) {
+        atomic_fetch_sub(&iface->io_users, 1);
+    }
+}
+
+static esp_err_t wait_for_iface_io_quiesced(uac2_iface_t *iface, TickType_t timeout_ticks)
+{
+    TickType_t start = xTaskGetTickCount();
+    while (atomic_load(&iface->io_users) > 0) {
+        if ((xTaskGetTickCount() - start) >= timeout_ticks) {
+            ESP_LOGE(TAG, "I/O users still active during close: %u",
+                     (unsigned)atomic_load(&iface->io_users));
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return ESP_OK;
+}
+
+static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks)
+{
+    TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < timeout_ticks) {
+        esp_err_t rel_err = usb_host_interface_release(s_uac2_driver->client_handle,
+                                                       dev->dev_hdl, iface->iface_num);
+        if (rel_err == ESP_OK) {
+            return ESP_OK;
+        }
+        if (rel_err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Interface release: URBs in-flight, retry");
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (atomic_load(&dev->gone) &&
+            (rel_err == ESP_ERR_INVALID_ARG || rel_err == ESP_ERR_NOT_FOUND)) {
+            ESP_LOGW(TAG, "Interface release after disconnect returned %s",
+                     esp_err_to_name(rel_err));
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "Interface release failed: %s", esp_err_to_name(rel_err));
+        return rel_err;
+    }
+
+    ESP_LOGE(TAG, "Interface release timed out");
+    return ESP_ERR_TIMEOUT;
+}
 
 // ── Lookup helpers ────────────────────────────────────────────────
 
@@ -253,12 +332,27 @@ static uac2_iface_t *get_iface_by_handle(uac2_host_device_handle_t handle)
 
 #define UAC2_API_MUTEX_TIMEOUT_MS  5000
 
-static inline esp_err_t api_lock(uac2_iface_t *iface) {
+static inline esp_err_t api_lock_internal(uac2_iface_t *iface, bool allow_closing)
+{
     if (xSemaphoreTake(iface->api_mutex, pdMS_TO_TICKS(UAC2_API_MUTEX_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "API mutex timeout");
         return ESP_ERR_TIMEOUT;
     }
+    if (!allow_closing && atomic_load(&iface->closing)) {
+        xSemaphoreGive(iface->api_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
     return ESP_OK;
+}
+
+static inline esp_err_t api_lock(uac2_iface_t *iface)
+{
+    return api_lock_internal(iface, false);
+}
+
+static inline esp_err_t api_lock_allow_closing(uac2_iface_t *iface)
+{
+    return api_lock_internal(iface, true);
 }
 
 static inline void api_unlock(uac2_iface_t *iface) {
@@ -1573,6 +1667,8 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
     iface->cfg_buffer_size = config->buffer_size;
     iface->cfg_buffer_threshold = config->buffer_threshold;
     atomic_init(&iface->disconnect_fired, false);
+    atomic_init(&iface->closing, false);
+    atomic_init(&iface->io_users, 0);
 
     iface->api_mutex = xSemaphoreCreateMutex();
     if (!iface->api_mutex) {
@@ -1604,25 +1700,38 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Handle not in list (already closed?)");
 
+    atomic_store(&iface->closing, true);
+
     // Take api_mutex to serialize with any in-progress API calls
-    esp_err_t lock_err = api_lock(iface);
+    esp_err_t lock_err = api_lock_allow_closing(iface);
     if (lock_err != ESP_OK) {
-        ESP_LOGW(TAG, "device_close: api_mutex timeout, proceeding anyway");
+        atomic_store(&iface->closing, false);
+        ESP_LOGE(TAG, "device_close: api_mutex timeout");
+        return lock_err;
     }
 
     // Re-validate after acquiring lock — a concurrent close may have freed this
     if (!is_interface_in_list(iface)) {
-        if (lock_err == ESP_OK) api_unlock(iface);
+        api_unlock(iface);
         return ESP_ERR_INVALID_ARG;
     }
 
-    // Stop active stream
-    if (iface->state != UAC2_IFACE_STATE_IDLE) {
-        stream_stop_internal(iface);
+    // Stop active stream or clean up disconnect-leftover resources.
+    esp_err_t stop_err = ESP_OK;
+    if (iface->state != UAC2_IFACE_STATE_IDLE || stream_has_resources(iface)) {
+        stop_err = stream_stop_internal(iface);
     }
 
-    if (lock_err == ESP_OK) {
-        api_unlock(iface);
+    api_unlock(iface);
+    if (stop_err != ESP_OK) {
+        ESP_LOGE(TAG, "device_close: stream teardown incomplete: %s", esp_err_to_name(stop_err));
+        return stop_err;
+    }
+
+    esp_err_t io_err = wait_for_iface_io_quiesced(iface, pdMS_TO_TICKS(2000));
+    if (io_err != ESP_OK) {
+        ESP_LOGE(TAG, "device_close: timed out waiting for pending I/O");
+        return io_err;
     }
 
     uac2_device_t *dev = iface->parent;
@@ -1891,7 +2000,7 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
     // If state is IDLE and no resources allocated, nothing to do.
     // But if state is IDLE with resources still present (disconnect set state
     // to IDLE without freeing), we must still clean up.
-    if (iface->state == UAC2_IFACE_STATE_IDLE && iface->xfer_count == 0) return ESP_OK;
+    if (iface->state == UAC2_IFACE_STATE_IDLE && !stream_has_resources(iface)) return ESP_OK;
 
     uac2_device_t *dev = iface->parent;
 
@@ -1923,18 +2032,13 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
         }
     }
 
-    // Release interface — retry for ESP-IDF bug #17707 (skip if device gone)
-    for (int retry = 0; retry < 5 && !atomic_load(&dev->gone); retry++) {
-        esp_err_t rel_err = usb_host_interface_release(s_uac2_driver->client_handle,
-                                                        dev->dev_hdl, iface->iface_num);
-        if (rel_err == ESP_OK) break;
-        if (rel_err == ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "Interface release: URBs in-flight, retry %d", retry + 1);
-            vTaskDelay(pdMS_TO_TICKS(20));
-        } else {
-            ESP_LOGE(TAG, "Interface release failed: %s", esp_err_to_name(rel_err));
-            break;
-        }
+    // Release interface — retry for ESP-IDF bug #17707 even after DEV_GONE.
+    // The physical device may be gone, but the host library still needs the
+    // client-side interface claim released so the bus can reach ALL_FREE and
+    // subsequent reconnects can enumerate cleanly.
+    esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
+    if (rel_err != ESP_OK) {
+        return rel_err;
     }
 
     // Wait for in-flight URBs
@@ -1944,16 +2048,10 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
         wait_ms += 5;
     }
     if (atomic_load(&iface->urbs_in_flight) > 0) {
-        ESP_LOGE(TAG, "Stream stop: %d URBs still in-flight after 2s — leaking to avoid crash",
+        ESP_LOGE(TAG, "Stream stop: %d URBs still in-flight after 2s — retaining resources",
                  atomic_load(&iface->urbs_in_flight));
-        // Leak stream resources — URB callbacks still reference them.
-        // Zero the pointers so we don't try to free them again.
-        memset(iface->xfer, 0, sizeof(iface->xfer));
-        iface->xfer_count = 0;
-        iface->fb_xfer = NULL;
-        iface->ringbuf = NULL;
-        iface->user_task_done = NULL;
-        // Set ERROR state to prevent device_start from re-using this interface
+        // Do not free or clear stream resources while callbacks may still be
+        // touching them. Leave the interface in ERROR and let the caller retry close.
         portENTER_CRITICAL(&iface->state_lock);
         iface->state = UAC2_IFACE_STATE_ERROR;
         portEXIT_CRITICAL(&iface->state_lock);
@@ -1982,9 +2080,11 @@ esp_err_t uac2_host_device_write(uac2_host_device_handle_t handle,
                                  uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(handle && data && size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = (uac2_iface_t *)handle;
+    uac2_iface_t *iface = acquire_iface_io_ref(handle);
+    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     if (!iface->ringbuf || iface->state != UAC2_IFACE_STATE_ACTIVE) {
+        release_iface_io_ref(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2002,6 +2102,7 @@ esp_err_t uac2_host_device_write(uac2_host_device_handle_t handle,
         xSemaphoreGive(iface->user_task_done);
     }
 
+    release_iface_io_ref(iface);
     if (!still_active) return ESP_ERR_INVALID_STATE;
     return ok == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
 }
@@ -2012,9 +2113,11 @@ esp_err_t uac2_host_device_read(uac2_host_device_handle_t handle,
                                 uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(handle && data && bytes_read && size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = (uac2_iface_t *)handle;
+    uac2_iface_t *iface = acquire_iface_io_ref(handle);
+    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     if (!iface->ringbuf || iface->state != UAC2_IFACE_STATE_ACTIVE) {
+        release_iface_io_ref(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2042,21 +2145,28 @@ esp_err_t uac2_host_device_read(uac2_host_device_handle_t handle,
     if (atomic_exchange(&iface->user_task_blocked, false) && iface->user_task_done) {
         xSemaphoreGive(iface->user_task_done);
     }
+    release_iface_io_ref(iface);
     return ret;
 }
 
 int64_t uac2_host_device_get_start_time(uac2_host_device_handle_t handle)
 {
     if (!handle) return 0;
-    uac2_iface_t *iface = (uac2_iface_t *)handle;
-    return atomic_load(&iface->first_frame_us);
+    uac2_iface_t *iface = acquire_iface_io_ref(handle);
+    if (!iface) return 0;
+    int64_t start = atomic_load(&iface->first_frame_us);
+    release_iface_io_ref(iface);
+    return start;
 }
 
 uint32_t uac2_host_device_get_feedback(uac2_host_device_handle_t handle)
 {
     if (!handle) return 0;
-    uac2_iface_t *iface = (uac2_iface_t *)handle;
-    return atomic_load(&iface->fb_value);
+    uac2_iface_t *iface = acquire_iface_io_ref(handle);
+    if (!iface) return 0;
+    uint32_t feedback = atomic_load(&iface->fb_value);
+    release_iface_io_ref(iface);
+    return feedback;
 }
 
 // ── Public API: Volume / Mute ─────────────────────────────────────
@@ -2310,14 +2420,8 @@ static esp_err_t stream_deactivate(uac2_iface_t *iface)
         wait_ms += 5;
     }
     if (atomic_load(&iface->urbs_in_flight) > 0) {
-        ESP_LOGE(TAG, "Deactivate: %d URBs still in-flight after 2s — leaking to avoid crash",
+        ESP_LOGE(TAG, "Deactivate: %d URBs still in-flight after 2s — retaining resources",
                  atomic_load(&iface->urbs_in_flight));
-        // Zero pointers so subsequent stream_stop_internal won't double-free
-        memset(iface->xfer, 0, sizeof(iface->xfer));
-        iface->xfer_count = 0;
-        iface->fb_xfer = NULL;
-        iface->ringbuf = NULL;
-        iface->user_task_done = NULL;
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;

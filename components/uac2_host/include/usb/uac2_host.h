@@ -324,9 +324,9 @@ esp_err_t uac2_host_device_resume(uac2_host_device_handle_t dev);
 /**
  * Write audio data to the playback ring buffer.
  *
- * @note For performance, this function does NOT validate the handle against
- *       the internal device list. The caller must ensure the handle is valid
- *       (not closed or disconnected) before calling.
+ * @note This function takes a lightweight runtime reference to the handle.
+ *       It returns `ESP_ERR_INVALID_STATE` if the stream is not active or if
+ *       the handle is closing/closed/disconnected.
  */
 esp_err_t uac2_host_device_write(uac2_host_device_handle_t dev,
                                  const uint8_t *data, uint32_t size,
@@ -335,9 +335,9 @@ esp_err_t uac2_host_device_write(uac2_host_device_handle_t dev,
 /**
  * Read audio data from the capture ring buffer.
  *
- * @note For performance, this function does NOT validate the handle against
- *       the internal device list. The caller must ensure the handle is valid
- *       (not closed or disconnected) before calling.
+ * @note This function takes a lightweight runtime reference to the handle.
+ *       It returns `ESP_ERR_INVALID_STATE` if the stream is not active or if
+ *       the handle is closing/closed/disconnected.
  */
 esp_err_t uac2_host_device_read(uac2_host_device_handle_t dev,
                                 uint8_t *data, uint32_t size,
@@ -348,8 +348,7 @@ esp_err_t uac2_host_device_read(uac2_host_device_handle_t dev,
  * Get the hardware timestamp of when the first isochronous URB was submitted.
  * Returns 0 if no stream is active.
  *
- * @note For performance, this function does NOT validate the handle.
- *       Caller must ensure the handle is valid (not closed or disconnected).
+ * @note Returns 0 if the handle is closing/closed/disconnected.
  */
 int64_t uac2_host_device_get_start_time(uac2_host_device_handle_t dev);
 
@@ -357,8 +356,7 @@ int64_t uac2_host_device_get_start_time(uac2_host_device_handle_t dev);
  * Get the current feedback value (async playback only).
  * Returns 16.16 fixed-point (samples per frame). 0 if no feedback.
  *
- * @note For performance, this function does NOT validate the handle.
- *       Caller must ensure the handle is valid (not closed or disconnected).
+ * @note Returns 0 if the handle is closing/closed/disconnected.
  */
 uint32_t uac2_host_device_get_feedback(uac2_host_device_handle_t dev);
 
