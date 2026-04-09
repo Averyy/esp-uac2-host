@@ -10,7 +10,7 @@ Minimal example for `usb_host_uac2`. It waits for a UAC2 playback interface, ope
 - Installing the ESP-IDF USB Host Library
 - Installing `usb_host_uac2` with background event handling
 - Reacting to `TX_CONNECTED` driver events
-- Opening a playback interface from the driver callback context
+- Deferring interface open/start work to a playback task outside the driver callback
 - Starting a 48 kHz / 24-bit / stereo stream
 - Streaming PCM data with `uac2_host_device_write()`
 - Cleaning up after disconnect
@@ -45,6 +45,6 @@ The example uses a local `path` dependency in `main/idf_component.yml` so it bui
 After boot:
 
 - The ESP32-S3 waits for a UAC2 device.
-- When a playback interface appears, the example opens it and starts streaming.
+- When a playback interface appears, the example signals a playback task, which opens it and starts streaming.
 - A 1 kHz tone continues until the device is unplugged.
 - Reconnect the device to start again.

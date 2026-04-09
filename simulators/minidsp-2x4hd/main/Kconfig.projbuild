@@ -1,0 +1,21 @@
+menu "miniDSP 2x4 HD Simulator"
+
+config MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD
+    bool "Build reduced no-feedback test image"
+    default n
+    help
+        Build a reduced-capability simulator image where both playback
+        alternate settings omit their feedback endpoints and the capture
+        streaming alt is removed. This exists only for host-side validation
+        of the driver's no-feedback fractional-rate rejection path.
+
+config MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
+    bool "Build playback feature-unit channel-only test image"
+    default n
+    help
+        Build a descriptor variant where the playback feature unit exposes
+        mute and volume only on channels 1 and 2, while master channel 0
+        advertises no playback controls. This exists only to validate the
+        host's per-channel capability handling.
+
+endmenu

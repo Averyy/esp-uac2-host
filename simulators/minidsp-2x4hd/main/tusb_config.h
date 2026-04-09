@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "sdkconfig.h"
 #include "tusb_option.h"
 
 #ifdef __cplusplus
@@ -34,9 +35,17 @@ extern "C" {
 #define CFG_TUD_AUDIO                               1
 
 // Audio function descriptor length — playback + capture AS interfaces.
-// IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(53) + AS_PB_alt2(53)
-//   + AS_CAP_alt0(9) + AS_CAP_alt1(46) = 314
+// Normal build:
+//   IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(53)
+//   + AS_PB_alt2(53) + AS_CAP_alt0(9) + AS_CAP_alt1(46) = 314
+// No-feedback playback build:
+//   IAD(8) + AC_IF(9) + AC_entities(127) + AS_PB_alt0(9) + AS_PB_alt1(46)
+//   + AS_PB_alt2(46) + AS_CAP_alt0(9) = 254
+#if CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD
+#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN               254
+#else
 #define CFG_TUD_AUDIO_FUNC_1_DESC_LEN               314
+#endif
 #define CFG_TUD_AUDIO_FUNC_1_N_AS_INT               2   // playback + capture
 #define CFG_TUD_AUDIO_FUNC_1_CTRL_BUF_SZ            64
 
@@ -47,16 +56,25 @@ extern "C" {
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX          294     // 48kHz/24-bit/2ch + async headroom
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (294 * 4)
 
-// Capture (device → host, EP IN) — present in descriptor to match real device.
-// Not functionally used (ESP32-S3 FIFO too small for simultaneous ISO IN+OUT).
+// Capture (device → host, EP IN) — present in the real-device build.
+// The no-feedback playback test build drops the capture stream to stay within
+// ESP32-S3 FIFO limits while exercising the host-side no-feedback path.
+#if CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD
+#define CFG_TUD_AUDIO_ENABLE_EP_IN                  0
+#else
 #define CFG_TUD_AUDIO_ENABLE_EP_IN                  1
+#endif
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX  3       // 24-bit
 #define CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX          2       // stereo
 #define CFG_TUD_AUDIO_FUNC_1_EP_IN_SZ_MAX           294
 #define CFG_TUD_AUDIO_FUNC_1_EP_IN_SW_BUF_SZ        (294 * 2)  // minimal buffer, never used
 
 // Feedback endpoint — sends rate feedback to host
+#if CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            0
+#else
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            1
+#endif
 // Disable format correction: real miniDSP sends 4-byte 16.16 even at Full Speed
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 0
 

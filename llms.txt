@@ -4,29 +4,30 @@ USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component written in C. MI
 
 ## What This Is
 
-A generic UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio to/from any USB Audio Class 2.0 device (DACs, audio interfaces, miniDSP hardware). The primary use case is playing measurement sweeps through a miniDSP 2x4 HD for automated subwoofer optimization.
+A UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio to/from single-clock USB Audio Class 2.0 devices (DACs, audio interfaces, miniDSP hardware). The primary use case is playing measurement sweeps through a miniDSP 2x4 HD for automated subwoofer optimization.
 
-v0.1.0 — complete, hardware-verified. All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD (zero errors, 766-second stability run). Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. 4-agent code review with all findings fixed. Builds clean with `-Werror -Wextra`.
+v0.1.1 — validated on current hardware. All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD, including a prior 766-second stability run; recent real-device reruns also pass live suspend/resume, duplex-guard, and active hot-unplug/replug recovery checks. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. Public support is currently scoped to single-clock UAC2 devices. Builds clean with `-Werror -Wextra`.
 
 ## Architecture
 
 ```
 components/uac2_host/           ESP-IDF component (the driver)
-  include/usb/uac2_host.h      Public API: device open/close, stream start/stop/read/write, clock, volume
+  include/usb/uac2_host.h      Public API: install/uninstall, driver/device callbacks, open/close, stream, clock, volume
   include/usb/uac2_desc.h      UAC2 descriptor structs (clock source, terminals, feature unit, AS, format type)
-  uac2_host.c                  Driver implementation (~2400 lines)
+  uac2_host.c                  Driver implementation
   uac2_desc.c                  Descriptor parser (~420 lines)
   CMakeLists.txt               Component build file (REQUIRES usb, PRIV_REQUIRES esp_ringbuf)
   Kconfig                      Tunable parameters (URB count, timeout, max size, error limit)
   idf_component.yml            Component registry manifest
 
 main/                           Test application
-  main.c                        12 automated tests (48kHz, volume/mute, stop/restart, 44.1kHz, feedback, 16-bit, rapid cycles, volume range, sample rate stress, starvation/recovery, long-running)
+  main.c                        12 numbered automated tests plus live suspend/resume and duplex-guard checks
   tone_gen.c/h                  Sine wave generator for test audio
 
 simulators/simple/              Minimal UAC2 device simulator (TinyUSB on ESP32-S3)
-simulators/minidsp-2x4hd/      Full miniDSP 2x4 HD simulator (~1400 lines)
+simulators/minidsp-2x4hd/      Full miniDSP 2x4 HD simulator
                                 UAC2 audio (playback, feedback) + HID (20 commands, EEPROM, DSP state, fault injection)
+                                Optional no-feedback and playback-channel-only FU test builds with profile markers for harness validation
 
 ref/                            Reference code (read-only, not compiled)
   espressif-uac1/               Espressif's UAC1 host driver v1.3.3 (architecture reference)
@@ -39,25 +40,30 @@ ref/                            Reference code (read-only, not compiled)
 
 ### Types
 - `uac2_host_device_handle_t` — opaque device handle (pointer to internal `uac2_iface_t`)
-- `uac2_host_config_t` — driver install config: `{ create_background_task, task_priority, stack_size, callback, callback_arg }`
-- `uac2_host_device_config_t` — device open config: `{ addr, iface_num, callback, callback_arg }`
-- `uac2_host_stream_config_t` — stream config: `{ sample_freq, bit_resolution, channels }`
-- `uac2_host_event_t` — `CONNECTED`, `TX_DONE`, `RX_DONE`, `TRANSFER_ERROR`, `STREAM_ERROR`, `DISCONNECTED`
-- `uac2_host_event_cb_t` — callback signature `void(dev, event, arg)`
+- `uac2_host_driver_config_t` — driver install config: `{ create_background_task, task_priority, stack_size, core_id, callback, callback_arg }`
+- `uac2_host_device_config_t` — device open config: `{ addr, iface_num, buffer_size, buffer_threshold, callback, callback_arg }`
+- `uac2_host_stream_config_t` — stream config: `{ sample_freq, bit_resolution, channels, flags }`
+- `uac2_host_driver_event_t` — `UAC2_HOST_DRIVER_EVENT_TX_CONNECTED`, `UAC2_HOST_DRIVER_EVENT_RX_CONNECTED`
+- `uac2_host_driver_event_cb_t` — callback signature `void(addr, iface_num, event, arg)`
+- `uac2_host_device_event_t` — `TX_DONE`, `RX_DONE`, `TRANSFER_ERROR`, `STREAM_ERROR`, `DISCONNECTED`
+- `uac2_host_device_event_cb_t` — callback signature `void(handle, event, arg)`
 - `uac2_device_info_t` — parsed descriptor info (AS interfaces, clock sources/selectors/multipliers, terminals) + VID/PID/strings
 - `uac2_sample_rate_range_t` — `{ min, max, res }`
+- `uac2_volume_range_t` — `{ min, max, res }`
+- `uac2_host_dev_alt_param_t` — alternate-setting parameters including data/feedback endpoints
 
 ### Functions
 ```c
 // Driver lifecycle (Espressif class driver pattern)
-esp_err_t uac2_host_install(const uac2_host_config_t *config);
+esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);
 esp_err_t uac2_host_uninstall(void);
-esp_err_t uac2_host_handle_events(uint32_t timeout_ms);  // manual event pump (if no background task)
+esp_err_t uac2_host_handle_events(TickType_t timeout);  // manual event pump (if no background task)
 
 // Device lifecycle (per-interface handles from driver callback)
 esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config, uac2_host_device_handle_t *handle);
 esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle);
 esp_err_t uac2_host_device_get_info(uac2_host_device_handle_t handle, uac2_device_info_t *info);
+esp_err_t uac2_host_get_device_alt_param(uac2_host_device_handle_t handle, uint8_t alt, uac2_host_dev_alt_param_t *param);
 void      uac2_host_device_print_info(uac2_host_device_handle_t handle);
 
 // Streaming
@@ -67,23 +73,23 @@ esp_err_t uac2_host_device_write(handle, data, size, timeout_ms);  // TX: blocks
 esp_err_t uac2_host_device_read(handle, buf, size, &bytes_read, timeout_ms);  // RX
 esp_err_t uac2_host_device_suspend(handle);   // pause without realloc
 esp_err_t uac2_host_device_resume(handle);    // resume after suspend
-int64_t   uac2_host_stream_get_start_time(handle);  // microsecond timestamp of first frame
-esp_err_t uac2_host_stream_get_feedback(handle, &feedback_hz);
+int64_t   uac2_host_device_get_start_time(handle);  // microsecond timestamp of first frame
+uint32_t  uac2_host_device_get_feedback(handle);    // 16.16 samples/frame, 0 if unavailable
 
 // Clock control
-esp_err_t uac2_host_get_sample_rate(handle, &rate);
-esp_err_t uac2_host_set_sample_rate(handle, rate);
-esp_err_t uac2_host_get_sample_rate_range(handle, ranges[], max, &count);
-esp_err_t uac2_host_get_clock_validity(handle, &valid);
+esp_err_t uac2_host_device_get_sample_rate(handle, &rate);
+esp_err_t uac2_host_device_set_sample_rate(handle, rate);
+esp_err_t uac2_host_device_get_sample_rate_range(handle, ranges, &count);
+esp_err_t uac2_host_device_get_clock_valid(handle, &valid);
 
 // Volume/mute (feature unit)
-esp_err_t uac2_host_set_volume(handle, channel, volume_db256);
-esp_err_t uac2_host_get_volume(handle, channel, &volume_db256);
-esp_err_t uac2_host_set_mute(handle, channel, mute);
-esp_err_t uac2_host_get_mute(handle, channel, &mute);
-esp_err_t uac2_host_get_volume_range(handle, &min, &max, &res);
-esp_err_t uac2_host_set_volume_percent(handle, channel, percent);
-esp_err_t uac2_host_set_volume_all_channels(handle, volume_db256);
+esp_err_t uac2_host_device_set_volume(handle, channel, volume_db256);
+esp_err_t uac2_host_device_get_volume(handle, channel, &volume_db256);
+esp_err_t uac2_host_device_set_mute(handle, channel, mute);
+esp_err_t uac2_host_device_get_mute(handle, channel, &mute);
+esp_err_t uac2_host_device_get_volume_range(handle, channel, ranges, &count);
+esp_err_t uac2_host_device_set_volume_percent(handle, channel, percent);
+esp_err_t uac2_host_device_set_volume_all_channels(handle, volume_db256);
 
 // Event callback fires from driver task — must not block or call driver APIs.
 ```
@@ -92,11 +98,11 @@ esp_err_t uac2_host_set_volume_all_channels(handle, volume_db256);
 ```c
 #define UAC2_HOST_VER_MAJOR         0
 #define UAC2_HOST_VER_MINOR         1
-#define UAC2_HOST_VER_PATCH         0
+#define UAC2_HOST_VER_PATCH         1
 #define UAC2_NUM_ISOC_URBS          3       // URBs in flight (Kconfig: UAC2_NUM_ISOC_URBS)
 #define UAC2_NUM_PACKETS_PER_URB    1       // 1 packet per URB (1ms at Full Speed)
 #define UAC2_CTRL_XFER_TIMEOUT_MS   5000    // Kconfig: UAC2_CTRL_XFER_TIMEOUT_MS
-#define UAC2_CTRL_XFER_MAX_SIZE     256     // Kconfig: UAC2_CTRL_XFER_MAX_SIZE
+#define UAC2_CTRL_XFER_MAX_SIZE     256     // header default; this repo sets 512 in sdkconfig.defaults
 #define UAC2_MAX_CONSECUTIVE_ERRORS 10      // Kconfig: UAC2_MAX_CONSECUTIVE_ERRORS
 #define UAC2_MAX_SAMPLE_RATE_RANGES 16
 #define UAC2_MAX_STRING_LEN         64      // VID/PID/strings in uac2_device_info_t
@@ -119,7 +125,7 @@ All control requests go through `ctrl_request()` which serializes access via a m
 ### Thread Safety
 - `stream->state_lock` (portMUX spinlock, per-stream): protects `stream->state` transitions. Callbacks check state under this lock before resubmitting URBs.
 - `ctrl_mutex` (FreeRTOS mutex): serializes control transfer access. WARNING: `ctrl_request()` holds mutex after success — caller must release after reading response data.
-- `dev->closing` (volatile bool): set during `device_close()` to reject new control requests.
+- `iface->closing` (_Atomic bool): set during `device_close()` to reject new control requests while teardown is in progress.
 - `urbs_in_flight` (atomic_int): tracks in-flight URBs for clean shutdown.
 - `consecutive_errors` (atomic_int): counts errors, stops re-submission at threshold (TX, RX, and feedback).
 - `fb_value` (atomic_uint): feedback value written by feedback callback, read by TX submit.
@@ -148,7 +154,7 @@ Full composite USB device simulator at `simulators/minidsp-2x4hd/`. Runs on a se
 - VID=0x2752, PID=0x0011, bcdDevice=0x0185 (byte-matched to real device)
 - 373-byte config descriptor matching real miniDSP exactly (5 interfaces: AC, AS playback, AS capture, DFU stub, HID)
 - UAC2 audio: playback IF1 (alt 1 = 24-bit, alt 2 = 16-bit), feedback endpoint (4-byte 16.16)
-- HID IF3: 64-byte vendor reports, 20 commands (ReadHardwareId, ReadFlash, ReadFloats, WriteDSP, WriteBiquad, SetVolume, SetMute, SetConfig, SetSource, etc.)
+- HID IF4: 64-byte vendor reports, 20 commands (ReadHardwareId, ReadFlash, ReadFloats, WriteDSP, WriteBiquad, SetVolume, SetMute, SetConfig, SetSource, etc.)
 - EEPROM state, DSP parameter storage, fault injection (serial console toggle)
 - All SET_INTERFACE transitions, volume/mute, sample rate switching work
 
@@ -157,7 +163,7 @@ Full composite USB device simulator at `simulators/minidsp-2x4hd/`. Runs on a se
 
 ## Known Limitations
 
-- No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. Hardware limitation, requires ESP32-P4 (4KB FIFO).
+- No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. The driver rejects opposite-direction stream activation at runtime. True duplex requires ESP32-P4 (4KB FIFO).
 - Active miniDSP hot-unplug/replug is verified working on ESP-IDF v5.4 with the current teardown path. Repeated 3-second unplug/replug cycles and an immediate unplug/replug stress test completed without crash, with `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` observed before reconnect.
 - No HID host support in the driver (HID is separate — the simulator implements the device side)
 - `device_close()` releases the driver's interface handle but does NOT call `usb_host_device_close()`. The underlying USB device is released when all interfaces are closed.

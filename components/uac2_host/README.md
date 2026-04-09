@@ -5,7 +5,7 @@
 
 USB Audio Class 2.0 host driver for ESP-IDF.
 
-This component provides a generic UAC2 host driver for ESP32-S3. It handles device discovery, descriptor parsing, clock control, isochronous playback/capture streams, async feedback, and feature-unit volume/mute controls.
+This component provides a UAC2 host driver for ESP32-S3. It handles device discovery, descriptor parsing, clock control, isochronous playback/capture streams, async feedback, and feature-unit volume/mute controls. Current public support is scoped to single-clock UAC2 devices. Real miniDSP validation currently includes the 12-test harness, live suspend/resume, duplex-guard rejection, and active hot-unplug/replug recovery.
 
 ## Features
 
@@ -32,7 +32,7 @@ This component provides a generic UAC2 host driver for ESP32-S3. It handles devi
 After publication to the registry:
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.0"
+idf.py add-dependency "averyy/usb_host_uac2^0.1.1"
 ```
 
 For local development before publication, use a `path` dependency in `idf_component.yml`:
@@ -47,8 +47,49 @@ dependencies:
 ## Quick Start
 
 ```c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "usb/usb_host.h"
 #include "usb/uac2_host.h"
+
+static uint8_t s_addr;
+static uint8_t s_iface_num;
+static TaskHandle_t s_playback_task;
+
+static void playback_task(void *arg)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        uac2_host_device_handle_t dev = NULL;
+        uac2_host_device_config_t open_cfg = {
+            .addr = s_addr,
+            .iface_num = s_iface_num,
+            .buffer_size = 0,
+            .buffer_threshold = 0,
+            .callback = NULL,
+            .callback_arg = NULL,
+        };
+
+        if (uac2_host_device_open(&open_cfg, &dev) != ESP_OK) {
+            continue;
+        }
+
+        uac2_host_stream_config_t stream_cfg = {
+            .channels = 2,
+            .bit_resolution = 24,
+            .sample_freq = 48000,
+            .flags = 0,
+        };
+
+        if (uac2_host_device_start(dev, &stream_cfg) != ESP_OK) {
+            uac2_host_device_close(dev);
+            continue;
+        }
+
+        // Application can now call uac2_host_device_write()
+    }
+}
 
 static void driver_event_cb(uint8_t addr, uint8_t iface_num,
                             const uac2_host_driver_event_t event, void *arg)
@@ -57,33 +98,9 @@ static void driver_event_cb(uint8_t addr, uint8_t iface_num,
         return;
     }
 
-    uac2_host_device_handle_t dev = NULL;
-    uac2_host_device_config_t open_cfg = {
-        .addr = addr,
-        .iface_num = iface_num,
-        .buffer_size = 0,
-        .buffer_threshold = 0,
-        .callback = NULL,
-        .callback_arg = NULL,
-    };
-
-    if (uac2_host_device_open(&open_cfg, &dev) != ESP_OK) {
-        return;
-    }
-
-    uac2_host_stream_config_t stream_cfg = {
-        .channels = 2,
-        .bit_resolution = 24,
-        .sample_freq = 48000,
-        .flags = 0,
-    };
-
-    if (uac2_host_device_start(dev, &stream_cfg) != ESP_OK) {
-        uac2_host_device_close(dev);
-        return;
-    }
-
-    // Application can now call uac2_host_device_write()
+    s_addr = addr;
+    s_iface_num = iface_num;
+    xTaskNotifyGive(s_playback_task);
 }
 
 void app_main(void)
@@ -103,6 +120,8 @@ void app_main(void)
         .callback_arg = NULL,
     };
     uac2_host_install(&driver_cfg);
+
+    xTaskCreate(playback_task, "uac2_playback", 4096, NULL, 21, &s_playback_task);
 }
 ```
 
@@ -122,7 +141,8 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 
 ## Known Limitations
 
-- ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits.
+- ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits. The driver rejects opposite-direction stream activation at runtime.
+- Public support is currently limited to single-clock UAC2 devices.
 - Active miniDSP hot-unplug/replug is verified working on ESP-IDF v5.4 with the current teardown path.
 - This component is UAC2-only. It does not fall back to UAC1.
 
@@ -131,6 +151,7 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 - ESP32-S3-DevKitC-1
 - miniDSP 2x4 HD
 - ESP32-S3 UAC2 simulator in this repository
+- Real-device reruns on the miniDSP 2x4 HD also validate suspend/resume, duplex-guard rejection, and active hot-unplug/replug recovery
 
 ## License
 

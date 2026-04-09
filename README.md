@@ -5,11 +5,11 @@
 
 USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component (C).
 
-Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, miniDSP, etc.). Primary use case: playing measurement sweeps through a miniDSP 2x4 HD from an ESP32 for automated sub optimization.
+Generic UAC2 driver for ESP32-S3, currently validated for single-clock UAC2 devices such as the miniDSP 2x4 HD. Primary use case: playing measurement sweeps through a miniDSP 2x4 HD from an ESP32 for automated sub optimization.
 
 ## Status
 
-**v0.1.0 — validated on current hardware, still under active testing.** The driver has been tested on an ESP32-S3 with a real miniDSP 2x4 HD and works. The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD, including repeated hot-unplug/replug recovery on hardware. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
+**v0.1.1 — validated on current hardware, still under active testing.** The driver has been tested on an ESP32-S3 with a real miniDSP 2x4 HD and works. The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD; recent live miniDSP reruns also pass suspend/resume, duplex-guard, and repeated hot-unplug/replug recovery checks. Current public support is scoped to single-clock UAC2 devices. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
 
 See [PROGRESS.md](PROGRESS.md) for detailed history.
 
@@ -54,11 +54,13 @@ uac2_host_driver_config_t config = {
 };
 uac2_host_install(&config);
 
-// In the callback, open a discovered interface:
+// In the driver callback, record addr/iface_num and notify a worker task.
+// The callback runs on the USB Host event task and must not block.
+enqueue_open_request(addr, iface_num);
+
+// In a normal task, open the interface and start playback.
 uac2_host_device_handle_t dev;
 uac2_host_device_open(&open_config, &dev);
-
-// Start 48kHz/24-bit/stereo playback
 uac2_host_device_start(dev, &stream_config);
 
 // Write PCM data (fills ring buffer, blocks if full)
@@ -92,7 +94,7 @@ set(EXTRA_COMPONENT_DIRS "/path/to/esp-uac2-host/components/uac2_host")
 After the component is eventually published to the ESP Component Registry, the planned install flow will be:
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.0"
+idf.py add-dependency "averyy/usb_host_uac2^0.1.1"
 ```
 
 The namespace and component name are final, but the component is intentionally not published yet.
@@ -163,24 +165,29 @@ The test suite runs automatically on boot against any connected UAC2 device (12 
 1. **48kHz streaming** — 10 seconds, 1kHz tone
 2. **Volume/mute control** — set/get during streaming
 3. **Stop/restart cycle** — 5s stream → stop → 2s pause → 5s stream
-4. **44.1kHz streaming** — 5 seconds, sample rate switch
+4. **44.1kHz streaming** — 5-second 44.1kHz switch smoke test
 5. **Start time precision** — microsecond timestamp verification
-6. **Feedback convergence** — verify feedback locks to expected rate
+6. **Feedback presence & clock validity** — verify expected feedback stabilizes near the target value and the clock reports valid
 7. **16-bit mode** — alternate format streaming
 8. **Rapid measurement cycles** — 9x rapid start/stop
-9. **Volume range exploration** — full range sweep
-10. **Sample rate switch stress** — repeated 48kHz↔44.1kHz switching
+9. **Volume/mute channel exploration** — per-channel set/get/readback/restore checks
+10. **Sample rate switch stress** — repeated 48kHz↔44.1kHz switch attempts while streaming
 11. **Ring buffer starvation/recovery** — underrun and recovery test
-12. **Long-running stability** — continuous until disconnect (766s sustained run verified, repeated hot-unplug/replug recovery verified)
+12. **Long-running stability** — configurable soak duration via `CONFIG_UAC2_TEST12_DURATION_SEC` (Kconfig default 1 hour; the checked-in repo `sdkconfig` currently pins this to 20 seconds for smoke reruns; 766s sustained run verified, repeated hot-unplug/replug recovery verified)
+
+For short local smoke runs on the ESP32-to-ESP32 simulator setup, build the host app with:
+`idf.py -B build-smoke -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.smoke.defaults" build flash`
 
 ## Validation Notes
 
 - The boot-time harness is automated on device startup, but real miniDSP hot-unplug/replug validation is still manual hardware testing rather than CI automation.
-- Active miniDSP hot-unplug/replug during isochronous playback is verified working on ESP-IDF v5.4 with this driver's teardown path. `usb_host_interface_release()` still needs retry handling for ESP-IDF bug `#17707`.
+- Recent real miniDSP reruns also pass the harness's live suspend/resume and duplex-guard checks after the 12 numbered tests.
+- Active miniDSP hot-unplug/replug during isochronous playback is verified working on ESP-IDF v5.4 with this driver's teardown path. The driver still retains `usb_host_interface_release()` retry handling for ESP-IDF bug `#17707`, but normal close no longer emits repeated retry warnings.
 
 ## Known Limitations
 
-- ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits.
+- ESP32-S3 cannot do simultaneous playback and capture for typical UAC2 packet sizes because of USB FIFO limits. The driver now rejects opposite-direction stream activation at runtime.
+- Public support is currently limited to single-clock UAC2 devices.
 - This component is UAC2-only. It does not provide a UAC1 fallback path.
 
 ## License

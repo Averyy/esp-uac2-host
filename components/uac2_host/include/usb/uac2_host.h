@@ -16,12 +16,13 @@
  *   1. usb_host_install()
  *   2. uac2_host_install(&driver_config)   — driver registers USB client
  *   3. Driver fires callback on connect: UAC2_HOST_DRIVER_EVENT_TX_CONNECTED
- *   4. uac2_host_device_open(&device_config, &handle)
- *   5. uac2_host_device_start(handle, &stream_config)
- *   6. uac2_host_device_write(handle, data, size, timeout)
- *   7. uac2_host_device_stop(handle)
- *   8. uac2_host_device_close(handle)
- *   9. uac2_host_uninstall()
+ *   4. Callback notifies application task with addr + iface_num
+ *   5. Application task calls uac2_host_device_open(&device_config, &handle)
+ *   6. Application task calls uac2_host_device_start(handle, &stream_config)
+ *   7. uac2_host_device_write(handle, data, size, timeout)
+ *   8. uac2_host_device_stop(handle)
+ *   9. uac2_host_device_close(handle)
+ *  10. uac2_host_uninstall()
  *
  * TX (playback) silence behavior: when the ring buffer is empty, isochronous
  * URBs are filled with zeros (silence) and never stop. The stream remains
@@ -46,7 +47,7 @@ extern "C" {
 
 #define UAC2_HOST_VER_MAJOR  0
 #define UAC2_HOST_VER_MINOR  1
-#define UAC2_HOST_VER_PATCH  0
+#define UAC2_HOST_VER_PATCH  1
 
 // ── Configuration defaults ─────────────────────────────────────────
 
@@ -112,8 +113,9 @@ typedef enum {
 
 /**
  * Driver-level event callback. Fired when a UAC2 device connects and
- * streaming interfaces are discovered. Use addr + iface_num to open
- * the interface via uac2_host_device_open().
+ * streaming interfaces are discovered. Use addr + iface_num to notify
+ * an application task, then open the interface there via
+ * uac2_host_device_open().
  *
  * @warning Called from the USB Host client event task. Must not block.
  */

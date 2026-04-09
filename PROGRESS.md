@@ -1,8 +1,19 @@
 # Progress
 
-## Status: v0.1.0 — validated on current hardware, still under active testing. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, and reference counting. The 12-test boot harness passes against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD hardware. Driver is feature-complete for single-clock UAC2 devices, but validation coverage is still expanding.
+## Status: v0.1.1 — validated on current hardware, still under active testing. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, and reference counting. The 12-test boot harness passes against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD hardware, and recent live miniDSP reruns also pass suspend/resume, duplex guard, and active unplug/replug recovery. Driver is feature-complete for single-clock UAC2 devices, but validation coverage is still expanding.
 
 ## Completed
+
+### Live miniDSP Cleanup + Validation (April 9, 2026)
+- [x] Version bumped to 0.1.1
+- [x] `docs/TODO-multiclock.md` now tracks only the remaining multi-clock support work
+- [x] Close-path interface release retry logging quieted; ESP-IDF bug `#17707` retry handling retained without repeated normal-shutdown warning spam
+- [x] Attached-device close heap reporting clarified so retained host bookkeeping is reported accurately instead of as a leak-style warning
+- [x] `uac2_host_device_resume()` fixed to reclaim the interface and resume an active playback stream on real miniDSP hardware
+- [x] Harness live checks added and validated on real hardware: suspend/resume and ESP32-S3 duplex guard rejection
+- [x] Full 12-test harness rerun passes on the real miniDSP 2x4 HD after the teardown/logging and suspend/resume changes
+- [x] Active playback unplug/replug rerun passes after the latest changes: `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` observed, re-enumeration clean, next-cycle heap baseline restored to delta 0
+- [x] Device task stack increased 12 KB -> 16 KB for the expanded harness; final watermark 4360 bytes free of 16384
 
 ### Phase 5 — Install/Uninstall Lifecycle Refactor (April 6, 2026)
 - [x] Refactored to Espressif USB host class driver pattern (matching CDC-ACM, HID, MSC, UAC1)
@@ -22,7 +33,7 @@
 - [x] `FLAG_STREAM_SUSPEND_AFTER_START` support in `uac2_host_device_start()`
 - [x] `main.c` rewritten: no manual USB client, driver callback creates device task
 - [x] LICENSE copied into `components/uac2_host/`
-- [x] Version set to 0.1.0 (pre-release)
+- [x] Initial pre-release version tagged
 - [x] All battle-tested logic preserved: URB callbacks, feedback, state machine, error handling
 - [x] Both host and simulator build clean with zero warnings (`-Werror -Wextra`)
 - [x] `uac2_host_device_set_volume_all_channels()` — iterates bmaControls bitmap
@@ -107,7 +118,7 @@
 - [x] Atomic in-flight URB counter (replaces 50ms delay in stream_stop)
 - [x] Spinlock (portMUX) for stream state transitions
 - [x] Ring buffer flush on stream stop
-- [x] First-frame timestamp API (uac2_host_stream_get_start_time)
+- [x] First-frame timestamp API (`uac2_host_device_get_start_time()`)
 - [x] Interface release retry loop (5 attempts, for ESP-IDF bug #17707)
 - [x] ESP-IDF component restructure (main/ -> components/uac2_host/)
 - [x] Test suite: 5 automated tests (48kHz, volume/mute, stop/restart, 44.1kHz, long-running)
@@ -185,14 +196,16 @@
 - [x] Test 1 PASS: 48kHz/24-bit/stereo, 10 sec sustained
 - [x] Test 2 PASS: Volume/mute control during streaming (set/get mute, set/get volume -12dB)
 - [x] Test 3 PASS: Stop/restart cycle (5s 440Hz → stop → 2s pause → 5s 880Hz)
-- [x] Test 4 PASS: 44.1kHz sample rate switch, 5 sec sustained
-- [x] Test 5 PASS: Long-running stability, 55,000+ frames, zero errors
+- [x] Test 4 PASS: 44.1kHz switch smoke test, 5 sec sustained stream
+- [x] Test 5 PASS: Start time precision stays within the expected before/after window across repeated starts
 - [x] Simulator confirms: all SET_INTERFACE transitions, sample rate switching, volume/mute, zero faults
-- [x] Frame math verified: 288 bytes/frame at 48kHz, 270 bytes/frame at 44.1kHz
+- [x] Harness feed math verified: 48kHz uses fixed 288-byte / 10 ms chunks, 44.1kHz uses fractional 10 ms chunking instead of integer truncation
 - [x] Identical behavior to pre-cleanup code — zero regressions
+- [x] April 9 rerun after control/harness hardening: reflashed host + simulator, `TEST 1` through `TEST 11` passed again on the ESP32-to-ESP32 setup
+- [x] April 9 simulator coverage expansion: added reduced no-feedback and playback channel-only feature-unit build variants, profile-specific product-string markers/assertions, and a configurable Test 12 duration for short smoke reruns
 
 ### Known Limitations (hardware/framework — not fixable in driver code)
-- [ ] No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. Requires ESP32-P4 (4KB FIFO).
+- [x] No simultaneous TX+RX on ESP32-S3 — PERIODIC_OUT FIFO bias gives RX only 128 bytes, audio packets are ~294 bytes. The driver now rejects opposite-direction stream activation at runtime. Requires ESP32-P4 (4KB FIFO) for true duplex.
 
 ### Clock Topology Fixes (April 6, 2026)
 - [x] `resolve_clock_source()` rewritten: proper topology walk from terminal→selector/multiplier→clock source (was: blindly pick first clock source)
@@ -208,10 +221,10 @@
 - [x] Feedback format confirmed: **4-byte 16.16** (not 3-byte 10.14 as assumed). Value: 0x00300000 (48.0000). Locks immediately.
 - [x] Volume range confirmed: -127 to 0 dB, 1 dB resolution
 - [x] VBUS fix: bridge `USB-OTG` solder pads on DevKitC-1 back (no powered hub needed)
-- [x] 12-test comprehensive suite: basic streaming, volume/mute, stop/restart, 44.1kHz, start time precision, feedback convergence, 16-bit mode, 9x rapid measurement cycles, volume range exploration, sample rate switch stress, ring buffer starvation/recovery, long-running stability
+- [x] 12-test comprehensive suite: basic streaming, volume/mute, stop/restart, 44.1kHz switch smoke test, start time precision, stable feedback + clock validity, 16-bit mode, 9x rapid measurement cycles, per-channel volume/mute readback + restore, sample rate switch stress, ring buffer starvation/recovery, long-running stability
 - [x] 766-second stability run, zero errors
 - [x] Disconnect/reconnect: clean teardown, automatic re-enumeration and test restart
-- [x] New driver APIs: `uac2_host_get_volume_range()`, `uac2_host_stream_get_feedback()`
+- [x] New driver APIs: `uac2_host_device_get_volume_range()`, `uac2_host_device_get_feedback()`
 
 ### Hot-Unplug Validation Updates (April 7, 2026)
 - [x] Heap accounting moved to after `USB_HOST_LIB_EVENT_FLAGS_ALL_FREE` so the harness no longer reports false leak warnings from asynchronous host cleanup
@@ -241,7 +254,7 @@ Phase 4 items (Rust FFI integration, sweep generator, `POST /play` endpoint) are
 - [x] Review fixes: stream_write/read signal-before-access ordering, semaphore leak in error paths, calc_packet_size==0 guard, ctrl_xfer_submitted_gen made atomic
 
 ### TODO Part 2 Features — IMPLEMENTED (April 6, 2026)
-- [x] Suspend/resume (`uac2_host_stream_suspend`/`uac2_host_stream_resume`) — no URB/ringbuf realloc
+- [x] Suspend/resume (`uac2_host_device_suspend()` / `uac2_host_device_resume()`) — no URB/ringbuf realloc
 - [x] API mutex on all public functions (except stream_write/stream_read which use ringbuf sync)
 - [x] Stream dead notification: `UAC2_STREAM_STATE_ERROR` + `UAC2_HOST_EVENT_STREAM_ERROR` on max errors
 - [x] Volume/mute hardening: bmaControls parsed, capability checks, range caching+validation, percent API

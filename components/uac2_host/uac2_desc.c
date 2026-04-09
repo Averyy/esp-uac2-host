@@ -154,11 +154,11 @@ static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
         return;
     }
     int num_entries = controls_bytes / 4;  // entry 0=master, 1..N=channels
-    fu->nr_channels = (num_entries > 1) ? (uint8_t)(num_entries - 1) : 0;
-    if (fu->nr_channels > 32) fu->nr_channels = 0;
 
-    // Cap to 33 entries (master + 32 channels) to avoid UB in 1u << i
-    if (num_entries > 33) num_entries = 33;
+    // Keep the parsed controls within the 32-bit channel maps:
+    // bit 0 = master, bits 1..31 = channels 1..31.
+    if (num_entries > 32) num_entries = 32;
+    fu->nr_channels = (num_entries > 1) ? (uint8_t)(num_entries - 1) : 0;
 
     // Parse bmaControls: each entry is 4 bytes (UAC2), bits 0-1=mute, bits 2-3=volume
     for (int i = 0; i < num_entries && (5 + i * 4 + 3) < bLength; i++) {

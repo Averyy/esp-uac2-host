@@ -1,4 +1,4 @@
-version: "0.1.0"
+version: "0.1.1"
 description: "USB Audio Class 2.0 host driver for ESP32"
 url: "https://github.com/Averyy/esp-uac2-host"
 repository: "https://github.com/Averyy/esp-uac2-host.git"

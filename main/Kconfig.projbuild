@@ -1,0 +1,11 @@
+menu "esp-uac2-host Test App"
+
+config UAC2_TEST12_DURATION_SEC
+    int "Test 12 duration (seconds)"
+    range 0 3600
+    default 3600
+    help
+        Duration for the long-running stability test in the boot harness.
+        Set to 0 to skip Test 12 entirely during local smoke runs.
+
+endmenu

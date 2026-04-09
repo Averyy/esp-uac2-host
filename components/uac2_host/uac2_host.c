@@ -137,6 +137,7 @@ typedef struct uac2_interface {
     // Data endpoint
     uint8_t  ep_addr;
     uint16_t ep_mps;
+    bool interface_claimed;
 
     // Feedback endpoint (async playback only)
     uint8_t  fb_ep_addr;
@@ -176,6 +177,7 @@ typedef struct {
     uac2_host_driver_event_cb_t user_cb;
     void *user_arg;
     SemaphoreHandle_t all_events_handled;
+    SemaphoreHandle_t lifecycle_mutex;
 } uac2_driver_t;
 
 static uac2_driver_t *s_uac2_driver;
@@ -185,6 +187,12 @@ static uac2_driver_t *s_uac2_driver;
 static esp_err_t stream_stop_internal(uac2_iface_t *iface);
 static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer);
 static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks);
+static esp_err_t stream_deactivate(uac2_iface_t *iface);
+static esp_err_t read_current_sample_rate(uac2_device_t *dev, uint32_t *sample_rate);
+static void validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate);
+static void device_destroy(uac2_device_t *dev);
+static esp_err_t wait_for_urbs_quiesced(uac2_iface_t *iface, uint32_t timeout_ms,
+                                        const char *stage, bool set_error_state);
 
 static inline bool stream_has_resources(const uac2_iface_t *iface)
 {
@@ -194,23 +202,60 @@ static inline bool stream_has_resources(const uac2_iface_t *iface)
            iface->user_task_done != NULL;
 }
 
-static uac2_iface_t *acquire_iface_io_ref(uac2_host_device_handle_t handle)
+static esp_err_t driver_lifecycle_lock(void)
 {
-    if (!handle || !s_uac2_driver) return NULL;
+    if (!s_uac2_driver || !s_uac2_driver->lifecycle_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (xSemaphoreTake(s_uac2_driver->lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Lifecycle mutex timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
+
+static void driver_lifecycle_unlock(void)
+{
+    if (s_uac2_driver && s_uac2_driver->lifecycle_mutex) {
+        xSemaphoreGive(s_uac2_driver->lifecycle_mutex);
+    }
+}
+
+static esp_err_t acquire_iface_runtime_ref(uac2_host_device_handle_t handle, uac2_iface_t **out_iface)
+{
+    if (!out_iface) return ESP_ERR_INVALID_ARG;
+    *out_iface = NULL;
+    if (!handle) return ESP_ERR_INVALID_ARG;
+    if (!s_uac2_driver) return ESP_ERR_INVALID_STATE;
 
     uac2_iface_t *target = (uac2_iface_t *)handle;
-    uac2_iface_t *iface = NULL;
+    bool found = false;
 
     UAC2_ENTER_CRITICAL();
+    uac2_iface_t *iface = NULL;
     STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
-        if (iface == target && !atomic_load(&iface->closing)) {
-            atomic_fetch_add(&iface->io_users, 1);
-            UAC2_EXIT_CRITICAL();
-            return iface;
+        if (iface == target) {
+            found = true;
+            if (!atomic_load(&iface->closing)) {
+                atomic_fetch_add(&iface->io_users, 1);
+                *out_iface = iface;
+                UAC2_EXIT_CRITICAL();
+                return ESP_OK;
+            }
+            break;
         }
     }
     UAC2_EXIT_CRITICAL();
-    return NULL;
+    return found ? ESP_ERR_INVALID_STATE : ESP_ERR_INVALID_ARG;
+}
+
+static uac2_iface_t *acquire_iface_io_ref(uac2_host_device_handle_t handle)
+{
+    uac2_iface_t *iface = NULL;
+    if (acquire_iface_runtime_ref(handle, &iface) != ESP_OK) {
+        return NULL;
+    }
+    return iface;
 }
 
 static void release_iface_io_ref(uac2_iface_t *iface)
@@ -237,14 +282,18 @@ static esp_err_t wait_for_iface_io_quiesced(uac2_iface_t *iface, TickType_t time
 static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks)
 {
     TickType_t start = xTaskGetTickCount();
+    uint32_t retries = 0;
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
         esp_err_t rel_err = usb_host_interface_release(s_uac2_driver->client_handle,
                                                        dev->dev_hdl, iface->iface_num);
         if (rel_err == ESP_OK) {
+            if (retries > 0) {
+                ESP_LOGD(TAG, "Interface release succeeded after %" PRIu32 " retries", retries);
+            }
             return ESP_OK;
         }
         if (rel_err == ESP_ERR_INVALID_STATE) {
-            ESP_LOGW(TAG, "Interface release: URBs in-flight, retry");
+            retries++;
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -258,8 +307,29 @@ static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface
         return rel_err;
     }
 
-    ESP_LOGE(TAG, "Interface release timed out");
+    ESP_LOGE(TAG, "Interface release timed out after %" PRIu32 " retries", retries);
     return ESP_ERR_TIMEOUT;
+}
+
+static esp_err_t wait_for_urbs_quiesced(uac2_iface_t *iface, uint32_t timeout_ms,
+                                        const char *stage, bool set_error_state)
+{
+    uint32_t wait_ms = 0;
+    while (atomic_load(&iface->urbs_in_flight) > 0 && wait_ms < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        wait_ms += 5;
+    }
+    if (atomic_load(&iface->urbs_in_flight) > 0) {
+        ESP_LOGE(TAG, "%s: %d URBs still in-flight after %" PRIu32 "ms — retaining resources",
+                 stage, atomic_load(&iface->urbs_in_flight), timeout_ms);
+        if (set_error_state) {
+            portENTER_CRITICAL(&iface->state_lock);
+            iface->state = UAC2_IFACE_STATE_ERROR;
+            portEXIT_CRITICAL(&iface->state_lock);
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
 }
 
 // ── Lookup helpers ────────────────────────────────────────────────
@@ -357,6 +427,26 @@ static inline esp_err_t api_lock_allow_closing(uac2_iface_t *iface)
 
 static inline void api_unlock(uac2_iface_t *iface) {
     xSemaphoreGive(iface->api_mutex);
+}
+
+static esp_err_t acquire_locked_iface(uac2_host_device_handle_t handle, uac2_iface_t **out_iface)
+{
+    esp_err_t err = acquire_iface_runtime_ref(handle, out_iface);
+    if (err != ESP_OK) return err;
+
+    err = api_lock(*out_iface);
+    if (err != ESP_OK) {
+        release_iface_io_ref(*out_iface);
+        *out_iface = NULL;
+    }
+    return err;
+}
+
+static void release_locked_iface(uac2_iface_t *iface)
+{
+    if (!iface) return;
+    api_unlock(iface);
+    release_iface_io_ref(iface);
 }
 
 // ── Control transfer helpers ──────────────────────────────────────
@@ -501,11 +591,16 @@ static esp_err_t ctrl_get_cur(uac2_device_t *dev,
     esp_err_t err = ctrl_request(dev, UAC2_CTRL_GET, UAC2_REQUEST_CUR,
                                  w_value, w_index, len, NULL);
     if (err == ESP_OK) {
+        int actual = ctrl_get_actual_len(dev);
+        if (actual != len) {
+            ESP_LOGE(TAG, "GET_CUR short response: entity=%u ctrl=%u ch=%u expected=%u actual=%d",
+                     entity_id, control_selector, channel, len, actual);
+            xSemaphoreGive(dev->ctrl_mutex);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
         if (data) {
-            int actual = ctrl_get_actual_len(dev);
-            int copy_len = actual < len ? actual : len;
-            if (copy_len > 0) {
-                memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+            if (len > 0) {
+                memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), len);
             }
         }
         xSemaphoreGive(dev->ctrl_mutex);
@@ -517,7 +612,8 @@ static esp_err_t ctrl_get_range(uac2_device_t *dev,
                                 uint8_t entity_id,
                                 uint8_t control_selector,
                                 uint8_t channel,
-                                uint8_t *data, uint16_t len)
+                                uint8_t *data, uint16_t len,
+                                uint16_t *actual_len_out)
 {
     uint16_t w_value = (control_selector << 8) | channel;
     uint16_t w_index = (entity_id << 8) | dev->ac_iface_num;
@@ -525,8 +621,17 @@ static esp_err_t ctrl_get_range(uac2_device_t *dev,
     esp_err_t err = ctrl_request(dev, UAC2_CTRL_GET, UAC2_REQUEST_RANGE,
                                  w_value, w_index, len, NULL);
     if (err == ESP_OK) {
+        int actual = ctrl_get_actual_len(dev);
+        if (actual < 2) {
+            ESP_LOGE(TAG, "GET_RANGE short response: entity=%u ctrl=%u ch=%u actual=%d",
+                     entity_id, control_selector, channel, actual);
+            xSemaphoreGive(dev->ctrl_mutex);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        if (actual_len_out) {
+            *actual_len_out = (uint16_t)actual;
+        }
         if (data) {
-            int actual = ctrl_get_actual_len(dev);
             int copy_len = actual < len ? actual : len;
             if (copy_len > 0) {
                 memcpy(data, dev->ctrl_xfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
@@ -535,6 +640,29 @@ static esp_err_t ctrl_get_range(uac2_device_t *dev,
         xSemaphoreGive(dev->ctrl_mutex);
     }
     return err;
+}
+
+static esp_err_t ensure_iface_device_available(uac2_iface_t *iface,
+                                               uac2_iface_state_t expected_state,
+                                               const char *stage)
+{
+    if (!iface) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (atomic_load(&iface->parent->gone)) {
+        ESP_LOGW(TAG, "%s aborted: device disconnected", stage);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    portENTER_CRITICAL(&iface->state_lock);
+    uac2_iface_state_t state = iface->state;
+    portEXIT_CRITICAL(&iface->state_lock);
+    if (state != expected_state) {
+        ESP_LOGW(TAG, "%s aborted: iface state=%d expected=%d",
+                 stage, state, expected_state);
+        return ESP_ERR_INVALID_STATE;
+    }
+    return ESP_OK;
 }
 
 // ── Isochronous transfer callbacks ────────────────────────────────
@@ -851,6 +979,41 @@ static const uac2_as_iface_t *find_matching_as_iface(
     return best;
 }
 
+static bool device_has_opposite_direction_stream(const uac2_iface_t *iface)
+{
+#if CONFIG_IDF_TARGET_ESP32S3
+    bool blocked = false;
+
+    UAC2_ENTER_CRITICAL();
+    uac2_iface_t *other = NULL;
+    STAILQ_FOREACH(other, &s_uac2_driver->ifaces_tailq, tailq_entry) {
+        if (other == iface || other->parent != iface->parent || other->dir == iface->dir) {
+            continue;
+        }
+        if (other->state != UAC2_IFACE_STATE_IDLE || stream_has_resources(other)) {
+            blocked = true;
+            break;
+        }
+    }
+    UAC2_EXIT_CRITICAL();
+
+    return blocked;
+#else
+    (void)iface;
+    return false;
+#endif
+}
+
+static bool fractional_playback_requires_feedback(uac2_stream_dir_t dir,
+                                                  uint8_t fb_ep_addr,
+                                                  uint32_t sample_rate)
+{
+    return dir == UAC2_STREAM_TX &&
+           fb_ep_addr == 0 &&
+           sample_rate > 0 &&
+           (sample_rate % 1000) != 0;
+}
+
 static uint16_t calc_packet_size(uint32_t sample_rate, uint8_t channels,
                                  uint8_t sub_slot_size)
 {
@@ -1054,6 +1217,108 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
     return ESP_OK;
 }
 
+static esp_err_t stream_abort_startup(uac2_iface_t *iface)
+{
+    uac2_device_t *dev = iface->parent;
+
+    portENTER_CRITICAL(&iface->state_lock);
+    iface->state = UAC2_IFACE_STATE_IDLE;
+    portEXIT_CRITICAL(&iface->state_lock);
+
+    if (!atomic_load(&dev->gone)) {
+        esp_err_t si_err = ctrl_request_no_data(dev,
+            USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
+            USB_B_REQUEST_SET_INTERFACE, 0, iface->iface_num);
+        if (si_err != ESP_OK) {
+            ESP_LOGW(TAG, "SET_INTERFACE(%d, 0) failed during startup abort: %s",
+                     iface->iface_num, esp_err_to_name(si_err));
+        }
+    }
+
+    if (iface->interface_claimed) {
+        esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
+        if (rel_err != ESP_OK) {
+            portENTER_CRITICAL(&iface->state_lock);
+            iface->state = UAC2_IFACE_STATE_ERROR;
+            portEXIT_CRITICAL(&iface->state_lock);
+            return rel_err;
+        }
+        iface->interface_claimed = false;
+    }
+
+    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Startup abort", true);
+    if (wait_err != ESP_OK) {
+        return wait_err;
+    }
+
+    stream_resources_free(iface);
+    portENTER_CRITICAL(&iface->state_lock);
+    iface->state = UAC2_IFACE_STATE_IDLE;
+    portEXIT_CRITICAL(&iface->state_lock);
+    return ESP_OK;
+}
+
+static void stream_flush_ringbuf(uac2_iface_t *iface)
+{
+    if (!iface->ringbuf) {
+        return;
+    }
+
+    if (iface->dir == UAC2_STREAM_TX) {
+        size_t item_size;
+        void *item;
+        while ((item = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0,
+                                               iface->ringbuf_size)) != NULL) {
+            vRingbufferReturnItem(iface->ringbuf, item);
+        }
+    } else {
+        size_t item_size;
+        void *item;
+        while ((item = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0,
+                                               iface->ringbuf_size)) != NULL) {
+            vRingbufferReturnItem(iface->ringbuf, item);
+        }
+    }
+}
+
+static void stream_reset_runtime_state(uac2_iface_t *iface)
+{
+    atomic_store(&iface->consecutive_errors, 0);
+    atomic_store(&iface->fb_value, 0);
+    iface->fb_accumulator = 0;
+    atomic_store(&iface->first_frame_us, 0);
+    atomic_store(&iface->tx_done_pending, false);
+}
+
+static esp_err_t resume_rollback_to_ready(uac2_iface_t *iface,
+                                          esp_err_t cause_err,
+                                          const char *stage)
+{
+    esp_err_t cleanup_err = stream_deactivate(iface);
+    if (cleanup_err == ESP_OK) {
+        stream_flush_ringbuf(iface);
+        stream_reset_runtime_state(iface);
+        bool gone = atomic_load(&iface->parent->gone);
+        portENTER_CRITICAL(&iface->state_lock);
+        uac2_iface_state_t state = iface->state;
+        portEXIT_CRITICAL(&iface->state_lock);
+        portENTER_CRITICAL(&iface->state_lock);
+        iface->state = (gone || state == UAC2_IFACE_STATE_IDLE)
+            ? UAC2_IFACE_STATE_IDLE
+            : UAC2_IFACE_STATE_READY;
+        portEXIT_CRITICAL(&iface->state_lock);
+        ESP_LOGE(TAG, "Resume failed during %s: %s", stage, esp_err_to_name(cause_err));
+        return (gone || state == UAC2_IFACE_STATE_IDLE) ? ESP_ERR_INVALID_STATE : cause_err;
+    }
+
+    portENTER_CRITICAL(&iface->state_lock);
+    iface->state = UAC2_IFACE_STATE_ERROR;
+    portEXIT_CRITICAL(&iface->state_lock);
+    ESP_LOGE(TAG, "Resume cleanup failed after %s error %s: %s",
+             stage, esp_err_to_name(cause_err), esp_err_to_name(cleanup_err));
+    return cleanup_err;
+}
+
 // ── Clock helpers ─────────────────────────────────────────────────
 
 static uint8_t resolve_clock_source(const uac2_device_info_t *info)
@@ -1185,40 +1450,118 @@ static const uac2_feature_unit_t *resolve_feature_unit_for_iface(const uac2_devi
     return NULL;
 }
 
+static const uac2_feature_unit_t *get_iface_feature_unit(const uac2_iface_t *iface)
+{
+    if (!iface || !iface->has_feature_unit) {
+        return NULL;
+    }
+
+    return find_feature_unit_by_id(&iface->parent->desc_info, iface->feature_unit_id);
+}
+
+static esp_err_t validate_feature_channel(const uac2_feature_unit_t *fu, uint8_t channel,
+                                          uint32_t channel_map, const char *control_name)
+{
+    ESP_RETURN_ON_FALSE(fu, ESP_ERR_NOT_FOUND, TAG, "Feature unit topology missing");
+    ESP_RETURN_ON_FALSE(channel <= fu->nr_channels, ESP_ERR_INVALID_ARG, TAG, "Channel out of range");
+    ESP_RETURN_ON_FALSE(channel_map & (1u << channel), ESP_ERR_NOT_SUPPORTED, TAG,
+                        "Control unsupported on channel");
+    (void)control_name;
+    return ESP_OK;
+}
+
+static esp_err_t validate_range_payload_len(const char *what, uint16_t actual_len,
+                                            uint16_t count, uint16_t max_count,
+                                            uint8_t stride)
+{
+    uint16_t parsed_count = count > max_count ? max_count : count;
+    uint32_t required = 2u + ((uint32_t)parsed_count * stride);
+    if (actual_len < required) {
+        ESP_LOGE(TAG, "%s short response: actual=%u required=%" PRIu32 " count=%u parsed=%u",
+                 what, actual_len, required, count, parsed_count);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t fetch_volume_range_triplet(uac2_iface_t *iface, uint8_t channel,
+                                            int16_t *min_db256, int16_t *max_db256,
+                                            int16_t *res_db256)
+{
+    uint8_t buf[2 + UAC2_MAX_VOLUME_RANGES * 6];
+    uint16_t actual_len = 0;
+    memset(buf, 0, sizeof(buf));
+
+    esp_err_t err = ctrl_get_range(iface->parent, iface->feature_unit_id,
+                                   UAC2_FU_VOLUME_CONTROL, channel, buf, sizeof(buf),
+                                   &actual_len);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint16_t count = buf[0] | (buf[1] << 8);
+    if (count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    err = validate_range_payload_len("Volume RANGE", actual_len, count,
+                                     UAC2_MAX_VOLUME_RANGES, 6);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    int16_t parsed_min = (int16_t)(buf[2] | (buf[3] << 8));
+    int16_t parsed_max = (int16_t)(buf[4] | (buf[5] << 8));
+    int16_t parsed_res = (int16_t)(buf[6] | (buf[7] << 8));
+
+    if (min_db256) *min_db256 = parsed_min;
+    if (max_db256) *max_db256 = parsed_max;
+    if (res_db256) *res_db256 = parsed_res;
+
+    if (channel == 0) {
+        iface->volume_min_db256 = parsed_min;
+        iface->volume_max_db256 = parsed_max;
+        iface->volume_res_db256 = parsed_res;
+        iface->volume_range_valid = true;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t get_volume_range_triplet(uac2_iface_t *iface, uint8_t channel,
+                                          int16_t *min_db256, int16_t *max_db256,
+                                          int16_t *res_db256)
+{
+    if (channel == 0 && iface->volume_range_valid) {
+        if (min_db256) *min_db256 = iface->volume_min_db256;
+        if (max_db256) *max_db256 = iface->volume_max_db256;
+        if (res_db256) *res_db256 = iface->volume_res_db256;
+        return ESP_OK;
+    }
+    return fetch_volume_range_triplet(iface, channel, min_db256, max_db256, res_db256);
+}
+
 static void iface_cache_feature_controls(uac2_iface_t *iface)
 {
-    uac2_device_t *dev = iface->parent;
-    const uac2_feature_unit_t *fu = resolve_feature_unit_for_iface(&dev->desc_info, iface->iface_num);
+    const uac2_feature_unit_t *fu = resolve_feature_unit_for_iface(&iface->parent->desc_info,
+                                                                   iface->iface_num);
     if (!fu) {
         return;
     }
 
     iface->feature_unit_id = fu->unit_id;
     iface->has_feature_unit = true;
-    iface->has_mute = fu->has_mute;
-    iface->has_volume = fu->has_volume;
+    iface->has_mute = fu->mute_ch_map != 0;
+    iface->has_volume = fu->volume_ch_map != 0;
 
-    if (!iface->has_volume) {
+    if (!iface->has_volume || (fu->volume_ch_map & 0x1u) == 0) {
         return;
     }
 
-    uint8_t buf[2 + 6];  // sized for exactly 1 range triplet (min+max+res)
-    memset(buf, 0, sizeof(buf));
-    esp_err_t vr_err = ctrl_get_range(dev, iface->feature_unit_id,
-                                      UAC2_FU_VOLUME_CONTROL, 0, buf, sizeof(buf));
-    if (vr_err != ESP_OK) {
-        return;
-    }
-
-    uint16_t count = buf[0] | (buf[1] << 8);
-    if (count == 0) {
-        return;
-    }
-
-    iface->volume_min_db256 = (int16_t)(buf[2] | (buf[3] << 8));
-    iface->volume_max_db256 = (int16_t)(buf[4] | (buf[5] << 8));
-    iface->volume_res_db256 = (int16_t)(buf[6] | (buf[7] << 8));
-    iface->volume_range_valid = true;
+    int16_t min_db256 = 0;
+    int16_t max_db256 = 0;
+    int16_t res_db256 = 0;
+    (void)fetch_volume_range_triplet(iface, 0, &min_db256, &max_db256, &res_db256);
 }
 
 static esp_err_t set_sample_rate_internal(uac2_device_t *dev, uint32_t sample_rate)
@@ -1237,19 +1580,68 @@ static esp_err_t set_sample_rate_internal(uac2_device_t *dev, uint32_t sample_ra
     return err;
 }
 
+static esp_err_t read_current_sample_rate(uac2_device_t *dev, uint32_t *sample_rate)
+{
+    ESP_RETURN_ON_FALSE(dev && sample_rate, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+
+    uint8_t data[4] = {0};
+    esp_err_t ret = ctrl_get_cur(dev, dev->clock_source_id, UAC2_CS_SAM_FREQ_CONTROL, 0, data, 4);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *sample_rate = (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+                 | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    return ESP_OK;
+}
+
+static esp_err_t ensure_sample_rate_applied(uac2_device_t *dev, uint32_t sample_rate)
+{
+    ESP_RETURN_ON_FALSE(dev, ESP_ERR_INVALID_ARG, TAG, "Invalid device");
+
+    validate_sample_rate(dev, sample_rate);
+    esp_err_t err = set_sample_rate_internal(dev, sample_rate);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    uint32_t current_rate = 0;
+    esp_err_t read_err = read_current_sample_rate(dev, &current_rate);
+    if (read_err == ESP_OK && current_rate == sample_rate) {
+        ESP_LOGW(TAG, "Sample rate SET failed but device already reports %" PRIu32 " Hz",
+                 sample_rate);
+        return ESP_OK;
+    }
+
+    if (read_err == ESP_OK) {
+        ESP_LOGE(TAG, "Requested sample rate %" PRIu32 " Hz but device reports %" PRIu32 " Hz",
+                 sample_rate, current_rate);
+        return err;
+    }
+
+    ESP_LOGE(TAG, "Failed to verify sample rate %" PRIu32 " Hz after SET failure: %s",
+             sample_rate, esp_err_to_name(read_err));
+    return read_err;
+}
+
 static void validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate)
 {
     if (dev->clock_source_id == 0) return;
 
     uint8_t buf[2 + UAC2_MAX_SAMPLE_RATE_RANGES * 12];
+    uint16_t actual_len = 0;
     memset(buf, 0, sizeof(buf));
     esp_err_t err = ctrl_get_range(dev, dev->clock_source_id,
-                                   UAC2_CS_SAM_FREQ_CONTROL, 0, buf, sizeof(buf));
+                                   UAC2_CS_SAM_FREQ_CONTROL, 0, buf, sizeof(buf), &actual_len);
     if (err != ESP_OK) return;
 
     uint16_t count = buf[0] | (buf[1] << 8);
     if (count > UAC2_MAX_SAMPLE_RATE_RANGES) count = UAC2_MAX_SAMPLE_RATE_RANGES;
     if (count == 0) return;
+
+    err = validate_range_payload_len("Sample-rate RANGE", actual_len, count,
+                                     UAC2_MAX_SAMPLE_RATE_RANGES, 12);
+    if (err != ESP_OK) return;
 
     for (int i = 0; i < count; i++) {
         const uint8_t *p = buf + 2 + (i * 12);
@@ -1362,6 +1754,11 @@ static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
     uac2_device_t *dev = get_device_by_handle(dev_hdl);
     if (!dev) return ESP_OK;  // Not a UAC2 device we track
 
+    // Cache addr before publishing gone=true. device_open() may tear down a
+    // provisional device immediately after seeing dev->gone, so avoid touching
+    // dev again after this point.
+    uint8_t dev_addr = dev->addr;
+
     // Mark device as gone — stream_stop_internal will skip SET_INTERFACE and endpoint ops
     atomic_store(&dev->gone, true);
 
@@ -1372,7 +1769,7 @@ static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
     UAC2_ENTER_CRITICAL();
     uac2_iface_t *iface;
     STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
-        if (iface->parent && iface->parent->addr == dev->addr) {
+        if (iface->parent && iface->parent->addr == dev_addr) {
             if (notify_count < UAC2_MAX_AS_INTERFACES) {
                 to_notify[notify_count++] = iface;
             }
@@ -1399,7 +1796,7 @@ static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
                 // to free resources. We cannot call it here because we're on the USB event task
                 // and device_close blocks waiting for URB drain callbacks from this same task.
                 ESP_LOGW(TAG, "Interface addr=%d iface=%d disconnected with no callback — "
-                         "call uac2_host_device_close() to free resources", dev->addr, iface->iface_num);
+                         "call uac2_host_device_close() to free resources", dev_addr, iface->iface_num);
             }
         }
     }
@@ -1431,46 +1828,54 @@ static void event_handler_task(void *arg)
 
 static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
 {
+    uac2_device_t *dev = heap_caps_calloc(1, sizeof(uac2_device_t), MALLOC_CAP_DEFAULT);
+    if (!dev) {
+        return ESP_ERR_NO_MEM;
+    }
+
     usb_device_handle_t dev_hdl;
     esp_err_t err = usb_host_device_open(s_uac2_driver->client_handle, addr, &dev_hdl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to open USB device addr %d: %s", addr, esp_err_to_name(err));
+        heap_caps_free(dev);
         return err;
     }
+
+    dev->dev_hdl = dev_hdl;
+    dev->addr = addr;
+    dev->opened_cnt = 0;
+    atomic_init(&dev->gone, false);
+
+    // Publish the device immediately so DEV_GONE cannot be missed while open
+    // is still parsing descriptors and allocating control buffers.
+    UAC2_ENTER_CRITICAL();
+    STAILQ_INSERT_TAIL(&s_uac2_driver->devices_tailq, dev, tailq_entry);
+    UAC2_EXIT_CRITICAL();
 
     const usb_config_desc_t *config_desc;
     err = usb_host_get_active_config_descriptor(dev_hdl, &config_desc);
     if (err != ESP_OK) {
-        usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
-        return err;
+        goto fail;
     }
 
     // Reject low-speed
     usb_device_info_t usb_info;
     err = usb_host_device_info(dev_hdl, &usb_info);
     if (err != ESP_OK) {
-        usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
-        return err;
+        goto fail;
     }
     if (usb_info.speed == USB_SPEED_LOW) {
         ESP_LOGE(TAG, "Low-speed devices do not support isochronous transfers");
-        usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    uac2_device_t *dev = heap_caps_calloc(1, sizeof(uac2_device_t), MALLOC_CAP_DEFAULT);
-    if (!dev) {
-        usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
-        return ESP_ERR_NO_MEM;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto fail;
     }
 
     // Parse descriptors
     bool is_uac2 = uac2_parse_config_descriptor(
         (const uint8_t *)config_desc, config_desc->wTotalLength, &dev->desc_info);
     if (!is_uac2) {
-        heap_caps_free(dev);
-        usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
-        return ESP_ERR_NOT_SUPPORTED;
+        err = ESP_ERR_NOT_SUPPORTED;
+        goto fail;
     }
 
     // Populate identification
@@ -1486,10 +1891,6 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     usb_string_to_ascii(usb_info.str_desc_serial_num, dev->desc_info.serial,
                          sizeof(dev->desc_info.serial));
 
-    dev->dev_hdl = dev_hdl;
-    dev->addr = addr;
-    dev->opened_cnt = 0;
-    atomic_init(&dev->gone, false);
     dev->ac_iface_num = dev->desc_info.ac_iface_num;
     dev->clock_source_id = resolve_clock_source(&dev->desc_info);
 
@@ -1507,11 +1908,6 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     atomic_init(&dev->ctrl_xfer_gen, 0);
     atomic_init(&dev->ctrl_xfer_submitted_gen, 0);
 
-    // Add to driver list
-    UAC2_ENTER_CRITICAL();
-    STAILQ_INSERT_TAIL(&s_uac2_driver->devices_tailq, dev, tailq_entry);
-    UAC2_EXIT_CRITICAL();
-
     ESP_LOGI(TAG, "UAC2 device opened: addr=%d VID=0x%04X PID=0x%04X \"%s\"",
              addr, dev->desc_info.vid, dev->desc_info.pid,
              dev->desc_info.product[0] ? dev->desc_info.product : "Unknown");
@@ -1520,11 +1916,7 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     return ESP_OK;
 
 fail:
-    if (dev->ctrl_mutex) vSemaphoreDelete(dev->ctrl_mutex);
-    if (dev->ctrl_xfer_done) vSemaphoreDelete(dev->ctrl_xfer_done);
-    if (dev->ctrl_xfer) usb_host_transfer_free(dev->ctrl_xfer);
-    heap_caps_free(dev);
-    usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
+    device_destroy(dev);
     return err;
 }
 
@@ -1577,6 +1969,13 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
         return ESP_ERR_NO_MEM;
     }
 
+    driver->lifecycle_mutex = xSemaphoreCreateMutex();
+    if (!driver->lifecycle_mutex) {
+        vSemaphoreDelete(driver->all_events_handled);
+        heap_caps_free(driver);
+        return ESP_ERR_NO_MEM;
+    }
+
     usb_host_client_config_t client_config = {
         .is_synchronous = false,
         .async.client_event_callback = client_event_cb,
@@ -1585,6 +1984,7 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
     };
     esp_err_t err = usb_host_client_register(&client_config, &driver->client_handle);
     if (err != ESP_OK) {
+        vSemaphoreDelete(driver->lifecycle_mutex);
         vSemaphoreDelete(driver->all_events_handled);
         heap_caps_free(driver);
         return err;
@@ -1605,6 +2005,7 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
             s_uac2_driver = NULL;
             UAC2_EXIT_CRITICAL();
             usb_host_client_deregister(driver->client_handle);
+            vSemaphoreDelete(driver->lifecycle_mutex);
             vSemaphoreDelete(driver->all_events_handled);
             heap_caps_free(driver);
             return ESP_ERR_NO_MEM;
@@ -1619,35 +2020,55 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
 esp_err_t uac2_host_uninstall(void)
 {
     ESP_RETURN_ON_FALSE(s_uac2_driver, ESP_OK, TAG, "UAC2 driver not installed");
-
     UAC2_ENTER_CRITICAL();
-    if (s_uac2_driver->end_client_event_handling) {
-        UAC2_EXIT_CRITICAL();
+    uac2_driver_t *driver = s_uac2_driver;
+    bool uninstalling = driver && driver->end_client_event_handling;
+    UAC2_EXIT_CRITICAL();
+    if (!driver || uninstalling) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (!STAILQ_EMPTY(&s_uac2_driver->devices_tailq) ||
-        !STAILQ_EMPTY(&s_uac2_driver->ifaces_tailq)) {
+
+    if (!driver->lifecycle_mutex ||
+        xSemaphoreTake(driver->lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    UAC2_ENTER_CRITICAL();
+    if (driver != s_uac2_driver) {
         UAC2_EXIT_CRITICAL();
+        xSemaphoreGive(driver->lifecycle_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!STAILQ_EMPTY(&driver->devices_tailq) ||
+        !STAILQ_EMPTY(&driver->ifaces_tailq)) {
+        UAC2_EXIT_CRITICAL();
+        xSemaphoreGive(driver->lifecycle_mutex);
         ESP_LOGE(TAG, "Cannot uninstall: devices/interfaces still open");
         return ESP_ERR_INVALID_STATE;
     }
-    s_uac2_driver->end_client_event_handling = true;
+    driver->end_client_event_handling = true;
     UAC2_EXIT_CRITICAL();
+    xSemaphoreGive(driver->lifecycle_mutex);
 
-    if (s_uac2_driver->event_handling_started) {
-        esp_err_t unblock_err = usb_host_client_unblock(s_uac2_driver->client_handle);
+    if (driver->event_handling_started) {
+        esp_err_t unblock_err = usb_host_client_unblock(driver->client_handle);
         if (unblock_err != ESP_OK) {
             ESP_LOGE(TAG, "client_unblock failed: %s", esp_err_to_name(unblock_err));
         }
-        xSemaphoreTake(s_uac2_driver->all_events_handled, portMAX_DELAY);
+        xSemaphoreTake(driver->all_events_handled, portMAX_DELAY);
     }
-    vSemaphoreDelete(s_uac2_driver->all_events_handled);
-    esp_err_t dereg_err = usb_host_client_deregister(s_uac2_driver->client_handle);
+    vSemaphoreDelete(driver->all_events_handled);
+    esp_err_t dereg_err = usb_host_client_deregister(driver->client_handle);
     if (dereg_err != ESP_OK) {
         ESP_LOGE(TAG, "client_deregister failed: %s", esp_err_to_name(dereg_err));
     }
-    heap_caps_free(s_uac2_driver);
-    s_uac2_driver = NULL;
+    vSemaphoreDelete(driver->lifecycle_mutex);
+    UAC2_ENTER_CRITICAL();
+    if (s_uac2_driver == driver) {
+        s_uac2_driver = NULL;
+    }
+    UAC2_EXIT_CRITICAL();
+    heap_caps_free(driver);
     ESP_LOGI(TAG, "UAC2 Host driver uninstalled");
     return ESP_OK;
 }
@@ -1676,19 +2097,40 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
     ESP_RETURN_ON_FALSE(s_uac2_driver, ESP_ERR_INVALID_STATE, TAG, "UAC2 driver not installed");
     *out_handle = NULL;
 
+    esp_err_t err = driver_lifecycle_lock();
+    if (err != ESP_OK) return err;
+    if (s_uac2_driver->end_client_event_handling) {
+        driver_lifecycle_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
     // Reject if already open — caller must close first
     uac2_iface_t *existing = get_iface_by_addr(config->addr, config->iface_num);
     if (existing) {
         ESP_LOGE(TAG, "Interface addr=%d iface=%d already open", config->addr, config->iface_num);
+        driver_lifecycle_unlock();
         return ESP_ERR_INVALID_STATE;
     }
 
     // Get or create physical device
-    esp_err_t err;
     uac2_device_t *dev = get_device_by_addr(config->addr);
+    if (dev && atomic_load(&dev->gone) && dev->opened_cnt == 0) {
+        device_destroy(dev);
+        dev = NULL;
+    }
     if (!dev) {
         err = device_create(config->addr, &dev);
-        if (err != ESP_OK) return err;
+        if (err != ESP_OK) {
+            driver_lifecycle_unlock();
+            return err;
+        }
+    }
+    if (atomic_load(&dev->gone)) {
+        if (dev->opened_cnt == 0) {
+            device_destroy(dev);
+        }
+        driver_lifecycle_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     // Determine direction from descriptor info
@@ -1707,6 +2149,7 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
         bool orphan = (dev->opened_cnt == 0);
         UAC2_EXIT_CRITICAL();
         if (orphan) device_destroy(dev);
+        driver_lifecycle_unlock();
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -1717,6 +2160,7 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
         bool orphan = (dev->opened_cnt == 0);
         UAC2_EXIT_CRITICAL();
         if (orphan) device_destroy(dev);
+        driver_lifecycle_unlock();
         return ESP_ERR_NO_MEM;
     }
 
@@ -1732,6 +2176,7 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
     atomic_init(&iface->disconnect_fired, false);
     atomic_init(&iface->closing, false);
     atomic_init(&iface->io_users, 0);
+    iface->interface_claimed = false;
 
     iface->api_mutex = xSemaphoreCreateMutex();
     if (!iface->api_mutex) {
@@ -1740,16 +2185,40 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
         bool orphan = (dev->opened_cnt == 0);
         UAC2_EXIT_CRITICAL();
         if (orphan) device_destroy(dev);
+        driver_lifecycle_unlock();
         return ESP_ERR_NO_MEM;
+    }
+
+    if (atomic_load(&dev->gone)) {
+        vSemaphoreDelete(iface->api_mutex);
+        heap_caps_free(iface);
+        if (dev->opened_cnt == 0) {
+            device_destroy(dev);
+        }
+        driver_lifecycle_unlock();
+        return ESP_ERR_INVALID_STATE;
     }
 
     iface_cache_feature_controls(iface);
 
     // Add to list and increment refcount
+    bool dev_gone = false;
     UAC2_ENTER_CRITICAL();
-    STAILQ_INSERT_TAIL(&s_uac2_driver->ifaces_tailq, iface, tailq_entry);
-    dev->opened_cnt++;
+    dev_gone = atomic_load(&dev->gone);
+    if (!dev_gone) {
+        STAILQ_INSERT_TAIL(&s_uac2_driver->ifaces_tailq, iface, tailq_entry);
+        dev->opened_cnt++;
+    }
     UAC2_EXIT_CRITICAL();
+    if (dev_gone) {
+        vSemaphoreDelete(iface->api_mutex);
+        heap_caps_free(iface);
+        if (dev->opened_cnt == 0) {
+            device_destroy(dev);
+        }
+        driver_lifecycle_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
 
     ESP_LOGI(TAG, "Opened %s interface: addr=%d iface=%d (device refs=%d)",
              dir == UAC2_STREAM_TX ? "TX" : "RX",
@@ -1767,14 +2236,27 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
     }
 
     *out_handle = iface;
+    driver_lifecycle_unlock();
     return ESP_OK;
 }
 
 esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+
+    esp_err_t err = driver_lifecycle_lock();
+    if (err != ESP_OK) return err;
+    if (s_uac2_driver->end_client_event_handling) {
+        driver_lifecycle_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Handle not in list (already closed?)");
+    if (!iface) {
+        driver_lifecycle_unlock();
+        ESP_LOGE(TAG, "Handle not in list (already closed?)");
+        return ESP_ERR_INVALID_ARG;
+    }
 
     atomic_store(&iface->closing, true);
 
@@ -1783,12 +2265,14 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
     if (lock_err != ESP_OK) {
         atomic_store(&iface->closing, false);
         ESP_LOGE(TAG, "device_close: api_mutex timeout");
+        driver_lifecycle_unlock();
         return lock_err;
     }
 
     // Re-validate after acquiring lock — a concurrent close may have freed this
     if (!is_interface_in_list(iface)) {
         api_unlock(iface);
+        driver_lifecycle_unlock();
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -1801,12 +2285,16 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
     api_unlock(iface);
     if (stop_err != ESP_OK) {
         ESP_LOGE(TAG, "device_close: stream teardown incomplete: %s", esp_err_to_name(stop_err));
+        atomic_store(&iface->closing, false);
+        driver_lifecycle_unlock();
         return stop_err;
     }
 
     esp_err_t io_err = wait_for_iface_io_quiesced(iface, pdMS_TO_TICKS(2000));
     if (io_err != ESP_OK) {
         ESP_LOGE(TAG, "device_close: timed out waiting for pending I/O");
+        atomic_store(&iface->closing, false);
+        driver_lifecycle_unlock();
         return io_err;
     }
 
@@ -1829,6 +2317,7 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
         device_destroy(dev);
     }
 
+    driver_lifecycle_unlock();
     return ESP_OK;
 }
 
@@ -1836,9 +2325,11 @@ esp_err_t uac2_host_device_get_info(uac2_host_device_handle_t handle,
                                     uac2_device_info_t *info)
 {
     ESP_RETURN_ON_FALSE(handle && info, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_iface_runtime_ref(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
     *info = iface->parent->desc_info;
+    release_iface_io_ref(iface);
     return ESP_OK;
 }
 
@@ -1847,9 +2338,10 @@ esp_err_t uac2_host_get_device_alt_param(uac2_host_device_handle_t handle,
                                          uac2_host_dev_alt_param_t *param)
 {
     ESP_RETURN_ON_FALSE(handle && param, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     ESP_RETURN_ON_FALSE(alt > 0, ESP_ERR_INVALID_ARG, TAG, "Alt setting must be >= 1");
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_iface_runtime_ref(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
 
     uac2_device_t *dev = iface->parent;
     for (int i = 0; i < dev->desc_info.num_as_ifaces; i++) {
@@ -1862,9 +2354,11 @@ esp_err_t uac2_host_get_device_alt_param(uac2_host_device_handle_t handle,
             param->ep_max_packet_size = as->ep_max_packet_size;
             param->ep_addr = as->ep_addr;
             param->fb_ep_addr = as->fb_ep_addr;
+            release_iface_io_ref(iface);
             return ESP_OK;
         }
     }
+    release_iface_io_ref(iface);
     return ESP_ERR_NOT_FOUND;
 }
 
@@ -1874,21 +2368,20 @@ esp_err_t uac2_host_device_get_sample_rate(uac2_host_device_handle_t handle,
                                            uint32_t *sample_rate)
 {
     ESP_RETURN_ON_FALSE(handle && sample_rate, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->clock_source_id != 0, ESP_ERR_NOT_SUPPORTED, TAG, "No clock source");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (dev->clock_source_id == 0) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
-    uint8_t data[4] = {0};
-    ret = ctrl_get_cur(dev, dev->clock_source_id, UAC2_CS_SAM_FREQ_CONTROL, 0, data, 4);
+    ret = read_current_sample_rate(dev, sample_rate);
     if (ret == ESP_OK) {
-        *sample_rate = (uint32_t)data[0] | ((uint32_t)data[1] << 8)
-                     | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
         ESP_LOGI(TAG, "Current sample rate: %" PRIu32 " Hz", *sample_rate);
     }
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -1896,14 +2389,16 @@ esp_err_t uac2_host_device_set_sample_rate(uac2_host_device_handle_t handle,
                                            uint32_t sample_rate)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->clock_source_id != 0, ESP_ERR_NOT_SUPPORTED, TAG, "No clock source");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (dev->clock_source_id == 0) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     ret = set_sample_rate_internal(dev, sample_rate);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -1912,19 +2407,32 @@ esp_err_t uac2_host_device_get_sample_rate_range(uac2_host_device_handle_t handl
                                                  uint8_t *num_ranges)
 {
     ESP_RETURN_ON_FALSE(handle && ranges && num_ranges, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->clock_source_id != 0, ESP_ERR_NOT_SUPPORTED, TAG, "No clock source");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (dev->clock_source_id == 0) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     uint8_t buf[2 + UAC2_MAX_SAMPLE_RATE_RANGES * 12];
+    uint16_t actual_len = 0;
     memset(buf, 0, sizeof(buf));
-    ret = ctrl_get_range(dev, dev->clock_source_id, UAC2_CS_SAM_FREQ_CONTROL, 0, buf, sizeof(buf));
-    if (ret != ESP_OK) { api_unlock(iface); return ret; }
+    ret = ctrl_get_range(dev, dev->clock_source_id, UAC2_CS_SAM_FREQ_CONTROL, 0,
+                         buf, sizeof(buf), &actual_len);
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
 
     uint16_t count = buf[0] | (buf[1] << 8);
+    ret = validate_range_payload_len("Sample-rate RANGE", actual_len, count,
+                                     UAC2_MAX_SAMPLE_RATE_RANGES, 12);
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
     if (count > UAC2_MAX_SAMPLE_RATE_RANGES) count = UAC2_MAX_SAMPLE_RATE_RANGES;
 
     for (int i = 0; i < count; i++) {
@@ -1937,26 +2445,28 @@ esp_err_t uac2_host_device_get_sample_rate_range(uac2_host_device_handle_t handl
                       | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
     }
     *num_ranges = (uint8_t)count;
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ESP_OK;
 }
 
 esp_err_t uac2_host_device_get_clock_valid(uac2_host_device_handle_t handle, bool *valid)
 {
     ESP_RETURN_ON_FALSE(handle && valid, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->clock_source_id != 0, ESP_ERR_NOT_SUPPORTED, TAG, "No clock source");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (dev->clock_source_id == 0) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
     uint8_t data = 0;
     ret = ctrl_get_cur(dev, dev->clock_source_id, UAC2_CS_CLOCK_VALID_CONTROL, 0, &data, 1);
     if (ret == ESP_OK) {
         *valid = (data & 0x01) != 0;
     }
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -1966,14 +2476,13 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
                                  const uac2_host_stream_config_t *config)
 {
     ESP_RETURN_ON_FALSE(handle && config, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
 
     if (iface->state != UAC2_IFACE_STATE_IDLE) {
         ESP_LOGE(TAG, "Stream already active");
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1986,8 +2495,21 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
         ESP_LOGE(TAG, "No matching AS interface for %s %dch/%dbit",
                  iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
                  config->channels, config->bit_resolution);
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_ERR_NOT_FOUND;
+    }
+
+    if (fractional_playback_requires_feedback(iface->dir, as->fb_ep_addr, config->sample_freq)) {
+        ESP_LOGE(TAG, "Playback %.2f kHz requires a feedback endpoint on this alt setting",
+                 config->sample_freq / 1000.0);
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (device_has_opposite_direction_stream(iface)) {
+        ESP_LOGE(TAG, "ESP32-S3 does not support simultaneous TX and RX audio streams");
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     if (as->ep_interval != 1) {
@@ -2003,7 +2525,10 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
 
     // Allocate stream resources
     esp_err_t err = stream_resources_alloc(iface, as, config);
-    if (err != ESP_OK) { api_unlock(iface); return err; }
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err;
+    }
 
     // Claim interface
     err = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
@@ -2012,61 +2537,103 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
         ESP_LOGE(TAG, "Failed to claim iface %d alt %d: %s",
                  iface->iface_num, iface->alt_setting, esp_err_to_name(err));
         stream_resources_free(iface);
-        api_unlock(iface);
+        release_locked_iface(iface);
         return err;
     }
+    iface->interface_claimed = true;
 
     // SET_INTERFACE to activate endpoints on device
     err = ctrl_request_no_data(dev,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
         USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "SET_INTERFACE(%d, %d) failed: %s (continuing)",
-                 iface->iface_num, iface->alt_setting, esp_err_to_name(err));
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after SET_INTERFACE error %s: %s",
+                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        release_locked_iface(iface);
+        return err;
     }
 
     iface->state = UAC2_IFACE_STATE_READY;
+    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                        "device_start after SET_INTERFACE");
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after disconnect during SET_INTERFACE: %s",
+                     esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        release_locked_iface(iface);
+        return err;
+    }
 
     // Validate and set sample rate
     if (dev->clock_source_id != 0 && config->sample_freq > 0) {
-        validate_sample_rate(dev, config->sample_freq);
-        err = set_sample_rate_internal(dev, config->sample_freq);
+        err = ensure_sample_rate_applied(dev, config->sample_freq);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to set sample rate (continuing anyway)");
+            esp_err_t cleanup_err = stream_abort_startup(iface);
+            if (cleanup_err != ESP_OK) {
+                ESP_LOGE(TAG, "Startup abort failed after sample-rate error %s: %s",
+                         esp_err_to_name(err), esp_err_to_name(cleanup_err));
+                err = cleanup_err;
+            }
+            release_locked_iface(iface);
+            return err;
+        }
+        err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                            "device_start after sample-rate setup");
+        if (err != ESP_OK) {
+            esp_err_t cleanup_err = stream_abort_startup(iface);
+            if (cleanup_err != ESP_OK) {
+                ESP_LOGE(TAG, "Startup abort failed after disconnect during sample-rate setup: %s",
+                         esp_err_to_name(cleanup_err));
+                err = cleanup_err;
+            }
+            release_locked_iface(iface);
+            return err;
         }
     }
 
     // Check for suspend-after-start flag
     if (config->flags & UAC2_FLAG_STREAM_SUSPEND_AFTER_START) {
         ESP_LOGI(TAG, "%s stream started (suspended)", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_OK;
     }
 
     // Submit URBs
     err = stream_submit_urbs(iface);
     if (err != ESP_OK) {
-        portENTER_CRITICAL(&iface->state_lock);
-        iface->state = UAC2_IFACE_STATE_IDLE;
-        portEXIT_CRITICAL(&iface->state_lock);
-        ctrl_request_no_data(dev,
-            USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-            USB_B_REQUEST_SET_INTERFACE, 0, iface->iface_num);
-        usb_host_interface_release(s_uac2_driver->client_handle, dev->dev_hdl, iface->iface_num);
-        int wait_ms = 0;
-        while (atomic_load(&iface->urbs_in_flight) > 0 && wait_ms < 500) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            wait_ms += 5;
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after submit error %s: %s",
+                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
+            err = cleanup_err;
         }
-        stream_resources_free(iface);
-        api_unlock(iface);
+        release_locked_iface(iface);
+        return err;
+    }
+    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
+                                        "device_start after URB submit");
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after disconnect during URB submit: %s",
+                     esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        release_locked_iface(iface);
         return err;
     }
 
     ESP_LOGI(TAG, "%s stream started (pkt_size=%d, ringbuf=%" PRIu32 ")",
              iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
              iface->packet_size, iface->ringbuf_size);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ESP_OK;
 }
 
@@ -2112,26 +2679,17 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
     // The physical device may be gone, but the host library still needs the
     // client-side interface claim released so the bus can reach ALL_FREE and
     // subsequent reconnects can enumerate cleanly.
-    esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
-    if (rel_err != ESP_OK) {
-        return rel_err;
+    if (iface->interface_claimed) {
+        esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
+        if (rel_err != ESP_OK) {
+            return rel_err;
+        }
+        iface->interface_claimed = false;
     }
 
-    // Wait for in-flight URBs
-    int wait_ms = 0;
-    while (atomic_load(&iface->urbs_in_flight) > 0 && wait_ms < 2000) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        wait_ms += 5;
-    }
-    if (atomic_load(&iface->urbs_in_flight) > 0) {
-        ESP_LOGE(TAG, "Stream stop: %d URBs still in-flight after 2s — retaining resources",
-                 atomic_load(&iface->urbs_in_flight));
-        // Do not free or clear stream resources while callbacks may still be
-        // touching them. Leave the interface in ERROR and let the caller retry close.
-        portENTER_CRITICAL(&iface->state_lock);
-        iface->state = UAC2_IFACE_STATE_ERROR;
-        portEXIT_CRITICAL(&iface->state_lock);
-        return ESP_ERR_TIMEOUT;
+    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Stream stop", true);
+    if (wait_err != ESP_OK) {
+        return wait_err;
     }
 
     stream_resources_free(iface);
@@ -2142,12 +2700,11 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
 esp_err_t uac2_host_device_stop(uac2_host_device_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     ret = stream_stop_internal(iface);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -2251,16 +2808,27 @@ esp_err_t uac2_host_device_set_mute(uac2_host_device_handle_t handle,
                                     uint8_t channel, bool mute)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (!iface->has_feature_unit) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_mute) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    ret = validate_feature_channel(fu, channel, fu ? fu->mute_ch_map : 0, "Mute");
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
     uint8_t data = mute ? 1 : 0;
     ret = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -2268,17 +2836,28 @@ esp_err_t uac2_host_device_get_mute(uac2_host_device_handle_t handle,
                                     uint8_t channel, bool *mute)
 {
     ESP_RETURN_ON_FALSE(handle && mute, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (!iface->has_feature_unit) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_mute) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    ret = validate_feature_channel(fu, channel, fu ? fu->mute_ch_map : 0, "Mute");
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
     uint8_t data = 0;
     ret = ctrl_get_cur(dev, iface->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
     if (ret == ESP_OK) *mute = (data != 0);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -2286,26 +2865,41 @@ esp_err_t uac2_host_device_set_volume(uac2_host_device_handle_t handle,
                                       uint8_t channel, int16_t volume_db256)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
-    // Range check under lock to avoid TOCTOU with reconnect
-    if (iface->volume_range_valid) {
-        if (volume_db256 < iface->volume_min_db256 || volume_db256 > iface->volume_max_db256) {
+    if (!iface->has_feature_unit) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_volume) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    ret = validate_feature_channel(fu, channel, fu ? fu->volume_ch_map : 0, "Volume");
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
+    int16_t min_db256 = 0;
+    int16_t max_db256 = 0;
+    ret = get_volume_range_triplet(iface, channel, &min_db256, &max_db256, NULL);
+    if (ret == ESP_OK) {
+        if (volume_db256 < min_db256 || volume_db256 > max_db256) {
             ESP_LOGE(TAG, "Volume %.2f dB out of range [%.2f, %.2f]",
-                     volume_db256 / 256.0, iface->volume_min_db256 / 256.0,
-                     iface->volume_max_db256 / 256.0);
-            api_unlock(iface);
+                     volume_db256 / 256.0, min_db256 / 256.0, max_db256 / 256.0);
+            release_locked_iface(iface);
             return ESP_ERR_INVALID_ARG;
         }
+    } else if (ret != ESP_ERR_NOT_FOUND) {
+        release_locked_iface(iface);
+        return ret;
     }
     uint8_t data[2] = { (uint8_t)(volume_db256 & 0xFF), (uint8_t)((volume_db256 >> 8) & 0xFF) };
     ret = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -2313,17 +2907,28 @@ esp_err_t uac2_host_device_get_volume(uac2_host_device_handle_t handle,
                                       uint8_t channel, int16_t *volume_db256)
 {
     ESP_RETURN_ON_FALSE(handle && volume_db256, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (!iface->has_feature_unit) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_volume) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    ret = validate_feature_channel(fu, channel, fu ? fu->volume_ch_map : 0, "Volume");
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
     uint8_t data[2] = {0};
     ret = ctrl_get_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
     if (ret == ESP_OK) *volume_db256 = (int16_t)(data[0] | (data[1] << 8));
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
 
@@ -2333,20 +2938,42 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t handle,
                                             uint8_t *num_ranges)
 {
     ESP_RETURN_ON_FALSE(handle && ranges && num_ranges, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    if (!iface->has_feature_unit) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_volume) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    ret = validate_feature_channel(fu, channel, fu ? fu->volume_ch_map : 0, "Volume");
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
 
     uint8_t buf[2 + UAC2_MAX_VOLUME_RANGES * 6];
+    uint16_t actual_len = 0;
     memset(buf, 0, sizeof(buf));
-    ret = ctrl_get_range(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, buf, sizeof(buf));
-    if (ret != ESP_OK) { api_unlock(iface); return ret; }
+    ret = ctrl_get_range(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel,
+                         buf, sizeof(buf), &actual_len);
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
 
     uint16_t count = buf[0] | (buf[1] << 8);
+    ret = validate_range_payload_len("Volume RANGE", actual_len, count,
+                                     UAC2_MAX_VOLUME_RANGES, 6);
+    if (ret != ESP_OK) {
+        release_locked_iface(iface);
+        return ret;
+    }
     if (count > UAC2_MAX_VOLUME_RANGES) count = UAC2_MAX_VOLUME_RANGES;
     for (int i = 0; i < count; i++) {
         const uint8_t *p = buf + 2 + (i * 6);
@@ -2355,7 +2982,13 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t handle,
         ranges[i].res = (int16_t)(p[4] | (p[5] << 8));
     }
     *num_ranges = (uint8_t)count;
-    api_unlock(iface);
+    if (channel == 0 && count > 0) {
+        iface->volume_min_db256 = ranges[0].min;
+        iface->volume_max_db256 = ranges[0].max;
+        iface->volume_res_db256 = ranges[0].res;
+        iface->volume_range_valid = true;
+    }
+    release_locked_iface(iface);
     return ESP_OK;
 }
 
@@ -2364,32 +2997,76 @@ esp_err_t uac2_host_device_set_volume_percent(uac2_host_device_handle_t handle,
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     ESP_RETURN_ON_FALSE(percent <= 100, ESP_ERR_INVALID_ARG, TAG, "Percent must be 0-100");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    ESP_RETURN_ON_FALSE(iface->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
-    int16_t db256 = iface->volume_min_db256 +
-        (int16_t)(((int32_t)(iface->volume_max_db256 - iface->volume_min_db256) * percent) / 100);
-    return uac2_host_device_set_volume(handle, channel, db256);
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
+    if (!iface->has_feature_unit || !iface->has_volume) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    err = validate_feature_channel(fu, channel, fu ? fu->volume_ch_map : 0, "Volume");
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err;
+    }
+    int16_t min_db256 = 0;
+    int16_t max_db256 = 0;
+    err = get_volume_range_triplet(iface, channel, &min_db256, &max_db256, NULL);
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err == ESP_ERR_NOT_FOUND ? ESP_ERR_NOT_SUPPORTED : err;
+    }
+    int16_t db256 = min_db256 +
+        (int16_t)(((int32_t)(max_db256 - min_db256) * percent) / 100);
+    uac2_device_t *dev = iface->parent;
+    uint8_t data[2] = { (uint8_t)(db256 & 0xFF), (uint8_t)((db256 >> 8) & 0xFF) };
+    err = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
+    release_locked_iface(iface);
+    return err;
 }
 
 esp_err_t uac2_host_device_get_volume_percent(uac2_host_device_handle_t handle,
                                               uint8_t channel, uint8_t *percent)
 {
     ESP_RETURN_ON_FALSE(handle && percent, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    ESP_RETURN_ON_FALSE(iface->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
-    int16_t db256;
-    esp_err_t err = uac2_host_device_get_volume(handle, channel, &db256);
-    if (err != ESP_OK) return err;
-    int32_t range = iface->volume_max_db256 - iface->volume_min_db256;
-    if (range <= 0) { *percent = 0; }
-    else {
-        int32_t pct = ((int32_t)(db256 - iface->volume_min_db256) * 100) / range;
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
+    if (!iface->has_feature_unit || !iface->has_volume) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    err = validate_feature_channel(fu, channel, fu ? fu->volume_ch_map : 0, "Volume");
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err;
+    }
+    int16_t min_db256 = 0;
+    int16_t max_db256 = 0;
+    err = get_volume_range_triplet(iface, channel, &min_db256, &max_db256, NULL);
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err == ESP_ERR_NOT_FOUND ? ESP_ERR_NOT_SUPPORTED : err;
+    }
+    uint8_t data[2] = {0};
+    err = ctrl_get_cur(iface->parent, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
+    if (err != ESP_OK) {
+        release_locked_iface(iface);
+        return err;
+    }
+    int16_t db256 = (int16_t)(data[0] | (data[1] << 8));
+    int32_t range = max_db256 - min_db256;
+    if (range <= 0) {
+        *percent = 0;
+    } else {
+        int32_t pct = ((int32_t)(db256 - min_db256) * 100) / range;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
         *percent = (uint8_t)pct;
     }
+    release_locked_iface(iface);
     return ESP_OK;
 }
 
@@ -2397,19 +3074,30 @@ esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t han
                                                    int16_t volume_db256)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_iface_runtime_ref(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
+    if (!iface->has_feature_unit) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (!iface->has_volume) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
 
-    const uac2_feature_unit_t *fu = find_feature_unit_by_id(&dev->desc_info, iface->feature_unit_id);
-    ESP_RETURN_ON_FALSE(fu, ESP_ERR_NOT_FOUND, TAG, "Feature unit topology missing");
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    if (!fu) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_NOT_FOUND;
+    }
     uint32_t ch_map = fu->volume_ch_map;
+    uint8_t nr_channels = fu->nr_channels;
+    release_iface_io_ref(iface);
 
-    for (uint8_t ch = 0; ch <= fu->nr_channels && ch < 32; ch++) {
+    for (uint8_t ch = 0; ch <= nr_channels && ch < 32; ch++) {
         if (ch_map & (1u << ch)) {
-            esp_err_t err = uac2_host_device_set_volume(handle, ch, volume_db256);
+            err = uac2_host_device_set_volume(handle, ch, volume_db256);
             if (err != ESP_OK) return err;
         }
     }
@@ -2433,8 +3121,12 @@ static const char *iface_state_str(uac2_iface_state_t state)
 void uac2_host_device_print_info(uac2_host_device_handle_t handle)
 {
     if (!handle) { ESP_LOGE(TAG, "print_info: NULL handle"); return; }
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    if (!iface) { ESP_LOGE(TAG, "print_info: invalid handle"); return; }
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_iface_runtime_ref(handle, &iface);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "print_info: invalid handle");
+        return;
+    }
     uac2_device_t *dev = iface->parent;
 
     bool locked = (xSemaphoreTake(iface->api_mutex, pdMS_TO_TICKS(500)) == pdTRUE);
@@ -2462,6 +3154,7 @@ void uac2_host_device_print_info(uac2_host_device_handle_t handle)
     }
 
     if (locked) xSemaphoreGive(iface->api_mutex);
+    release_iface_io_ref(iface);
 }
 
 // ── Public API: Suspend / Resume ──────────────────────────────────
@@ -2470,46 +3163,51 @@ static esp_err_t stream_deactivate(uac2_iface_t *iface)
 {
     uac2_device_t *dev = iface->parent;
 
-    esp_err_t si_err = ctrl_request_no_data(dev,
-        USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-        USB_B_REQUEST_SET_INTERFACE, 0, iface->iface_num);
-    if (si_err != ESP_OK) {
-        ESP_LOGW(TAG, "SET_INTERFACE(%d, 0) failed: %s", iface->iface_num, esp_err_to_name(si_err));
+    portENTER_CRITICAL(&iface->state_lock);
+    if (iface->state == UAC2_IFACE_STATE_ACTIVE) {
+        iface->state = UAC2_IFACE_STATE_SUSPENDING;
     }
+    portEXIT_CRITICAL(&iface->state_lock);
 
-    esp_err_t halt_err = usb_host_endpoint_halt(dev->dev_hdl, iface->ep_addr);
-    if (halt_err == ESP_OK) {
-        usb_host_endpoint_flush(dev->dev_hdl, iface->ep_addr);
-        usb_host_endpoint_clear(dev->dev_hdl, iface->ep_addr);
-    }
-    if (iface->fb_ep_addr) {
-        halt_err = usb_host_endpoint_halt(dev->dev_hdl, iface->fb_ep_addr);
+    if (!atomic_load(&dev->gone)) {
+        esp_err_t si_err = ctrl_request_no_data(dev,
+            USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
+            USB_B_REQUEST_SET_INTERFACE, 0, iface->iface_num);
+        if (si_err != ESP_OK) {
+            ESP_LOGW(TAG, "SET_INTERFACE(%d, 0) failed: %s", iface->iface_num, esp_err_to_name(si_err));
+        }
+
+        esp_err_t halt_err = usb_host_endpoint_halt(dev->dev_hdl, iface->ep_addr);
         if (halt_err == ESP_OK) {
-            usb_host_endpoint_flush(dev->dev_hdl, iface->fb_ep_addr);
-            usb_host_endpoint_clear(dev->dev_hdl, iface->fb_ep_addr);
+            usb_host_endpoint_flush(dev->dev_hdl, iface->ep_addr);
+            usb_host_endpoint_clear(dev->dev_hdl, iface->ep_addr);
+        }
+        if (iface->fb_ep_addr) {
+            halt_err = usb_host_endpoint_halt(dev->dev_hdl, iface->fb_ep_addr);
+            if (halt_err == ESP_OK) {
+                usb_host_endpoint_flush(dev->dev_hdl, iface->fb_ep_addr);
+                usb_host_endpoint_clear(dev->dev_hdl, iface->fb_ep_addr);
+            }
         }
     }
 
-    int wait_ms = 0;
-    while (atomic_load(&iface->urbs_in_flight) > 0 && wait_ms < 2000) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        wait_ms += 5;
+    if (iface->interface_claimed) {
+        esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
+        if (rel_err != ESP_OK) {
+            return rel_err;
+        }
+        iface->interface_claimed = false;
     }
-    if (atomic_load(&iface->urbs_in_flight) > 0) {
-        ESP_LOGE(TAG, "Deactivate: %d URBs still in-flight after 2s — retaining resources",
-                 atomic_load(&iface->urbs_in_flight));
-        return ESP_ERR_TIMEOUT;
-    }
-    return ESP_OK;
+
+    return wait_for_urbs_quiesced(iface, 2000, "Deactivate", false);
 }
 
 esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
 
     portENTER_CRITICAL(&iface->state_lock);
     uac2_iface_state_t state = iface->state;
@@ -2519,11 +3217,11 @@ esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
     portEXIT_CRITICAL(&iface->state_lock);
 
     if (state == UAC2_IFACE_STATE_READY) {
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_OK;
     }
     if (state != UAC2_IFACE_STATE_ACTIVE) {
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2532,80 +3230,113 @@ esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
         portENTER_CRITICAL(&iface->state_lock);
         iface->state = UAC2_IFACE_STATE_ERROR;
         portEXIT_CRITICAL(&iface->state_lock);
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ret;
     }
 
-    // Flush ringbuffer
-    if (iface->ringbuf) {
-        size_t item_size;
-        void *item;
-        while ((item = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0,
-                                               iface->ringbuf_size)) != NULL) {
-            vRingbufferReturnItem(iface->ringbuf, item);
-        }
-    }
-
-    atomic_store(&iface->consecutive_errors, 0);
-    atomic_store(&iface->fb_value, 0);
-    iface->fb_accumulator = 0;
-    atomic_store(&iface->first_frame_us, 0);
-    atomic_store(&iface->tx_done_pending, false);
+    stream_flush_ringbuf(iface);
+    stream_reset_runtime_state(iface);
 
     portENTER_CRITICAL(&iface->state_lock);
     iface->state = UAC2_IFACE_STATE_READY;
     portEXIT_CRITICAL(&iface->state_lock);
 
     ESP_LOGI(TAG, "%s stream suspended", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ESP_OK;
 }
 
 esp_err_t uac2_host_device_resume(uac2_host_device_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_iface_t *iface = get_iface_by_handle(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    esp_err_t ret = api_lock(iface);
-    if (ret != ESP_OK) return ret;
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
 
     portENTER_CRITICAL(&iface->state_lock);
     uac2_iface_state_t state = iface->state;
     portEXIT_CRITICAL(&iface->state_lock);
 
     if (state == UAC2_IFACE_STATE_ACTIVE) {
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_OK;
     }
     if (state != UAC2_IFACE_STATE_READY) {
-        api_unlock(iface);
+        release_locked_iface(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
     uac2_device_t *dev = iface->parent;
+    if (atomic_load(&dev->gone)) {
+        release_locked_iface(iface);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (device_has_opposite_direction_stream(iface)) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (fractional_playback_requires_feedback(iface->dir, iface->fb_ep_addr, iface->sample_rate)) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (!iface->interface_claimed) {
+        ret = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
+                                       iface->iface_num, iface->alt_setting);
+        if (ret != ESP_OK) {
+            release_locked_iface(iface);
+            return ret;
+        }
+        iface->interface_claimed = true;
+    }
 
     ret = ctrl_request_no_data(dev,
         USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
         USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "SET_INTERFACE(%d, %d) failed on resume: %s",
-                 iface->iface_num, iface->alt_setting, esp_err_to_name(ret));
+        ret = resume_rollback_to_ready(iface, ret, "SET_INTERFACE");
+        release_locked_iface(iface);
+        return ret;
+    }
+    ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                        "device_resume after SET_INTERFACE");
+    if (ret != ESP_OK) {
+        ret = resume_rollback_to_ready(iface, ret, "disconnect after SET_INTERFACE");
+        release_locked_iface(iface);
+        return ret;
     }
 
     if (dev->clock_source_id != 0 && iface->sample_rate > 0) {
-        set_sample_rate_internal(dev, iface->sample_rate);
+        ret = ensure_sample_rate_applied(dev, iface->sample_rate);
+        if (ret != ESP_OK) {
+            ret = resume_rollback_to_ready(iface, ret, "sample-rate setup");
+            release_locked_iface(iface);
+            return ret;
+        }
+        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                            "device_resume after sample-rate setup");
+        if (ret != ESP_OK) {
+            ret = resume_rollback_to_ready(iface, ret, "disconnect after sample-rate setup");
+            release_locked_iface(iface);
+            return ret;
+        }
     }
 
     ret = stream_submit_urbs(iface);
     if (ret != ESP_OK) {
-        portENTER_CRITICAL(&iface->state_lock);
-        iface->state = UAC2_IFACE_STATE_READY;
-        portEXIT_CRITICAL(&iface->state_lock);
-        ESP_LOGE(TAG, "Resume failed: %s", esp_err_to_name(ret));
+        ret = resume_rollback_to_ready(iface, ret, "URB submit");
     } else {
-        ESP_LOGI(TAG, "%s stream resumed", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
+        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
+                                            "device_resume after URB submit");
+        if (ret != ESP_OK) {
+            ret = resume_rollback_to_ready(iface, ret, "disconnect after URB submit");
+        } else {
+            ESP_LOGI(TAG, "%s stream resumed", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
+        }
     }
 
-    api_unlock(iface);
+    release_locked_iface(iface);
     return ret;
 }
