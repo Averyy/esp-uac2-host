@@ -70,14 +70,6 @@ typedef struct uac2_device {
     uac2_device_info_t desc_info;
     uint8_t ac_iface_num;
     uint8_t clock_source_id;
-    uint8_t feature_unit_id;
-    bool has_feature_unit;
-    bool has_mute;          // cached from desc_info.feature_units[0].has_mute
-    bool has_volume;        // cached from desc_info.feature_units[0].has_volume
-    bool volume_range_valid;
-    int16_t volume_min_db256;
-    int16_t volume_max_db256;
-    int16_t volume_res_db256;
 
     // Device gone flag — set on USB_HOST_CLIENT_EVENT_DEV_GONE, checked by
     // stream_stop_internal to skip SET_INTERFACE on a device that's already disconnected
@@ -104,6 +96,14 @@ typedef struct uac2_interface {
     // Interface identity
     uac2_stream_dir_t dir;
     uint8_t iface_num;
+    uint8_t feature_unit_id;
+    bool has_feature_unit;
+    bool has_mute;
+    bool has_volume;
+    bool volume_range_valid;
+    int16_t volume_min_db256;
+    int16_t volume_max_db256;
+    int16_t volume_res_db256;
 
     // API mutex (serializes public API calls except write/read)
     SemaphoreHandle_t api_mutex;
@@ -1129,6 +1129,98 @@ static uint8_t resolve_clock_source(const uac2_device_info_t *info)
     return 0;
 }
 
+static const uac2_terminal_t *find_terminal_by_id(const uac2_device_info_t *info, uint8_t terminal_id)
+{
+    for (int i = 0; i < info->num_terminals; i++) {
+        if (info->terminals[i].terminal_id == terminal_id) {
+            return &info->terminals[i];
+        }
+    }
+    return NULL;
+}
+
+static const uac2_feature_unit_t *find_feature_unit_by_id(const uac2_device_info_t *info, uint8_t unit_id)
+{
+    for (int i = 0; i < info->num_feature_units; i++) {
+        if (info->feature_units[i].unit_id == unit_id) {
+            return &info->feature_units[i];
+        }
+    }
+    return NULL;
+}
+
+static const uac2_feature_unit_t *resolve_feature_unit_for_iface(const uac2_device_info_t *info,
+                                                                 uint8_t iface_num)
+{
+    uint8_t terminal_link = 0;
+    for (int i = 0; i < info->num_as_ifaces; i++) {
+        const uac2_as_iface_t *as = &info->as_ifaces[i];
+        if (as->interface_num == iface_num && as->terminal_link != 0) {
+            terminal_link = as->terminal_link;
+            break;
+        }
+    }
+    if (terminal_link == 0) {
+        return NULL;
+    }
+
+    const uac2_terminal_t *terminal = find_terminal_by_id(info, terminal_link);
+    if (!terminal) {
+        return NULL;
+    }
+
+    if (terminal->is_input) {
+        for (int i = 0; i < info->num_feature_units; i++) {
+            if (info->feature_units[i].source_id == terminal->terminal_id) {
+                return &info->feature_units[i];
+            }
+        }
+        return NULL;
+    }
+
+    if (terminal->source_id != 0) {
+        return find_feature_unit_by_id(info, terminal->source_id);
+    }
+
+    return NULL;
+}
+
+static void iface_cache_feature_controls(uac2_iface_t *iface)
+{
+    uac2_device_t *dev = iface->parent;
+    const uac2_feature_unit_t *fu = resolve_feature_unit_for_iface(&dev->desc_info, iface->iface_num);
+    if (!fu) {
+        return;
+    }
+
+    iface->feature_unit_id = fu->unit_id;
+    iface->has_feature_unit = true;
+    iface->has_mute = fu->has_mute;
+    iface->has_volume = fu->has_volume;
+
+    if (!iface->has_volume) {
+        return;
+    }
+
+    uint8_t buf[2 + 6];  // sized for exactly 1 range triplet (min+max+res)
+    memset(buf, 0, sizeof(buf));
+    esp_err_t vr_err = ctrl_get_range(dev, iface->feature_unit_id,
+                                      UAC2_FU_VOLUME_CONTROL, 0, buf, sizeof(buf));
+    if (vr_err != ESP_OK) {
+        return;
+    }
+
+    uint16_t count = buf[0] | (buf[1] << 8);
+    if (count == 0) {
+        return;
+    }
+
+    iface->volume_min_db256 = (int16_t)(buf[2] | (buf[3] << 8));
+    iface->volume_max_db256 = (int16_t)(buf[4] | (buf[5] << 8));
+    iface->volume_res_db256 = (int16_t)(buf[6] | (buf[7] << 8));
+    iface->volume_range_valid = true;
+}
+
 static esp_err_t set_sample_rate_internal(uac2_device_t *dev, uint32_t sample_rate)
 {
     uint8_t data[4] = {
@@ -1401,14 +1493,6 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     dev->ac_iface_num = dev->desc_info.ac_iface_num;
     dev->clock_source_id = resolve_clock_source(&dev->desc_info);
 
-    if (dev->desc_info.num_feature_units > 0) {
-        const uac2_feature_unit_t *fu = &dev->desc_info.feature_units[0];
-        dev->has_feature_unit = true;
-        dev->feature_unit_id = fu->unit_id;
-        dev->has_mute = fu->has_mute;
-        dev->has_volume = fu->has_volume;
-    }
-
     // Allocate control transfer
     err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + UAC2_CTRL_XFER_MAX_SIZE,
                                   0, &dev->ctrl_xfer);
@@ -1422,27 +1506,6 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
 
     atomic_init(&dev->ctrl_xfer_gen, 0);
     atomic_init(&dev->ctrl_xfer_submitted_gen, 0);
-
-    // Cache volume range
-    if (dev->has_feature_unit && dev->has_volume) {
-        uint8_t buf[2 + 6];  // sized for exactly 1 range triplet (min+max+res)
-        memset(buf, 0, sizeof(buf));
-        esp_err_t vr_err = ctrl_get_range(dev, dev->feature_unit_id,
-                                           UAC2_FU_VOLUME_CONTROL, 0, buf, sizeof(buf));
-        if (vr_err == ESP_OK) {
-            uint16_t count = buf[0] | (buf[1] << 8);
-            if (count > 1) count = 1;  // buffer holds only 1 triplet
-            if (count > 0) {
-                dev->volume_min_db256 = (int16_t)(buf[2] | (buf[3] << 8));
-                dev->volume_max_db256 = (int16_t)(buf[4] | (buf[5] << 8));
-                dev->volume_res_db256 = (int16_t)(buf[6] | (buf[7] << 8));
-                dev->volume_range_valid = true;
-                ESP_LOGI(TAG, "Volume range: %.2f to %.2f dB (res %.4f dB)",
-                         dev->volume_min_db256 / 256.0, dev->volume_max_db256 / 256.0,
-                         dev->volume_res_db256 / 256.0);
-            }
-        }
-    }
 
     // Add to driver list
     UAC2_ENTER_CRITICAL();
@@ -1680,6 +1743,8 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
         return ESP_ERR_NO_MEM;
     }
 
+    iface_cache_feature_controls(iface);
+
     // Add to list and increment refcount
     UAC2_ENTER_CRITICAL();
     STAILQ_INSERT_TAIL(&s_uac2_driver->ifaces_tailq, iface, tailq_entry);
@@ -1689,6 +1754,17 @@ esp_err_t uac2_host_device_open(const uac2_host_device_config_t *config,
     ESP_LOGI(TAG, "Opened %s interface: addr=%d iface=%d (device refs=%d)",
              dir == UAC2_STREAM_TX ? "TX" : "RX",
              config->addr, config->iface_num, dev->opened_cnt);
+    if (iface->has_feature_unit) {
+        ESP_LOGI(TAG, "Interface addr=%d iface=%d controls: FU=%d mute=%s volume=%s",
+                 config->addr, config->iface_num, iface->feature_unit_id,
+                 iface->has_mute ? "yes" : "no", iface->has_volume ? "yes" : "no");
+        if (iface->volume_range_valid) {
+            ESP_LOGI(TAG, "Interface addr=%d iface=%d volume range: %.2f to %.2f dB (res %.4f dB)",
+                     config->addr, config->iface_num,
+                     iface->volume_min_db256 / 256.0, iface->volume_max_db256 / 256.0,
+                     iface->volume_res_db256 / 256.0);
+        }
+    }
 
     *out_handle = iface;
     return ESP_OK;
@@ -2178,12 +2254,12 @@ esp_err_t uac2_host_device_set_mute(uac2_host_device_handle_t handle,
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(dev->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
     esp_err_t ret = api_lock(iface);
     if (ret != ESP_OK) return ret;
     uint8_t data = mute ? 1 : 0;
-    ret = ctrl_set_cur(dev, dev->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
+    ret = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
     api_unlock(iface);
     return ret;
 }
@@ -2195,12 +2271,12 @@ esp_err_t uac2_host_device_get_mute(uac2_host_device_handle_t handle,
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(dev->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_mute, ESP_ERR_NOT_SUPPORTED, TAG, "No mute control");
     esp_err_t ret = api_lock(iface);
     if (ret != ESP_OK) return ret;
     uint8_t data = 0;
-    ret = ctrl_get_cur(dev, dev->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
+    ret = ctrl_get_cur(dev, iface->feature_unit_id, UAC2_FU_MUTE_CONTROL, channel, &data, 1);
     if (ret == ESP_OK) *mute = (data != 0);
     api_unlock(iface);
     return ret;
@@ -2213,22 +2289,22 @@ esp_err_t uac2_host_device_set_volume(uac2_host_device_handle_t handle,
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(dev->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
     esp_err_t ret = api_lock(iface);
     if (ret != ESP_OK) return ret;
     // Range check under lock to avoid TOCTOU with reconnect
-    if (dev->volume_range_valid) {
-        if (volume_db256 < dev->volume_min_db256 || volume_db256 > dev->volume_max_db256) {
+    if (iface->volume_range_valid) {
+        if (volume_db256 < iface->volume_min_db256 || volume_db256 > iface->volume_max_db256) {
             ESP_LOGE(TAG, "Volume %.2f dB out of range [%.2f, %.2f]",
-                     volume_db256 / 256.0, dev->volume_min_db256 / 256.0,
-                     dev->volume_max_db256 / 256.0);
+                     volume_db256 / 256.0, iface->volume_min_db256 / 256.0,
+                     iface->volume_max_db256 / 256.0);
             api_unlock(iface);
             return ESP_ERR_INVALID_ARG;
         }
     }
     uint8_t data[2] = { (uint8_t)(volume_db256 & 0xFF), (uint8_t)((volume_db256 >> 8) & 0xFF) };
-    ret = ctrl_set_cur(dev, dev->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
+    ret = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
     api_unlock(iface);
     return ret;
 }
@@ -2240,12 +2316,12 @@ esp_err_t uac2_host_device_get_volume(uac2_host_device_handle_t handle,
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(dev->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
     esp_err_t ret = api_lock(iface);
     if (ret != ESP_OK) return ret;
     uint8_t data[2] = {0};
-    ret = ctrl_get_cur(dev, dev->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
+    ret = ctrl_get_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
     if (ret == ESP_OK) *volume_db256 = (int16_t)(data[0] | (data[1] << 8));
     api_unlock(iface);
     return ret;
@@ -2260,13 +2336,14 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t handle,
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
     esp_err_t ret = api_lock(iface);
     if (ret != ESP_OK) return ret;
 
     uint8_t buf[2 + UAC2_MAX_VOLUME_RANGES * 6];
     memset(buf, 0, sizeof(buf));
-    ret = ctrl_get_range(dev, dev->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, buf, sizeof(buf));
+    ret = ctrl_get_range(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, buf, sizeof(buf));
     if (ret != ESP_OK) { api_unlock(iface); return ret; }
 
     uint16_t count = buf[0] | (buf[1] << 8);
@@ -2289,10 +2366,9 @@ esp_err_t uac2_host_device_set_volume_percent(uac2_host_device_handle_t handle,
     ESP_RETURN_ON_FALSE(percent <= 100, ESP_ERR_INVALID_ARG, TAG, "Percent must be 0-100");
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
-    int16_t db256 = dev->volume_min_db256 +
-        (int16_t)(((int32_t)(dev->volume_max_db256 - dev->volume_min_db256) * percent) / 100);
+    ESP_RETURN_ON_FALSE(iface->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
+    int16_t db256 = iface->volume_min_db256 +
+        (int16_t)(((int32_t)(iface->volume_max_db256 - iface->volume_min_db256) * percent) / 100);
     return uac2_host_device_set_volume(handle, channel, db256);
 }
 
@@ -2302,15 +2378,14 @@ esp_err_t uac2_host_device_get_volume_percent(uac2_host_device_handle_t handle,
     ESP_RETURN_ON_FALSE(handle && percent, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
-    uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
+    ESP_RETURN_ON_FALSE(iface->volume_range_valid, ESP_ERR_NOT_SUPPORTED, TAG, "Volume range not cached");
     int16_t db256;
     esp_err_t err = uac2_host_device_get_volume(handle, channel, &db256);
     if (err != ESP_OK) return err;
-    int32_t range = dev->volume_max_db256 - dev->volume_min_db256;
+    int32_t range = iface->volume_max_db256 - iface->volume_min_db256;
     if (range <= 0) { *percent = 0; }
     else {
-        int32_t pct = ((int32_t)(db256 - dev->volume_min_db256) * 100) / range;
+        int32_t pct = ((int32_t)(db256 - iface->volume_min_db256) * 100) / range;
         if (pct < 0) pct = 0;
         if (pct > 100) pct = 100;
         *percent = (uint8_t)pct;
@@ -2325,10 +2400,11 @@ esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t han
     uac2_iface_t *iface = get_iface_by_handle(handle);
     ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     uac2_device_t *dev = iface->parent;
-    ESP_RETURN_ON_FALSE(dev->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
-    ESP_RETURN_ON_FALSE(dev->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
+    ESP_RETURN_ON_FALSE(iface->has_feature_unit, ESP_ERR_NOT_SUPPORTED, TAG, "No feature unit");
+    ESP_RETURN_ON_FALSE(iface->has_volume, ESP_ERR_NOT_SUPPORTED, TAG, "No volume control");
 
-    const uac2_feature_unit_t *fu = &dev->desc_info.feature_units[0];
+    const uac2_feature_unit_t *fu = find_feature_unit_by_id(&dev->desc_info, iface->feature_unit_id);
+    ESP_RETURN_ON_FALSE(fu, ESP_ERR_NOT_FOUND, TAG, "Feature unit topology missing");
     uint32_t ch_map = fu->volume_ch_map;
 
     for (uint8_t ch = 0; ch <= fu->nr_channels && ch < 32; ch++) {
@@ -2368,12 +2444,12 @@ void uac2_host_device_print_info(uac2_host_device_handle_t handle)
     ESP_LOGI(TAG, "--- Runtime State ---");
     ESP_LOGI(TAG, "  Clock source ID: %d", dev->clock_source_id);
     ESP_LOGI(TAG, "  Feature unit: %s (ID=%d, mute=%s, volume=%s)",
-             dev->has_feature_unit ? "yes" : "no", dev->feature_unit_id,
-             dev->has_mute ? "yes" : "no", dev->has_volume ? "yes" : "no");
-    if (dev->volume_range_valid) {
+             iface->has_feature_unit ? "yes" : "no", iface->feature_unit_id,
+             iface->has_mute ? "yes" : "no", iface->has_volume ? "yes" : "no");
+    if (iface->volume_range_valid) {
         ESP_LOGI(TAG, "  Volume range: %.2f to %.2f dB (res %.4f dB)",
-                 dev->volume_min_db256 / 256.0, dev->volume_max_db256 / 256.0,
-                 dev->volume_res_db256 / 256.0);
+                 iface->volume_min_db256 / 256.0, iface->volume_max_db256 / 256.0,
+                 iface->volume_res_db256 / 256.0);
     }
     ESP_LOGI(TAG, "  Interface %d (%s): %s, ep=0x%02X, pkt=%d, ringbuf=%" PRIu32 ", urbs=%d",
              iface->iface_num,

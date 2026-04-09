@@ -1,7 +1,7 @@
 # esp-uac2-host
 
 > [!WARNING]
-> This project is new and still under active testing. Expect breaking changes, behavior changes, and documentation updates as the driver is validated on more hardware.
+> This project is new and still under active testing. It has been tested on an ESP32-S3 with a miniDSP 2x4 HD and works, but expect breaking changes, behavior changes, and documentation updates as the driver is validated on more hardware.
 
 USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component (C).
 
@@ -9,7 +9,7 @@ Generic UAC2 driver — works with any UAC2 device (DACs, audio interfaces, mini
 
 ## Status
 
-**v0.1.0 — validated on current hardware, still under active testing.** The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD, including repeated hot-unplug/replug recovery on hardware. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
+**v0.1.0 — validated on current hardware, still under active testing.** The driver has been tested on an ESP32-S3 with a real miniDSP 2x4 HD and works. The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD, including repeated hot-unplug/replug recovery on hardware. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
 
 See [PROGRESS.md](PROGRESS.md) for detailed history.
 
@@ -47,7 +47,7 @@ The driver is not being published yet. The repo is being prepared so the compone
 #include "usb/uac2_host.h"
 
 // Install the driver (creates internal USB Host client)
-uac2_host_config_t config = {
+uac2_host_driver_config_t config = {
     .create_background_task = true,
     .callback = device_event_cb,
     .callback_arg = NULL,
