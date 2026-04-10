@@ -729,52 +729,59 @@ static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer)
         return;
     }
 
-    size_t item_size = 0;
-
-    // Feedback-based adaptive packet sizing
-    uint16_t pkt_size;
+    int num_pkts = xfer->num_isoc_packets;
     uint32_t fb = atomic_load(&iface->fb_value);
-    if (fb > 0) {
-        uint16_t nominal_samples = (uint16_t)(fb >> 16);
-        uint16_t fraction = (uint16_t)(fb & 0xFFFF);
-        if (nominal_samples == 0 || nominal_samples > 1000) {
+    uint32_t bytes_filled = 0;
+
+    for (int i = 0; i < num_pkts; i++) {
+        // Feedback-based adaptive packet sizing (per packet)
+        uint16_t pkt_size;
+        if (fb > 0) {
+            uint16_t nominal_samples = (uint16_t)(fb >> 16);
+            uint16_t fraction = (uint16_t)(fb & 0xFFFF);
+            if (nominal_samples == 0 || nominal_samples > 1000) {
+                pkt_size = iface->packet_size;
+            } else {
+                iface->fb_accumulator += fraction;
+                uint16_t extra = (uint16_t)(iface->fb_accumulator >> 16);
+                iface->fb_accumulator &= 0xFFFF;
+                uint16_t samples_this_frame = nominal_samples + extra;
+                uint32_t raw_pkt_size = (uint32_t)samples_this_frame * iface->channels * iface->sub_slot_size;
+                pkt_size = (raw_pkt_size > iface->ep_mps) ? iface->ep_mps : (uint16_t)raw_pkt_size;
+            }
+        } else {
             pkt_size = iface->packet_size;
-            goto send_packet;
         }
-        iface->fb_accumulator += fraction;
-        uint16_t extra = (uint16_t)(iface->fb_accumulator >> 16);
-        iface->fb_accumulator &= 0xFFFF;
-        uint16_t samples_this_frame = nominal_samples + extra;
-        uint32_t raw_pkt_size = (uint32_t)samples_this_frame * iface->channels * iface->sub_slot_size;
-        pkt_size = (raw_pkt_size > iface->ep_mps) ? iface->ep_mps : (uint16_t)raw_pkt_size;
-    } else {
-        pkt_size = iface->packet_size;
-    }
-send_packet:
 
-    void *data = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0, pkt_size);
+        // HCD reads isochronous OUT data contiguously (hcd_dwc.c _buffer_fill_isoc)
+        uint8_t *pkt_buf = xfer->data_buffer + bytes_filled;
+        size_t item_size = 0;
+        void *data = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0, pkt_size);
 
-    if (data && item_size > 0) {
-        memcpy(xfer->data_buffer, data, item_size);
-        vRingbufferReturnItem(iface->ringbuf, data);
-        if (item_size < pkt_size) {
-            memset(xfer->data_buffer + item_size, 0, pkt_size - item_size);
+        if (data && item_size > 0) {
+            memcpy(pkt_buf, data, item_size);
+            vRingbufferReturnItem(iface->ringbuf, data);
+            if (item_size < pkt_size) {
+                memset(pkt_buf + item_size, 0, pkt_size - item_size);
+            }
+        } else {
+            memset(pkt_buf, 0, pkt_size);
         }
-        size_t rb_used = iface->ringbuf_size - xRingbufferGetCurFreeSize(iface->ringbuf);
-        if (rb_used < iface->ringbuf_threshold && iface->user_cb && !atomic_load(&iface->tx_done_pending)) {
-            atomic_store(&iface->tx_done_pending, true);
-            iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_TX_DONE, iface->user_cb_arg);
-        }
-    } else {
-        memset(xfer->data_buffer, 0, pkt_size);
+
+        xfer->isoc_packet_desc[i].num_bytes = pkt_size;
+        bytes_filled += pkt_size;
+
+        // Per-packet low-watermark check to keep refill signaling responsive
         if (iface->user_cb && !atomic_load(&iface->tx_done_pending)) {
-            atomic_store(&iface->tx_done_pending, true);
-            iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_TX_DONE, iface->user_cb_arg);
+            size_t rb_used = iface->ringbuf_size - xRingbufferGetCurFreeSize(iface->ringbuf);
+            if (rb_used < iface->ringbuf_threshold) {
+                atomic_store(&iface->tx_done_pending, true);
+                iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_TX_DONE, iface->user_cb_arg);
+            }
         }
     }
 
-    xfer->num_bytes = pkt_size;
-    xfer->isoc_packet_desc[0].num_bytes = pkt_size;
+    xfer->num_bytes = bytes_filled;
 
     esp_err_t err = usb_host_transfer_submit(xfer);
     if (err != ESP_OK) {

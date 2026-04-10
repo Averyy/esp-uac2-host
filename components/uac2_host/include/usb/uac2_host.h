@@ -47,7 +47,7 @@ extern "C" {
 
 #define UAC2_HOST_VER_MAJOR  0
 #define UAC2_HOST_VER_MINOR  1
-#define UAC2_HOST_VER_PATCH  1
+#define UAC2_HOST_VER_PATCH  2
 
 // ── Configuration defaults ─────────────────────────────────────────
 
@@ -58,7 +58,11 @@ extern "C" {
 #define UAC2_NUM_ISOC_URBS          3
 #endif
 
-#define UAC2_NUM_PACKETS_PER_URB    1       // Packets per URB (1 = 1ms per URB at FS)
+#ifdef CONFIG_UAC2_NUM_PACKETS_PER_URB
+#define UAC2_NUM_PACKETS_PER_URB    CONFIG_UAC2_NUM_PACKETS_PER_URB
+#else
+#define UAC2_NUM_PACKETS_PER_URB    3
+#endif
 
 #ifdef CONFIG_UAC2_CTRL_XFER_TIMEOUT_MS
 #define UAC2_CTRL_XFER_TIMEOUT_MS   CONFIG_UAC2_CTRL_XFER_TIMEOUT_MS

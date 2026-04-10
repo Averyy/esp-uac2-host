@@ -4,7 +4,7 @@ USB Audio Class 2.0 host driver for ESP32. ESP-IDF component (C). Enables ESP32 
 
 ## Project State
 
-**v0.1.1 — validated on current hardware, still under active testing.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD; recent live miniDSP reruns also pass suspend/resume, duplex-guard, and active hot-unplug/replug recovery checks. Builds clean with `-Werror -Wextra`. Downstream integration (sweep generator, `POST /play`) lives in minidsp-open. See `PROGRESS.md` for detailed status.
+**v0.1.2 — validated on current hardware, still under active testing.** Espressif class driver pattern: `uac2_host_install()`/`uac2_host_uninstall()` with internal device discovery, linked lists, reference counting. Two-level struct split: `uac2_device_t` (physical) + `uac2_iface_t` (per-interface). The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD; recent live miniDSP reruns also pass suspend/resume, duplex-guard, and active hot-unplug/replug recovery checks. Builds clean with `-Werror -Wextra`. Downstream integration (sweep generator, `POST /play`) lives in minidsp-open. See `PROGRESS.md` for detailed status.
 
 ## Related Projects
 

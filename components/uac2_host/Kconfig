@@ -8,6 +8,17 @@ menu "UAC2 Host Driver"
             Number of isochronous transfer URBs kept in flight simultaneously.
             More URBs reduce the chance of underrun but use more memory.
 
+    config UAC2_NUM_PACKETS_PER_URB
+        int "Number of isochronous packets per URB"
+        default 3
+        range 1 8
+        help
+            Number of 1ms isochronous packets bundled into each URB.
+            Higher values increase the resubmission margin (URBs * packets ms)
+            at the cost of latency and memory. With the default 3 URBs and
+            3 packets/URB, the HCD pipeline is 9ms — enough to absorb WiFi
+            power-save wakeups and task scheduling jitter.
+
     config UAC2_CTRL_XFER_TIMEOUT_MS
         int "Control transfer timeout (ms)"
         default 5000

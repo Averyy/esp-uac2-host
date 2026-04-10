@@ -1,8 +1,19 @@
 # Progress
 
-## Status: v0.1.1 — validated on current hardware, still under active testing. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, and reference counting. The 12-test boot harness passes against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD hardware, and recent live miniDSP reruns also pass suspend/resume, duplex guard, and active unplug/replug recovery. Driver is feature-complete for single-clock UAC2 devices, but validation coverage is still expanding.
+## Status: v0.1.2 — validated on current hardware, still under active testing. UAC2 host driver with Espressif class driver pattern, internal device discovery, linked lists, and reference counting. The 12-test boot harness passes against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD hardware, and recent live miniDSP reruns also pass suspend/resume, duplex guard, and active unplug/replug recovery. Driver is feature-complete for single-clock UAC2 devices, but validation coverage is still expanding.
 
 ## Completed
+
+### Multi-Packet URB Fix for Audio Dropout (April 10, 2026)
+- [x] Version bumped to 0.1.2
+- [x] `UAC2_NUM_PACKETS_PER_URB` made configurable via Kconfig (default 3, range 1-8) — was hardcoded to 1
+- [x] `stream_tx_xfer_submit()` rewritten to fill multiple isochronous packets per URB with contiguous data packing (matching DWC_OTG `_buffer_fill_isoc` layout, confirmed by reading `hcd_dwc.c`)
+- [x] Per-packet feedback-adjusted sizing preserved inside the multi-packet loop
+- [x] Per-packet low-watermark TX_DONE signaling preserved (review finding: URB-granular signaling would delay refill)
+- [x] HCD pipeline increased from 3ms (3 URBs × 1 pkt) to 9ms (3 URBs × 3 pkts), giving 6ms resubmission margin
+- [x] Fixes periodic audio dropouts (~1/sec blips) when running under system load (WiFi + HTTP + HID), caused by WiFi beacon processing stalling USB callbacks beyond the previous 2ms margin
+- [x] Verified on real miniDSP 2x4 HD: standalone test harness plays clean, and minidsp-open playback (200 Hz tone via `POST /play`) is blip-free with WiFi active
+- [x] Dobby 3-agent review (correctness, performance, regression): no bugs found; TX_DONE signaling regression fixed before commit
 
 ### Live miniDSP Cleanup + Validation (April 9, 2026)
 - [x] Version bumped to 0.1.1
