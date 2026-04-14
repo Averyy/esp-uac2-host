@@ -6,7 +6,7 @@ USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component written in C. MI
 
 A UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio to/from single-clock USB Audio Class 2.0 devices (DACs, audio interfaces, miniDSP hardware). The primary use case is playing measurement sweeps through a miniDSP 2x4 HD for automated subwoofer optimization.
 
-v0.1.1 — validated on current hardware. All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD, including a prior 766-second stability run; recent real-device reruns also pass live suspend/resume, duplex-guard, and active hot-unplug/replug recovery checks. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. Public support is currently scoped to single-clock UAC2 devices. Builds clean with `-Werror -Wextra`.
+v0.1.2 — validated on current hardware. All 12 automated tests pass against both ESP32-to-ESP32 simulator and real miniDSP 2x4 HD, including a prior 766-second stability run; recent real-device reruns also pass live suspend/resume, duplex-guard, and active hot-unplug/replug recovery checks. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, reference counting. Public support is currently scoped to single-clock UAC2 devices. Builds clean with `-Werror -Wextra`.
 
 ## Architecture
 
@@ -98,7 +98,7 @@ esp_err_t uac2_host_device_set_volume_all_channels(handle, volume_db256);
 ```c
 #define UAC2_HOST_VER_MAJOR         0
 #define UAC2_HOST_VER_MINOR         1
-#define UAC2_HOST_VER_PATCH         1
+#define UAC2_HOST_VER_PATCH         2
 #define UAC2_NUM_ISOC_URBS          3       // URBs in flight (Kconfig: UAC2_NUM_ISOC_URBS)
 #define UAC2_NUM_PACKETS_PER_URB    1       // 1 packet per URB (1ms at Full Speed)
 #define UAC2_CTRL_XFER_TIMEOUT_MS   5000    // Kconfig: UAC2_CTRL_XFER_TIMEOUT_MS

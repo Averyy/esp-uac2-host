@@ -32,7 +32,7 @@ This component provides a UAC2 host driver for ESP32-S3. It handles device disco
 After publication to the registry:
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.1"
+idf.py add-dependency "averyy/usb_host_uac2^0.1.2"
 ```
 
 For local development before publication, use a `path` dependency in `idf_component.yml`:

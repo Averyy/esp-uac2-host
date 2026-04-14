@@ -9,7 +9,7 @@ Generic UAC2 driver for ESP32-S3, currently validated for single-clock UAC2 devi
 
 ## Status
 
-**v0.1.1 — validated on current hardware, still under active testing.** The driver has been tested on an ESP32-S3 with a real miniDSP 2x4 HD and works. The 12-test boot harness passes against both the ESP32-to-ESP32 simulator and the real miniDSP 2x4 HD; recent live miniDSP reruns also pass suspend/resume, duplex-guard, and repeated hot-unplug/replug recovery checks. Current public support is scoped to single-clock UAC2 devices. Espressif class driver pattern with install/uninstall lifecycle, internal device discovery, and reference counting. Builds clean with `-Werror -Wextra`.
+**v0.1.2 — validated on current hardware, still under active testing.** The 12-test harness passes on both the ESP32-to-ESP32 simulator and a real miniDSP 2x4 HD, with recent reruns also passing suspend/resume, duplex-guard, and hot-unplug/replug recovery. Current support is focused on single-clock UAC2 devices. Builds clean with `-Werror -Wextra`.
 
 See [PROGRESS.md](PROGRESS.md) for detailed history.
 
@@ -94,7 +94,7 @@ set(EXTRA_COMPONENT_DIRS "/path/to/esp-uac2-host/components/uac2_host")
 After the component is eventually published to the ESP Component Registry, the planned install flow will be:
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.1"
+idf.py add-dependency "averyy/usb_host_uac2^0.1.2"
 ```
 
 The namespace and component name are final, but the component is intentionally not published yet.

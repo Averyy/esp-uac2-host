@@ -4,6 +4,13 @@
 
 ## Completed
 
+### TX Ringbuffer Wrap Fix (April 14, 2026)
+- [x] Version fields normalized to 0.1.2 across code, metadata, and docs
+- [x] `stream_tx_xfer_submit()` now reads across BYTEBUF wrap points before zero-padding, preventing valid queued audio from being replaced with silence at the internal ringbuffer boundary
+- [x] `stream_tx_xfer_done()` now logs per-packet skipped/error statuses even when the overall URB reports `USB_TRANSFER_STATUS_COMPLETED`
+- [x] Feedback-driven packet sizing is now limited to fractional sample rates with a real feedback endpoint; integer-kHz playback continues to use fixed packet sizing
+- [x] Reflashed real ESP32-S3 host hardware and verified clean playback on the previously affected path; user-confirmed sweep playback was perfect
+
 ### Multi-Packet URB Fix for Audio Dropout (April 10, 2026)
 - [x] Version bumped to 0.1.2
 - [x] `UAC2_NUM_PACKETS_PER_URB` made configurable via Kconfig (default 3, range 1-8) — was hardcoded to 1
