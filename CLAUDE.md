@@ -21,6 +21,7 @@ C (ESP-IDF component). Targets ESP32-S3. Built on top of ESP-IDF USB Host Librar
 - **ESP-IDF:** v5.4 (`~/esp/esp-idf`). System `python3` is 3.9 (Apple) but ESP-IDF needs Homebrew Python. Always activate with: `export PATH="/opt/homebrew/bin:$PATH" && . ~/esp/esp-idf/export.sh`
 - **Board:** ESP32-S3-DevKitC-1. Two USB-C ports:
   - **Right (UART):** CH340 USB-to-UART bridge (VID 0x1A86). Use for programming + serial monitor. Shows as `/dev/cu.usbmodem*`.
+    - **Flashing note (2026-04-14):** After a physical unplug/replug, the reliable path on this board was direct `esptool.py --no-stub` at `115200`. Earlier flash failures (`Packet content transfer stopped`, chip stopped responding) were due to UART link instability, not a bad build.
   - **Left (USB):** Built-in USB-Serial/JTAG on GPIO 19/20 (VID 0x303A). **This is also the USB OTG port** — when using USB Host mode (miniDSP), this port is unavailable for serial.
 - **VBUS:** The DevKitC-1 does not supply 5V to OTG port by default. **Bridge the `USB-OTG` solder pads** on the back of the board to route 5V from the power rail to the OTG port VBUS pin. Without this, USB devices won't enumerate even if self-powered.
 

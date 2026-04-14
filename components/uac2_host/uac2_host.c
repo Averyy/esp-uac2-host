@@ -682,10 +682,27 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
     }
 
     switch (xfer->status) {
-    case USB_TRANSFER_STATUS_COMPLETED:
+    case USB_TRANSFER_STATUS_COMPLETED: {
         atomic_store(&iface->consecutive_errors, 0);
+        // Check per-packet status — the HCD sets overall status to COMPLETED
+        // even when individual packets are SKIPPED (frame slot missed).
+        int skipped = 0;
+        int errors = 0;
+        for (int i = 0; i < xfer->num_isoc_packets; i++) {
+            usb_transfer_status_t pkt_st = xfer->isoc_packet_desc[i].status;
+            if (pkt_st == USB_TRANSFER_STATUS_SKIPPED) {
+                skipped++;
+            } else if (pkt_st != USB_TRANSFER_STATUS_COMPLETED) {
+                errors++;
+            }
+        }
+        if (skipped > 0 || errors > 0) {
+            ESP_LOGW(TAG, "TX URB: %d/%d packets skipped, %d errors",
+                     skipped, xfer->num_isoc_packets, errors);
+        }
         stream_tx_xfer_submit(iface, xfer);
         break;
+    }
 
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
@@ -731,12 +748,15 @@ static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer)
 
     int num_pkts = xfer->num_isoc_packets;
     uint32_t fb = atomic_load(&iface->fb_value);
+    bool use_feedback = iface->fb_ep_addr != 0 &&
+                        iface->sample_rate > 0 &&
+                        (iface->sample_rate % 1000) != 0;
     uint32_t bytes_filled = 0;
 
     for (int i = 0; i < num_pkts; i++) {
         // Feedback-based adaptive packet sizing (per packet)
         uint16_t pkt_size;
-        if (fb > 0) {
+        if (use_feedback && fb > 0) {
             uint16_t nominal_samples = (uint16_t)(fb >> 16);
             uint16_t fraction = (uint16_t)(fb & 0xFFFF);
             if (nominal_samples == 0 || nominal_samples > 1000) {
@@ -761,8 +781,21 @@ static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer)
         if (data && item_size > 0) {
             memcpy(pkt_buf, data, item_size);
             vRingbufferReturnItem(iface->ringbuf, data);
+            // BYTEBUF ring buffers only return contiguous data — at the
+            // internal wrap point we get a short read.  Pull the remaining
+            // bytes (now at the head of the buffer) before zero-padding.
             if (item_size < pkt_size) {
-                memset(pkt_buf + item_size, 0, pkt_size - item_size);
+                size_t need = pkt_size - item_size;
+                size_t extra_size = 0;
+                void *extra = xRingbufferReceiveUpTo(iface->ringbuf, &extra_size, 0, need);
+                if (extra && extra_size > 0) {
+                    memcpy(pkt_buf + item_size, extra, extra_size);
+                    vRingbufferReturnItem(iface->ringbuf, extra);
+                    item_size += extra_size;
+                }
+                if (item_size < pkt_size) {
+                    memset(pkt_buf + item_size, 0, pkt_size - item_size);
+                }
             }
         } else {
             memset(pkt_buf, 0, pkt_size);

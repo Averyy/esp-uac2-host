@@ -16,6 +16,7 @@ dependencies.lock
 
 # Claude Code (local settings, not project config)
 .claude/
+.codex-dobby/
 
 # macOS
 .DS_Store
