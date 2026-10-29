@@ -1,0 +1,3 @@
+# Leak hunting: the harness dumps the allocations each connect cycle still holds after teardown
+CONFIG_HEAP_TRACING_STANDALONE=y
+CONFIG_HEAP_TRACING_STACK_DEPTH=10

@@ -11,6 +11,7 @@
 
 #include <string.h>
 #include "usb/uac2_desc.h"
+#include "usb/usb_helpers.h"
 #include "esp_log.h"
 
 static const char *TAG = "uac2-desc";
@@ -230,6 +231,86 @@ static void parse_format_type_i(const uint8_t *desc, uac2_as_iface_t *as)
 
 // ── Main parser ─────────────────────────────────────────────────────
 
+/**
+ * Drop an AS alt setting that declared more endpoints than were present.
+ * usb_host_interface_claim() looks up each declared endpoint with ESP-IDF's
+ * descriptor walker, which never advances past a zero-length descriptor, so
+ * claiming such an alt setting on a malformed configuration can hang.
+ */
+static void drop_incomplete_as_alt(uac2_device_info_t *info, const uac2_as_iface_t *as,
+                                   int found, int declared)
+{
+    if (!as || found >= declared) {
+        return;
+    }
+    ESP_LOGW(TAG, "AS iface %d alt %d declares %d endpoints but only %d present, ignoring it",
+             as->interface_num, as->alt_setting, declared, found);
+    // as is always the most recently appended entry
+    info->num_as_ifaces--;
+}
+
+static bool ep_matches(const usb_ep_desc_t *ep, uint8_t attributes, uint16_t max_packet_size,
+                       uint8_t interval)
+{
+    return ep->bmAttributes == attributes &&
+           ep->wMaxPacketSize == max_packet_size &&
+           ep->bInterval == interval;
+}
+
+/**
+ * Keep only AS alt settings whose descriptors are the ones
+ * usb_host_interface_claim() will use. ESP-IDF takes the first interface
+ * descriptor matching interface/alt (and does not check bInterfaceNumber
+ * while scanning for the alt), then the first bNumEndpoints endpoint
+ * descriptors after it, walking past the next interface descriptor if
+ * needed. A malformed configuration (duplicate alts, misordered interfaces,
+ * missing or extra endpoints) can therefore make it claim endpoints other
+ * than the ones parsed here and validated at stream start.
+ *
+ * Requires the walk's malformed-descriptor rejection first: ESP-IDF's helpers
+ * loop on bLength < 2 and read past short or overrunning descriptors.
+ */
+static void drop_as_alts_unlike_claim(const uint8_t *config_desc, uac2_device_info_t *info,
+                                      int *as_offset)
+{
+    const usb_config_desc_t *cfg = (const usb_config_desc_t *)config_desc;
+    int kept = 0;
+    for (int i = 0; i < info->num_as_ifaces; i++) {
+        const uac2_as_iface_t *as = &info->as_ifaces[i];
+        int intf_offset = 0;
+        const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, as->interface_num,
+                                                                     as->alt_setting, &intf_offset);
+        bool match = intf && intf_offset == as_offset[i];
+        bool saw_data = as->ep_addr == 0;
+        bool saw_fb = as->fb_ep_addr == 0;
+        for (int e = 0; match && e < intf->bNumEndpoints; e++) {
+            int ep_offset = intf_offset;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, e, cfg->wTotalLength,
+                                                                             &ep_offset);
+            if (!ep) {
+                match = false;
+            } else if (ep->bEndpointAddress == as->ep_addr && !saw_data) {
+                match = ep_matches(ep, as->ep_attributes, as->ep_max_packet_size, as->ep_interval);
+                saw_data = true;
+            } else if (ep->bEndpointAddress == as->fb_ep_addr && !saw_fb) {
+                match = (ep->bmAttributes & 0x03) == 0x01 &&
+                        ep->wMaxPacketSize == as->fb_ep_max_packet_size &&
+                        ep->bInterval == as->fb_ep_interval;
+                saw_fb = true;
+            }
+        }
+        if (match && saw_data && saw_fb) {
+            info->as_ifaces[kept] = *as;
+            as_offset[kept] = as_offset[i];
+            kept++;
+        } else {
+            ESP_LOGW(TAG, "AS iface %d alt %d does not match the descriptors ESP-IDF would claim, ignoring it",
+                     as->interface_num, as->alt_setting);
+        }
+    }
+    info->num_as_ifaces = kept;
+}
+
 bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_length,
                                   uac2_device_info_t *info)
 {
@@ -245,18 +326,30 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
     // Current AS interface being built (when in an AudioStreaming alternate)
     uac2_as_iface_t *current_as = NULL;
     int ep_count_in_current_as = 0;
+    // Config offset of each AS entry's interface descriptor
+    int as_offset[UAC2_MAX_AS_INTERFACES] = {0};
 
     int offset = 0;
     while (offset < total_length) {
         uint8_t len = config_desc[offset];
-        if (len < 2) break;  // Need at least bLength + bDescriptorType
-        if (offset + len > total_length) break;
+        uint8_t type = offset + 1 < total_length ? config_desc[offset + 1] : 0;
+        // ESP-IDF's descriptor walk, which usb_host_interface_claim() uses,
+        // never advances past bLength < 2, follows a descriptor that overruns
+        // wTotalLength, and reads the full fixed-size fields of any INTERFACE
+        // or ENDPOINT descriptor whatever its bLength. No interface of such a
+        // configuration is safe to claim.
+        if (len < 2 || offset + len > total_length ||
+            (type == 0x04 && len < 9) || (type == 0x05 && len < 7)) {
+            ESP_LOGE(TAG, "Malformed descriptor at offset %d (type 0x%02X, bLength=%d, total=%d), "
+                     "rejecting configuration", offset, type, len, total_length);
+            memset(info, 0, sizeof(*info));
+            return false;
+        }
 
-        uint8_t type = config_desc[offset + 1];
         const uint8_t *desc = &config_desc[offset];
 
         if (type == 0x04) { // INTERFACE descriptor
-            if (len < 9) { offset += len; continue; }  // Standard interface descriptor is 9 bytes
+            drop_incomplete_as_alt(info, current_as, ep_count_in_current_as, current_num_endpoints);
             current_iface_num = desc[2];
             current_alt_setting = desc[3];
             current_num_endpoints = desc[4];
@@ -278,6 +371,7 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
                 current_num_endpoints > 0) {
                 // This is an active AS alt setting
                 if (info->num_as_ifaces < UAC2_MAX_AS_INTERFACES) {
+                    as_offset[info->num_as_ifaces] = offset;
                     current_as = &info->as_ifaces[info->num_as_ifaces++];
                     memset(current_as, 0, sizeof(*current_as));
                     current_as->interface_num = current_iface_num;
@@ -295,7 +389,7 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
                     uint8_t subtype = desc[2];
                     if (subtype == UAC2_AS_GENERAL) {
                         parse_as_general(desc, current_as);
-                    } else if (subtype == UAC2_AS_FORMAT_TYPE) {
+                    } else if (subtype == UAC2_AS_FORMAT_TYPE && len >= 4) {
                         if (desc[3] == UAC2_FORMAT_TYPE_I) {
                             parse_format_type_i(desc, current_as);
                         }
@@ -303,7 +397,8 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
                 }
             }
         } else if (type == 0x05) { // ENDPOINT descriptor
-            if (current_as && len >= 7) {
+            // Only the first bNumEndpoints belong to the alt, as for ESP-IDF
+            if (current_as && ep_count_in_current_as < current_num_endpoints) {
                 uint8_t ep_addr = desc[2];
                 uint8_t ep_attr = desc[3];
                 uint16_t max_pkt = read_u16(&desc[4]);
@@ -334,6 +429,8 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
 
         offset += len;
     }
+    drop_incomplete_as_alt(info, current_as, ep_count_in_current_as, current_num_endpoints);
+    drop_as_alts_unlike_claim(config_desc, info, as_offset);
 
     return info->is_uac2;
 }

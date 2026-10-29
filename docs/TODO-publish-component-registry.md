@@ -14,7 +14,7 @@ Publishing `usb_host_uac2` on [components.espressif.com](https://components.espr
 
 The registry auto-discovers `examples/` and displays them on the component page.
 
-- [x] `components/uac2_host/examples/basic_playback/` — minimal: enumerate, open, stream 48kHz sine wave
+- [x] `components/usb_host_uac2/examples/basic_playback/` — minimal: enumerate, open, stream 48kHz sine wave
 - [x] Each example needs its own `CMakeLists.txt`, `main/`, and `README.md`
 - [x] Examples use `idf_component.yml` with dependency on the component for standalone local builds (`path` now, registry dependency after publish)
 
@@ -24,11 +24,11 @@ The registry auto-discovers `examples/` and displays them on the component page.
 - [x] Clean up repo: ignore generated `build/`, `sdkconfig`, `dependencies.lock`, and example artifacts; keep `ref/` and `simulators/` clearly separated
 - [x] Top-level `README.md` with local component usage and planned Component Registry install instructions
 - [ ] Component Registry badge in README
-- [ ] Tag conventions: `v1.0.0`, `v1.1.0`, etc. (semver, `v` prefix)
+- [ ] Tag conventions: semver with `v` prefix matching `idf_component.yml` (`v0.1.3`, `v0.2.0`, ... `v1.0.0`)
 
 ## 4. CI / GitHub Actions
 
-- [x] Build CI (root project + component example against ESP-IDF v5.4)
+- [x] Build CI (root project + component example against ESP-IDF v5.4 and v6.1; all simulator profiles against v5.4)
 - [x] Manual/gated publish workflow scaffold added (`espressif/upload-components-ci-action@v2`) but not enabled for automatic release
 - [ ] Test against [staging registry](https://components-staging.espressif.com) first
 
@@ -42,7 +42,7 @@ The registry auto-discovers `examples/` and displays them on the component page.
 ## 6. Post-Publish
 
 - [ ] Verify component page renders correctly
-- [ ] Test install from fresh project: `idf.py add-dependency "averyy/usb_host_uac2^1.0.0"`
+- [ ] Test install from fresh project: `idf.py add-dependency "averyy/usb_host_uac2^<published version>"`
 - [ ] Announce: ESP32 forum, Reddit r/esp32
 - [ ] Update `llms.txt` with install instructions
 - [ ] Tested device compatibility list in README

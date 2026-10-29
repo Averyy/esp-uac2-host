@@ -214,7 +214,10 @@ typedef struct __attribute__((packed)) {
 #define UAC2_MAX_CLOCK_MULTIPLIERS  4
 #define UAC2_MAX_TERMINALS          8
 #define UAC2_MAX_FEATURE_UNITS      4
-#define UAC2_MAX_AS_INTERFACES      4
+// Active AS alternate settings kept across all streaming interfaces (one entry
+// per interface/alt pair; a device with 16/24/32-bit playback and capture
+// alts already needs 6). Later ones are skipped with a warning.
+#define UAC2_MAX_AS_INTERFACES      8
 #define UAC2_MAX_ALT_SETTINGS       4
 
 typedef struct {

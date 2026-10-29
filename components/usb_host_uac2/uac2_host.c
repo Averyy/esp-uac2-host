@@ -25,8 +25,10 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_check.h"
+#include "esp_idf_version.h"
 #include "usb/usb_host.h"
 #include "usb/uac2_host.h"
+#include "uac2_tx_sizing.h"
 
 static const char *TAG = "uac2-host";
 
@@ -37,6 +39,23 @@ static const char *TAG = "uac2-host";
 
 #define UAC2_CTRL_SET   (USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE)
 #define UAC2_CTRL_GET   (USB_BM_REQUEST_TYPE_DIR_IN  | USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE)
+
+_Static_assert(UAC2_CTRL_XFER_MAX_SIZE >= 2 + UAC2_MAX_SAMPLE_RATE_RANGES * 12,
+               "UAC2_CTRL_XFER_MAX_SIZE too small for a sample-rate GET_RANGE request");
+
+// The USB Host HCD spreads an isochronous URB of N packets over
+// N * 2^(bInterval-1) frames and asserts that this fits its 64-entry ISOC
+// descriptor list minus a 3-frame scheduling margin (hcd_dwc.c
+// XFER_LIST_LEN_ISOC / XFER_LIST_ISOC_MARGIN). Endpoints that exceed it must
+// be rejected before submission or the host aborts.
+#define UAC2_HCD_ISOC_MAX_FRAMES        (64 - 3)
+
+// Endpoint bmAttributes bits 3..2: synchronization type (uac2_ep_sync_type_t)
+#define UAC2_EP_SYNC_TYPE(attributes)   ((uac2_ep_sync_type_t)(((attributes) >> 2) & 0x03))
+
+// Minimum interval between repeated warnings logged from transfer callbacks.
+// Unthrottled logging at 1 ms packet rate would stall the USB event task.
+#define UAC2_CB_LOG_INTERVAL_US         1000000
 
 // ── Critical section ───────────────────────────────────────────────
 
@@ -77,12 +96,20 @@ typedef struct uac2_device {
 
     // Control transfer (shared across all interfaces on this device)
     usb_transfer_t *ctrl_xfer;
-    SemaphoreHandle_t ctrl_xfer_done;
+    SemaphoreHandle_t ctrl_xfer_done;   // given once per completed submission
     SemaphoreHandle_t ctrl_mutex;
-    // Generation counters for timeout/stale-callback detection. Both start at 0;
-    // this is safe because a new device has no prior submitted transfers.
-    atomic_uint ctrl_xfer_gen;
-    atomic_uint ctrl_xfer_submitted_gen;
+    // Set when a control request timed out. ESP-IDF does not let clients
+    // halt/flush EP0, so the URB stays in flight until the device answers or
+    // disconnects; its late completion must be consumed before reuse/free.
+    // Protected by ctrl_mutex.
+    bool ctrl_xfer_abandoned;
+    // Allocated with the control URB so orphaning it at destroy cannot fail.
+    struct uac2_orphaned_ctrl *orphan_node;
+
+    // Serializes stream activation (device_start/device_resume) and sample-rate
+    // changes across every interface of this device: they share one clock, and
+    // the ESP32-S3 duplex guard must see a sibling's activation complete.
+    SemaphoreHandle_t stream_mutex;
 } uac2_device_t;
 
 /**
@@ -137,19 +164,33 @@ typedef struct uac2_interface {
     // Data endpoint
     uint8_t  ep_addr;
     uint16_t ep_mps;
+    uint8_t  ep_sync_type;          // uac2_ep_sync_type_t
     bool interface_claimed;
 
     // Feedback endpoint (async playback only)
     uint8_t  fb_ep_addr;
     usb_transfer_t *fb_xfer;
     atomic_uint fb_value;           // 16.16 feedback
-    uint32_t fb_accumulator;        // fractional sample accumulator (callback context only)
+    uint32_t nominal_fb;            // 16.16 samples/frame implied by sample_rate
+    uint32_t fb_accumulator;        // fractional samples carried between packets: 16.16 with a
+                                    // feedback EP, sample_freq % 1000 units without (see
+                                    // tx_next_packet_samples); callback context only
 
     // Isochronous URBs
     usb_transfer_t *xfer[UAC2_NUM_ISOC_URBS];
     int xfer_count;
     atomic_int urbs_in_flight;
-    atomic_int consecutive_errors;
+    atomic_int consecutive_errors;      // data URBs
+    atomic_int fb_consecutive_errors;   // feedback URB; kept apart so a live
+                                        // feedback EP cannot mask a dead data EP
+
+    // Packet problems aggregated for throttled logging (callback context only)
+    uint32_t log_skipped_pkts;
+    uint32_t log_error_pkts;
+    uint32_t log_dropped_bytes;
+    uint32_t log_failed_urbs;
+    int log_last_urb_status;
+    int64_t last_issue_log_us;
 
     // Timing
     _Atomic int64_t first_frame_us;
@@ -160,10 +201,29 @@ typedef struct uac2_interface {
     uint32_t ringbuf_threshold;
     _Atomic bool tx_done_pending;
 
-    // Sync for safe stream resource free
-    SemaphoreHandle_t user_task_done;
-    _Atomic bool user_task_blocked;
+    // Tasks currently inside device_write/device_read. The ring buffer is only
+    // flushed or deleted after the stream has left ACTIVE and this drops to 0.
+    atomic_uint rw_users;
 } uac2_iface_t;
+
+#define UAC2_SCAN_MAX_DEVICES           8
+// Window in which a NEW_DEV event for a device already reported by the
+// install-time scan is treated as a duplicate. Re-enumerating a different
+// device at the same address takes longer than this (debounce + reset + enum).
+#define UAC2_SCAN_DEDUP_WINDOW_MS       500
+
+/**
+ * Control URB abandoned by device_destroy while still in flight. The USB
+ * device stays open with it: ESP-IDF asserts if the last handle to a device is
+ * closed while a control transfer is in flight.
+ */
+typedef struct uac2_orphaned_ctrl {
+    usb_transfer_t *xfer;
+    SemaphoreHandle_t done;
+    usb_device_handle_t dev_hdl;
+    uint8_t addr;
+    STAILQ_ENTRY(uac2_orphaned_ctrl) tailq_entry;
+} uac2_orphaned_ctrl_t;
 
 /**
  * Singleton driver state — created by uac2_host_install().
@@ -172,25 +232,49 @@ typedef struct {
     STAILQ_HEAD(devices, uac2_device) devices_tailq;
     STAILQ_HEAD(interfaces, uac2_interface) ifaces_tailq;
     volatile bool end_client_event_handling;
-    bool event_handling_started;
+    // A uac2_host_handle_events() call is running (s_uac2_lock). Uninstall
+    // waits only for a running call, so a manual pump that has stopped, or
+    // that calls uninstall itself between calls, cannot hang it.
+    bool handling_events;
     usb_host_client_handle_t client_handle;
     uac2_host_driver_event_cb_t user_cb;
     void *user_arg;
     SemaphoreHandle_t all_events_handled;
-    SemaphoreHandle_t lifecycle_mutex;
+    // Given by the background task as it exits; NULL without one.
+    SemaphoreHandle_t event_task_done;
+
+    // Control URBs that outlived their device (protected by s_uac2_lock).
+    // Reclaimed on the event task once their completion has been delivered.
+    STAILQ_HEAD(orphans, uac2_orphaned_ctrl) orphans_tailq;
+
+    // Install-time scan of already-attached devices (event context only)
+    bool initial_scan_done;
+    uint8_t scan_dedup_addrs[UAC2_SCAN_MAX_DEVICES];
+    int scan_dedup_count;
+    TickType_t scan_dedup_start;
 } uac2_driver_t;
 
 static uac2_driver_t *s_uac2_driver;
+
+// Serializes install/uninstall/open/close. Static and never deleted, so a call
+// racing uninstall cannot block on a freed mutex.
+static StaticSemaphore_t s_lifecycle_mutex_buf;
+static SemaphoreHandle_t s_lifecycle_mutex;
+static atomic_int s_lifecycle_mutex_state;  // 0 = none, 1 = creating, 2 = ready
 
 // ── Forward declarations ──────────────────────────────────────────
 
 static esp_err_t stream_stop_internal(uac2_iface_t *iface);
 static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer);
+static void stream_flush_ringbuf(uac2_iface_t *iface);
 static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks);
 static esp_err_t stream_deactivate(uac2_iface_t *iface);
 static esp_err_t read_current_sample_rate(uac2_device_t *dev, uint32_t *sample_rate);
-static void validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate);
+static esp_err_t validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate);
+static void warn_if_rate_not_applied(uac2_device_t *dev, uint32_t sample_rate);
 static void device_destroy(uac2_device_t *dev);
+static bool consume_scan_duplicate(uint8_t addr);
+static void scan_forget_addr(uint8_t addr);
 static esp_err_t wait_for_urbs_quiesced(uac2_iface_t *iface, uint32_t timeout_ms,
                                         const char *stage, bool set_error_state);
 
@@ -198,27 +282,37 @@ static inline bool stream_has_resources(const uac2_iface_t *iface)
 {
     return iface->xfer_count > 0 ||
            iface->fb_xfer != NULL ||
-           iface->ringbuf != NULL ||
-           iface->user_task_done != NULL;
+           iface->ringbuf != NULL;
 }
 
+static SemaphoreHandle_t lifecycle_mutex(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&s_lifecycle_mutex_state, &expected, 1)) {
+        s_lifecycle_mutex = xSemaphoreCreateMutexStatic(&s_lifecycle_mutex_buf);
+        atomic_store(&s_lifecycle_mutex_state, 2);
+    } else {
+        while (atomic_load(&s_lifecycle_mutex_state) != 2) {
+            vTaskDelay(1);
+        }
+    }
+    return s_lifecycle_mutex;
+}
+
+/** Takes the lifecycle mutex; fails (without holding it) if not installed. */
 static esp_err_t driver_lifecycle_lock(void)
 {
-    if (!s_uac2_driver || !s_uac2_driver->lifecycle_mutex) {
+    xSemaphoreTake(lifecycle_mutex(), portMAX_DELAY);
+    if (!s_uac2_driver) {
+        xSemaphoreGive(s_lifecycle_mutex);
         return ESP_ERR_INVALID_STATE;
-    }
-    if (xSemaphoreTake(s_uac2_driver->lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
-        ESP_LOGE(TAG, "Lifecycle mutex timeout");
-        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }
 
 static void driver_lifecycle_unlock(void)
 {
-    if (s_uac2_driver && s_uac2_driver->lifecycle_mutex) {
-        xSemaphoreGive(s_uac2_driver->lifecycle_mutex);
-    }
+    xSemaphoreGive(s_lifecycle_mutex);
 }
 
 static esp_err_t acquire_iface_runtime_ref(uac2_host_device_handle_t handle, uac2_iface_t **out_iface)
@@ -226,12 +320,17 @@ static esp_err_t acquire_iface_runtime_ref(uac2_host_device_handle_t handle, uac
     if (!out_iface) return ESP_ERR_INVALID_ARG;
     *out_iface = NULL;
     if (!handle) return ESP_ERR_INVALID_ARG;
-    if (!s_uac2_driver) return ESP_ERR_INVALID_STATE;
 
     uac2_iface_t *target = (uac2_iface_t *)handle;
     bool found = false;
 
     UAC2_ENTER_CRITICAL();
+    // Checked under the lock uninstall clears it with: these calls accept
+    // closed handles, so one can race the final close and uninstall.
+    if (!s_uac2_driver) {
+        UAC2_EXIT_CRITICAL();
+        return ESP_ERR_INVALID_STATE;
+    }
     uac2_iface_t *iface = NULL;
     STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
         if (iface == target) {
@@ -258,6 +357,20 @@ static uac2_iface_t *acquire_iface_io_ref(uac2_host_device_handle_t handle)
     return iface;
 }
 
+/**
+ * acquire_iface_io_ref() for the streaming calls, which document
+ * ESP_ERR_INVALID_STATE (not INVALID_ARG) for a closing or already-closed
+ * handle: a writer racing close must see the same error as a stopped stream.
+ */
+static uac2_iface_t *acquire_stream_io_ref(uac2_host_device_handle_t handle)
+{
+    uac2_iface_t *iface = acquire_iface_io_ref(handle);
+    if (!iface) {
+        ESP_LOGD(TAG, "Stream I/O on a closing or closed handle");
+    }
+    return iface;
+}
+
 static void release_iface_io_ref(uac2_iface_t *iface)
 {
     if (iface) {
@@ -265,20 +378,85 @@ static void release_iface_io_ref(uac2_iface_t *iface)
     }
 }
 
-static esp_err_t wait_for_iface_io_quiesced(uac2_iface_t *iface, TickType_t timeout_ticks)
+static inline bool stream_is_active(uac2_iface_t *iface)
+{
+    portENTER_CRITICAL(&iface->state_lock);
+    bool active = iface->state == UAC2_IFACE_STATE_ACTIVE;
+    portEXIT_CRITICAL(&iface->state_lock);
+    return active;
+}
+
+/** Streaming and the device still attached (telemetry is meaningful). */
+static inline bool stream_is_live(uac2_iface_t *iface)
+{
+    return stream_is_active(iface) && !atomic_load(&iface->parent->gone);
+}
+
+/**
+ * Register the caller as a ring buffer user (device_write/device_read).
+ * Registering before the state check pairs with stream teardown, which leaves
+ * ACTIVE before waiting for rw_users to drain: either the caller sees a
+ * non-ACTIVE stream here, or teardown waits for the caller to finish.
+ * On success the caller must decrement rw_users when done.
+ */
+static bool acquire_ringbuf_user(uac2_iface_t *iface)
+{
+    atomic_fetch_add(&iface->rw_users, 1);
+    if (stream_is_active(iface) && iface->ringbuf) {
+        return true;
+    }
+    atomic_fetch_sub(&iface->rw_users, 1);
+    return false;
+}
+
+/**
+ * Sleep one polling step of about 5 ms, but at least one tick: at
+ * CONFIG_FREERTOS_HZ=100 pdMS_TO_TICKS(5) is 0, and vTaskDelay(0) would not
+ * let a lower-priority task (the USB event task, a reader or writer) run.
+ */
+static inline void poll_delay(void)
+{
+    TickType_t ticks = pdMS_TO_TICKS(5);
+    vTaskDelay(ticks > 0 ? ticks : 1);
+}
+
+/**
+ * Unlink a closing interface once no runtime references remain. References are
+ * only taken under s_uac2_lock while the interface is linked, so checking the
+ * count and unlinking under that lock leaves no window for a new reference.
+ */
+static esp_err_t unlink_iface_when_unreferenced(uac2_iface_t *iface, TickType_t timeout_ticks,
+                                                uint8_t *remaining_refs)
 {
     TickType_t start = xTaskGetTickCount();
-    while (atomic_load(&iface->io_users) > 0) {
+    while (true) {
+        UAC2_ENTER_CRITICAL();
+        if (atomic_load(&iface->io_users) == 0) {
+            STAILQ_REMOVE(&s_uac2_driver->ifaces_tailq, iface, uac2_interface, tailq_entry);
+            iface->parent->opened_cnt--;
+            *remaining_refs = iface->parent->opened_cnt;
+            UAC2_EXIT_CRITICAL();
+            return ESP_OK;
+        }
+        UAC2_EXIT_CRITICAL();
         if ((xTaskGetTickCount() - start) >= timeout_ticks) {
             ESP_LOGE(TAG, "I/O users still active during close: %u",
                      (unsigned)atomic_load(&iface->io_users));
             return ESP_ERR_TIMEOUT;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        poll_delay();
     }
-    return ESP_OK;
 }
 
+/**
+ * usb_host_interface_release() refuses with ESP_ERR_INVALID_STATE while the
+ * client event task still has endpoint completions to process (ESP-IDF
+ * #17707). The upstream fix (IDF 5.4.4 / 5.5.4, espressif/usb 1.2.0) instead
+ * sleeps 10 ticks (100 ms at 100 Hz) if any of the client's endpoints has
+ * unprocessed completions, and the in-flight count is still decremented after
+ * callbacks run. Callers wait for this interface's URBs to quiesce first, so
+ * neither normally happens; keep retrying on every version for the rest.
+ */
 static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface, TickType_t timeout_ticks)
 {
     TickType_t start = xTaskGetTickCount();
@@ -314,10 +492,10 @@ static esp_err_t release_interface_claim(uac2_device_t *dev, uac2_iface_t *iface
 static esp_err_t wait_for_urbs_quiesced(uac2_iface_t *iface, uint32_t timeout_ms,
                                         const char *stage, bool set_error_state)
 {
-    uint32_t wait_ms = 0;
-    while (atomic_load(&iface->urbs_in_flight) > 0 && wait_ms < timeout_ms) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        wait_ms += 5;
+    TickType_t start = xTaskGetTickCount();
+    while (atomic_load(&iface->urbs_in_flight) > 0 &&
+           (xTaskGetTickCount() - start) < pdMS_TO_TICKS(timeout_ms)) {
+        poll_delay();
     }
     if (atomic_load(&iface->urbs_in_flight) > 0) {
         ESP_LOGE(TAG, "%s: %d URBs still in-flight after %" PRIu32 "ms — retaining resources",
@@ -340,20 +518,6 @@ static uac2_device_t *get_device_by_addr(uint8_t addr)
     UAC2_ENTER_CRITICAL();
     STAILQ_FOREACH(dev, &s_uac2_driver->devices_tailq, tailq_entry) {
         if (dev->addr == addr) {
-            UAC2_EXIT_CRITICAL();
-            return dev;
-        }
-    }
-    UAC2_EXIT_CRITICAL();
-    return NULL;
-}
-
-static uac2_device_t *get_device_by_handle(usb_device_handle_t usb_handle)
-{
-    uac2_device_t *dev = NULL;
-    UAC2_ENTER_CRITICAL();
-    STAILQ_FOREACH(dev, &s_uac2_driver->devices_tailq, tailq_entry) {
-        if (dev->dev_hdl == usb_handle) {
             UAC2_EXIT_CRITICAL();
             return dev;
         }
@@ -453,11 +617,9 @@ static void release_locked_iface(uac2_iface_t *iface)
 
 static void ctrl_xfer_cb(usb_transfer_t *xfer)
 {
-    uac2_device_t *dev = (uac2_device_t *)xfer->context;
-    if (atomic_load(&dev->ctrl_xfer_gen) != atomic_load(&dev->ctrl_xfer_submitted_gen)) {
-        return;  // stale callback after timeout
-    }
-    xSemaphoreGive(dev->ctrl_xfer_done);
+    // Context is the completion semaphore rather than the device, so a URB
+    // orphaned by device_destroy() never touches freed device memory.
+    xSemaphoreGive((SemaphoreHandle_t)xfer->context);
 }
 
 /**
@@ -478,6 +640,17 @@ static esp_err_t ctrl_request(uac2_device_t *dev,
     if (xSemaphoreTake(dev->ctrl_mutex, pdMS_TO_TICKS(UAC2_CTRL_XFER_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGE(TAG, "Control transfer mutex timeout");
         return ESP_ERR_TIMEOUT;
+    }
+
+    if (dev->ctrl_xfer_abandoned) {
+        // The URB from a timed-out request is still owned by the host stack.
+        // It can be reused only after its late completion has been delivered.
+        if (xSemaphoreTake(dev->ctrl_xfer_done, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "Previous control transfer still pending on addr %d", dev->addr);
+            xSemaphoreGive(dev->ctrl_mutex);
+            return ESP_ERR_INVALID_STATE;
+        }
+        dev->ctrl_xfer_abandoned = false;
     }
 
     usb_transfer_t *xfer = dev->ctrl_xfer;
@@ -502,10 +675,8 @@ static esp_err_t ctrl_request(uac2_device_t *dev,
     xfer->device_handle = dev->dev_hdl;
     xfer->bEndpointAddress = 0;
     xfer->callback = ctrl_xfer_cb;
-    xfer->context = dev;
+    xfer->context = dev->ctrl_xfer_done;
     xfer->timeout_ms = UAC2_CTRL_XFER_TIMEOUT_MS;
-
-    atomic_store(&dev->ctrl_xfer_submitted_gen, atomic_load(&dev->ctrl_xfer_gen));
 
     esp_err_t err = usb_host_transfer_submit_control(s_uac2_driver->client_handle, xfer);
     if (err != ESP_OK) {
@@ -515,14 +686,11 @@ static esp_err_t ctrl_request(uac2_device_t *dev,
     }
 
     if (xSemaphoreTake(dev->ctrl_xfer_done, pdMS_TO_TICKS(UAC2_CTRL_XFER_TIMEOUT_MS)) != pdTRUE) {
+        // usb_host_endpoint_halt/flush reject EP0 (it is owned by USBH), so a
+        // timed-out control transfer cannot be cancelled. Leave it in flight
+        // and make the next request / device_destroy() wait for its completion.
         ESP_LOGE(TAG, "Control transfer timeout");
-        atomic_fetch_add(&dev->ctrl_xfer_gen, 1);
-        esp_err_t halt_err = usb_host_endpoint_halt(dev->dev_hdl, 0);
-        if (halt_err == ESP_OK) {
-            usb_host_endpoint_flush(dev->dev_hdl, 0);
-            usb_host_endpoint_clear(dev->dev_hdl, 0);
-        }
-        xSemaphoreTake(dev->ctrl_xfer_done, 0);
+        dev->ctrl_xfer_abandoned = true;
         xSemaphoreGive(dev->ctrl_mutex);
         return ESP_ERR_TIMEOUT;
     }
@@ -667,6 +835,87 @@ static esp_err_t ensure_iface_device_available(uac2_iface_t *iface,
 
 // ── Isochronous transfer callbacks ────────────────────────────────
 
+/**
+ * Tally per-packet results of a COMPLETED isochronous URB. The HCD reports
+ * the URB as COMPLETED even when individual packets were SKIPPED (frame slot
+ * missed) or failed, so the overall status alone says nothing about delivery.
+ * Returns the number of hard (non-skipped) packet errors.
+ */
+static int stream_tally_isoc_packets(uac2_iface_t *iface, const usb_transfer_t *xfer)
+{
+    int skipped = 0;
+    int errors = 0;
+    for (int i = 0; i < xfer->num_isoc_packets; i++) {
+        usb_transfer_status_t pkt_st = xfer->isoc_packet_desc[i].status;
+        if (pkt_st == USB_TRANSFER_STATUS_SKIPPED) {
+            skipped++;
+        } else if (pkt_st != USB_TRANSFER_STATUS_COMPLETED) {
+            errors++;
+        }
+    }
+    iface->log_skipped_pkts += skipped;
+    iface->log_error_pkts += errors;
+    return errors;
+}
+
+/** Log aggregated packet problems at most once per UAC2_CB_LOG_INTERVAL_US. */
+static void stream_log_issues_throttled(uac2_iface_t *iface)
+{
+    if (iface->log_skipped_pkts == 0 && iface->log_error_pkts == 0 &&
+        iface->log_dropped_bytes == 0 && iface->log_failed_urbs == 0) {
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (now - iface->last_issue_log_us < UAC2_CB_LOG_INTERVAL_US) {
+        return;
+    }
+    iface->last_issue_log_us = now;
+    ESP_LOGW(TAG, "%s iface %d: %" PRIu32 " packets skipped, %" PRIu32 " packet errors, "
+             "%" PRIu32 " bytes dropped (ringbuf full), %" PRIu32 " failed URBs (last status %d, "
+             "consecutive %d)",
+             iface->dir == UAC2_STREAM_TX ? "TX" : "RX", iface->iface_num,
+             iface->log_skipped_pkts, iface->log_error_pkts, iface->log_dropped_bytes,
+             iface->log_failed_urbs, iface->log_last_urb_status,
+             atomic_load(&iface->consecutive_errors));
+    iface->log_skipped_pkts = 0;
+    iface->log_error_pkts = 0;
+    iface->log_dropped_bytes = 0;
+    iface->log_failed_urbs = 0;
+}
+
+/**
+ * Count a failed URB. Returns true if the caller should resubmit it, false if
+ * the stream hit UAC2_MAX_CONSECUTIVE_ERRORS (URB retired, stream in ERROR).
+ */
+static bool stream_handle_xfer_error(uac2_iface_t *iface, const usb_transfer_t *xfer)
+{
+    const char *dir = iface->dir == UAC2_STREAM_TX ? "TX" : "RX";
+    int errs = atomic_fetch_add(&iface->consecutive_errors, 1) + 1;
+    // A device alternating good and failed URBs never trips the limit, so
+    // per-URB warnings are aggregated like the packet counters.
+    iface->log_failed_urbs++;
+    iface->log_last_urb_status = xfer->status;
+    stream_log_issues_throttled(iface);
+    if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
+        ESP_LOGE(TAG, "%s: %d consecutive errors, stream dead", dir, errs);
+        atomic_fetch_sub(&iface->urbs_in_flight, 1);
+        // Only a still-running stream dies: a stop that already moved it to
+        // IDLE must not be left in ERROR
+        portENTER_CRITICAL(&iface->state_lock);
+        bool was_active = iface->state == UAC2_IFACE_STATE_ACTIVE;
+        if (was_active) iface->state = UAC2_IFACE_STATE_ERROR;
+        portEXIT_CRITICAL(&iface->state_lock);
+        if (was_active && iface->user_cb) {
+            iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_STREAM_ERROR, iface->user_cb_arg);
+        }
+        return false;
+    }
+    if (iface->user_cb) {
+        iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_TRANSFER_ERROR, iface->user_cb_arg);
+    }
+    return true;
+}
+
 static void stream_tx_xfer_done(usb_transfer_t *xfer)
 {
     uac2_iface_t *iface = (uac2_iface_t *)xfer->context;
@@ -683,24 +932,15 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
 
     switch (xfer->status) {
     case USB_TRANSFER_STATUS_COMPLETED: {
-        atomic_store(&iface->consecutive_errors, 0);
-        // Check per-packet status — the HCD sets overall status to COMPLETED
-        // even when individual packets are SKIPPED (frame slot missed).
-        int skipped = 0;
-        int errors = 0;
-        for (int i = 0; i < xfer->num_isoc_packets; i++) {
-            usb_transfer_status_t pkt_st = xfer->isoc_packet_desc[i].status;
-            if (pkt_st == USB_TRANSFER_STATUS_SKIPPED) {
-                skipped++;
-            } else if (pkt_st != USB_TRANSFER_STATUS_COMPLETED) {
-                errors++;
-            }
+        int errors = stream_tally_isoc_packets(iface, xfer);
+        stream_log_issues_throttled(iface);
+        if (errors < xfer->num_isoc_packets) {
+            atomic_store(&iface->consecutive_errors, 0);
+            stream_tx_xfer_submit(iface, xfer);
+        } else if (stream_handle_xfer_error(iface, xfer)) {
+            // Every packet hard-failed: count it so a dead link reaches STREAM_ERROR
+            stream_tx_xfer_submit(iface, xfer);
         }
-        if (skipped > 0 || errors > 0) {
-            ESP_LOGW(TAG, "TX URB: %d/%d packets skipped, %d errors",
-                     skipped, xfer->num_isoc_packets, errors);
-        }
-        stream_tx_xfer_submit(iface, xfer);
         break;
     }
 
@@ -713,27 +953,28 @@ static void stream_tx_xfer_done(usb_transfer_t *xfer)
         }
         return;
 
-    default: {
-        int errs = atomic_fetch_add(&iface->consecutive_errors, 1) + 1;
-        ESP_LOGW(TAG, "TX transfer error, status=%d (consecutive: %d)", xfer->status, errs);
-        if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
-            ESP_LOGE(TAG, "TX: %d consecutive errors, stream dead", errs);
-            atomic_fetch_sub(&iface->urbs_in_flight, 1);
-            portENTER_CRITICAL(&iface->state_lock);
-            iface->state = UAC2_IFACE_STATE_ERROR;
-            portEXIT_CRITICAL(&iface->state_lock);
-            if (iface->user_cb) {
-                iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_STREAM_ERROR, iface->user_cb_arg);
-            }
-        } else {
-            if (iface->user_cb) {
-                iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_TRANSFER_ERROR, iface->user_cb_arg);
-            }
+    default:
+        if (stream_handle_xfer_error(iface, xfer)) {
             stream_tx_xfer_submit(iface, xfer);
         }
         break;
     }
+}
+
+/**
+ * Sample frames for the next playback packet. With a feedback endpoint, follow
+ * the device's reported rate (nominal until the first report). Without one the
+ * endpoint is adaptive or synchronous (start refuses fractional rates on async
+ * endpoints without feedback), so send exactly sample_freq / 1000 per frame.
+ */
+static uint32_t tx_next_packet_samples(uac2_iface_t *iface, uint32_t max_samples)
+{
+    if (iface->fb_ep_addr == 0) {
+        return uac2_tx_next_nominal_samples(iface->sample_rate, &iface->fb_accumulator,
+                                            max_samples);
     }
+    uint32_t rate_q16 = uac2_tx_rate_q16(iface->nominal_fb, atomic_load(&iface->fb_value));
+    return uac2_tx_next_packet_samples(rate_q16, &iface->fb_accumulator, max_samples);
 }
 
 static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer)
@@ -747,28 +988,15 @@ static void stream_tx_xfer_submit(uac2_iface_t *iface, usb_transfer_t *xfer)
     }
 
     int num_pkts = xfer->num_isoc_packets;
-    uint32_t fb = atomic_load(&iface->fb_value);
-    bool use_feedback = iface->fb_ep_addr != 0 &&
-                        iface->sample_rate > 0 &&
-                        (iface->sample_rate % 1000) != 0;
+
+    uint32_t frame_bytes = (uint32_t)iface->channels * iface->sub_slot_size;
+    uint32_t max_samples = frame_bytes ? iface->ep_mps / frame_bytes : 0;
     uint32_t bytes_filled = 0;
 
     for (int i = 0; i < num_pkts; i++) {
-        // Feedback-based adaptive packet sizing (per packet)
         uint16_t pkt_size;
-        if (use_feedback && fb > 0) {
-            uint16_t nominal_samples = (uint16_t)(fb >> 16);
-            uint16_t fraction = (uint16_t)(fb & 0xFFFF);
-            if (nominal_samples == 0 || nominal_samples > 1000) {
-                pkt_size = iface->packet_size;
-            } else {
-                iface->fb_accumulator += fraction;
-                uint16_t extra = (uint16_t)(iface->fb_accumulator >> 16);
-                iface->fb_accumulator &= 0xFFFF;
-                uint16_t samples_this_frame = nominal_samples + extra;
-                uint32_t raw_pkt_size = (uint32_t)samples_this_frame * iface->channels * iface->sub_slot_size;
-                pkt_size = (raw_pkt_size > iface->ep_mps) ? iface->ep_mps : (uint16_t)raw_pkt_size;
-            }
+        if (iface->sample_rate != 0 && max_samples != 0) {
+            pkt_size = (uint16_t)(tx_next_packet_samples(iface, max_samples) * frame_bytes);
         } else {
             pkt_size = iface->packet_size;
         }
@@ -838,7 +1066,20 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
     }
 
     switch (xfer->status) {
-    case USB_TRANSFER_STATUS_COMPLETED:
+    case USB_TRANSFER_STATUS_COMPLETED: {
+        int errors = stream_tally_isoc_packets(iface, xfer);
+        if (errors >= xfer->num_isoc_packets) {
+            // Every packet hard-failed: count it so a dead link reaches STREAM_ERROR
+            stream_log_issues_throttled(iface);
+            if (stream_handle_xfer_error(iface, xfer)) {
+                esp_err_t sub_err = usb_host_transfer_submit(xfer);
+                if (sub_err != ESP_OK) {
+                    ESP_LOGW(TAG, "RX resubmit failed: %s", esp_err_to_name(sub_err));
+                    atomic_fetch_sub(&iface->urbs_in_flight, 1);
+                }
+            }
+            break;
+        }
         atomic_store(&iface->consecutive_errors, 0);
         for (int i = 0; i < xfer->num_isoc_packets; i++) {
             usb_isoc_packet_desc_t *pkt = &xfer->isoc_packet_desc[i];
@@ -847,11 +1088,11 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
                 BaseType_t ok = xRingbufferSend(iface->ringbuf, pkt_data,
                                                 pkt->actual_num_bytes, 0);
                 if (ok != pdTRUE) {
-                    ESP_LOGW(TAG, "RX ringbuf overflow, dropped %d bytes",
-                             pkt->actual_num_bytes);
+                    iface->log_dropped_bytes += pkt->actual_num_bytes;
                 }
             }
         }
+        stream_log_issues_throttled(iface);
         {
             size_t rb_used = iface->ringbuf_size - xRingbufferGetCurFreeSize(iface->ringbuf);
             if (rb_used >= iface->ringbuf_threshold && iface->user_cb) {
@@ -870,6 +1111,7 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
             }
         }
         break;
+    }
 
     case USB_TRANSFER_STATUS_NO_DEVICE:
     case USB_TRANSFER_STATUS_CANCELED:
@@ -880,19 +1122,8 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
         }
         return;
 
-    default: {
-        int errs = atomic_fetch_add(&iface->consecutive_errors, 1) + 1;
-        ESP_LOGW(TAG, "RX transfer error, status=%d (consecutive: %d)", xfer->status, errs);
-        if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
-            ESP_LOGE(TAG, "RX: %d consecutive errors, stream dead", errs);
-            atomic_fetch_sub(&iface->urbs_in_flight, 1);
-            portENTER_CRITICAL(&iface->state_lock);
-            iface->state = UAC2_IFACE_STATE_ERROR;
-            portEXIT_CRITICAL(&iface->state_lock);
-            if (iface->user_cb) {
-                iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_STREAM_ERROR, iface->user_cb_arg);
-            }
-        } else {
+    default:
+        if (stream_handle_xfer_error(iface, xfer)) {
             esp_err_t sub_err = usb_host_transfer_submit(xfer);
             if (sub_err != ESP_OK) {
                 ESP_LOGW(TAG, "RX resubmit failed: %s", esp_err_to_name(sub_err));
@@ -900,7 +1131,6 @@ static void stream_rx_xfer_done(usb_transfer_t *xfer)
             }
         }
         break;
-    }
     }
 }
 
@@ -918,47 +1148,50 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
         return;
     }
 
-    if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
-            xfer->status == USB_TRANSFER_STATUS_CANCELED) {
-            atomic_fetch_sub(&iface->urbs_in_flight, 1);
-            if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE &&
-                iface->user_cb && !atomic_exchange(&iface->disconnect_fired, true)) {
-                iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_DISCONNECTED, iface->user_cb_arg);
-            }
-            return;
+    if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
+        xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+        atomic_fetch_sub(&iface->urbs_in_flight, 1);
+        if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE &&
+            iface->user_cb && !atomic_exchange(&iface->disconnect_fired, true)) {
+            iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_DISCONNECTED, iface->user_cb_arg);
         }
-        int errs = atomic_fetch_add(&iface->consecutive_errors, 1) + 1;
-        ESP_LOGD(TAG, "Feedback transfer error, status=%d (consecutive: %d)", xfer->status, errs);
+        return;
+    }
+
+    // HCD reports the URB COMPLETED even when its only packet failed; that
+    // packet's bytes are not a feedback value. A SKIPPED packet (frame slot
+    // missed under load) is not a device error either, matching the data
+    // path: keep the last value and resubmit without counting it.
+    usb_transfer_status_t pkt_status = xfer->isoc_packet_desc[0].status;
+    bool fb_ok = xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
+                 pkt_status == USB_TRANSFER_STATUS_COMPLETED;
+    bool fb_skipped = xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
+                      pkt_status == USB_TRANSFER_STATUS_SKIPPED;
+    if (!fb_ok && !fb_skipped) {
+        int errs = atomic_fetch_add(&iface->fb_consecutive_errors, 1) + 1;
+        ESP_LOGD(TAG, "Feedback transfer error, status=%d/%d (consecutive: %d)",
+                 xfer->status, xfer->isoc_packet_desc[0].status, errs);
         if (errs >= UAC2_MAX_CONSECUTIVE_ERRORS) {
             ESP_LOGE(TAG, "Feedback: %d consecutive errors, stream dead", errs);
             atomic_fetch_sub(&iface->urbs_in_flight, 1);
             portENTER_CRITICAL(&iface->state_lock);
-            iface->state = UAC2_IFACE_STATE_ERROR;
+            bool was_active = iface->state == UAC2_IFACE_STATE_ACTIVE;
+            if (was_active) iface->state = UAC2_IFACE_STATE_ERROR;
             portEXIT_CRITICAL(&iface->state_lock);
-            if (iface->user_cb) {
+            if (was_active && iface->user_cb) {
                 iface->user_cb(iface, UAC2_HOST_DEVICE_EVENT_STREAM_ERROR, iface->user_cb_arg);
             }
             return;
         }
     }
 
-    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        atomic_store(&iface->consecutive_errors, 0);
+    if (fb_ok) {
+        atomic_store(&iface->fb_consecutive_errors, 0);
         int actual = xfer->isoc_packet_desc[0].actual_num_bytes;
         if (actual > 4) actual = 4;  // clamp to buffer size
-
-        if (actual == 4) {
-            uint32_t raw = xfer->data_buffer[0]
-                         | ((uint32_t)xfer->data_buffer[1] << 8)
-                         | ((uint32_t)xfer->data_buffer[2] << 16)
-                         | ((uint32_t)xfer->data_buffer[3] << 24);
-            atomic_store(&iface->fb_value, raw);
-        } else if (actual == 3) {
-            uint32_t raw = (uint32_t)xfer->data_buffer[0]
-                         | ((uint32_t)xfer->data_buffer[1] << 8)
-                         | ((uint32_t)xfer->data_buffer[2] << 16);
-            atomic_store(&iface->fb_value, raw << 2);
+        uint32_t fb_q16;
+        if (uac2_feedback_decode_q16(xfer->data_buffer, actual, &fb_q16)) {
+            atomic_store(&iface->fb_value, fb_q16);
         }
 
         {
@@ -974,8 +1207,10 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
     bool still_active = iface->state == UAC2_IFACE_STATE_ACTIVE;
     portEXIT_CRITICAL(&iface->state_lock);
     if (still_active) {
-        xfer->isoc_packet_desc[0].num_bytes = xfer->data_buffer_size;
-        xfer->num_bytes = xfer->data_buffer_size;
+        // The requested 4 bytes, not data_buffer_size: ESP-IDF before 5.4.2
+        // can report more than was allocated when heap poisoning is enabled
+        xfer->isoc_packet_desc[0].num_bytes = 4;
+        xfer->num_bytes = 4;
         esp_err_t sub_err = usb_host_transfer_submit(xfer);
         if (sub_err != ESP_OK) {
             ESP_LOGW(TAG, "Feedback resubmit failed: %s", esp_err_to_name(sub_err));
@@ -988,15 +1223,21 @@ static void feedback_xfer_done(usb_transfer_t *xfer)
 
 // ── Stream resource management ────────────────────────────────────
 
-static const uac2_as_iface_t *find_matching_as_iface(
-    const uac2_device_info_t *info,
-    uac2_stream_dir_t dir,
-    const uac2_host_stream_config_t *config,
-    uint8_t iface_num)
+/**
+ * Alt settings of iface_num that match dir and the requested format, best
+ * first: highest bit depth first (only one depth when bit_resolution is set),
+ * descriptor order within a depth. Returns how many were written to out,
+ * which must hold UAC2_MAX_AS_INTERFACES entries.
+ */
+static int find_matching_as_ifaces(const uac2_device_info_t *info,
+                                   uac2_stream_dir_t dir,
+                                   const uac2_host_stream_config_t *config,
+                                   uint8_t iface_num,
+                                   const uac2_as_iface_t **out)
 {
-    const uac2_as_iface_t *best = NULL;
+    int n = 0;
 
-    for (int i = 0; i < info->num_as_ifaces; i++) {
+    for (int i = 0; i < info->num_as_ifaces && i < UAC2_MAX_AS_INTERFACES; i++) {
         const uac2_as_iface_t *as = &info->as_ifaces[i];
 
         // Must match this interface number
@@ -1011,17 +1252,27 @@ static const uac2_as_iface_t *find_matching_as_iface(
         if (config->bit_resolution && as->bit_resolution != config->bit_resolution) continue;
         if (config->channels && as->nr_channels != config->channels) continue;
 
-        if (!best || as->bit_resolution > best->bit_resolution) {
-            best = as;
+        int pos = n++;
+        while (pos > 0 && out[pos - 1]->bit_resolution < as->bit_resolution) {
+            out[pos] = out[pos - 1];
+            pos--;
         }
+        out[pos] = as;
     }
 
-    return best;
+    return n;
 }
 
+/**
+ * With the USB Host Library's FIFO presets the ESP32-S3 cannot carry TX and RX
+ * audio at once. CONFIG_UAC2_ALLOW_DUPLEX lifts this when the application
+ * configured a FIFO split with room for both; the HCD then refuses any
+ * endpoint that does not fit when the interface is claimed. Caller must hold
+ * dev->stream_mutex, so a sibling's start cannot be half-way through.
+ */
 static bool device_has_opposite_direction_stream(const uac2_iface_t *iface)
 {
-#if CONFIG_IDF_TARGET_ESP32S3
+#if CONFIG_IDF_TARGET_ESP32S3 && !CONFIG_UAC2_ALLOW_DUPLEX
     bool blocked = false;
 
     UAC2_ENTER_CRITICAL();
@@ -1044,12 +1295,83 @@ static bool device_has_opposite_direction_stream(const uac2_iface_t *iface)
 #endif
 }
 
+/**
+ * True if any interface on the device has a started (or suspended) stream.
+ * Caller must hold dev->stream_mutex.
+ */
+static bool device_has_stream(const uac2_device_t *dev)
+{
+    bool busy = false;
+    UAC2_ENTER_CRITICAL();
+    uac2_iface_t *iface = NULL;
+    STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
+        if (iface->parent == dev &&
+            (iface->state != UAC2_IFACE_STATE_IDLE || stream_has_resources(iface))) {
+            busy = true;
+            break;
+        }
+    }
+    UAC2_EXIT_CRITICAL();
+    return busy;
+}
+
+/**
+ * Whether another started or suspended stream on iface's device runs at a
+ * rate other than sample_rate. The device has one clock, so applying
+ * sample_rate would change it under that stream. Caller must hold the
+ * device's stream_mutex (sample_rate is only written under it).
+ */
+static bool device_has_stream_at_other_rate(const uac2_iface_t *iface, uint32_t sample_rate)
+{
+    bool conflict = false;
+    UAC2_ENTER_CRITICAL();
+    uac2_iface_t *other = NULL;
+    STAILQ_FOREACH(other, &s_uac2_driver->ifaces_tailq, tailq_entry) {
+        if (other == iface || other->parent != iface->parent) {
+            continue;
+        }
+        if ((other->state != UAC2_IFACE_STATE_IDLE || stream_has_resources(other)) &&
+            other->sample_rate != sample_rate) {
+            conflict = true;
+            break;
+        }
+    }
+    UAC2_EXIT_CRITICAL();
+    return conflict;
+}
+
+/**
+ * The HCD schedules an isochronous packet every 2^(bInterval-1) frames.
+ * Audio data endpoints must be 1 at full speed (one packet per 1 ms frame,
+ * which the packet sizing assumes); the URB must also fit the HCD ISOC list.
+ */
+static bool iso_ep_interval_supported(uint8_t b_interval, int num_packets, bool is_data_ep)
+{
+    if (b_interval < 1 || b_interval > 16) {
+        return false;
+    }
+    if (is_data_ep && b_interval != 1) {
+        return false;
+    }
+    uint32_t frames = (1u << (b_interval - 1)) * (uint32_t)num_packets;
+    return frames <= UAC2_HCD_ISOC_MAX_FRAMES;
+}
+
+/**
+ * An asynchronous sink runs its own clock, so a fractional rate needs its
+ * feedback to stay in step. Adaptive and synchronous sinks follow the host's
+ * frame timing and play the nominal 44/45-frame pattern without feedback.
+ * Endpoints that declare no synchronization type are treated as asynchronous.
+ */
 static bool fractional_playback_requires_feedback(uac2_stream_dir_t dir,
                                                   uint8_t fb_ep_addr,
+                                                  uac2_ep_sync_type_t sync_type,
                                                   uint32_t sample_rate)
 {
     return dir == UAC2_STREAM_TX &&
            fb_ep_addr == 0 &&
+           sync_type != UAC2_EP_SYNC_ADAPTIVE &&
+           sync_type != UAC2_EP_SYNC_SYNC &&
            sample_rate > 0 &&
            (sample_rate % 1000) != 0;
 }
@@ -1057,10 +1379,12 @@ static bool fractional_playback_requires_feedback(uac2_stream_dir_t dir,
 static uint16_t calc_packet_size(uint32_t sample_rate, uint8_t channels,
                                  uint8_t sub_slot_size)
 {
-    uint32_t samples_per_frame = (sample_rate + 999) / 1000;
-    uint32_t result = samples_per_frame * channels * sub_slot_size;
+    // 64-bit: an absurd sample_freq with a many-channel descriptor would
+    // otherwise wrap to a small size that passes the MPS check
+    uint64_t samples_per_frame = ((uint64_t)sample_rate + 999) / 1000;
+    uint64_t result = samples_per_frame * channels * sub_slot_size;
     if (result > UINT16_MAX) {
-        ESP_LOGE(TAG, "Packet size overflow: %" PRIu32, result);
+        ESP_LOGE(TAG, "Packet size overflow: %" PRIu64, result);
         return 0;
     }
     return (uint16_t)result;
@@ -1077,26 +1401,28 @@ static esp_err_t stream_resources_alloc(uac2_iface_t *iface,
     iface->sub_slot_size = as->sub_slot_size;
     iface->ep_addr = as->ep_addr;
     iface->ep_mps = as->ep_max_packet_size;
+    iface->ep_sync_type = UAC2_EP_SYNC_TYPE(as->ep_attributes);
     iface->fb_ep_addr = as->fb_ep_addr;
     // Use atomic_store (not atomic_init) because the iface struct persists
     // across start/stop cycles. atomic_init on an already-initialized atomic is UB.
     atomic_store(&iface->fb_value, 0);
+    iface->nominal_fb = uac2_tx_nominal_q16(config->sample_freq);
     iface->fb_accumulator = 0;
     atomic_store(&iface->urbs_in_flight, 0);
     atomic_store(&iface->consecutive_errors, 0);
-    atomic_store(&iface->user_task_blocked, false);
+    atomic_store(&iface->fb_consecutive_errors, 0);
     atomic_store(&iface->first_frame_us, 0);
     atomic_store(&iface->tx_done_pending, false);
-
-    iface->user_task_done = xSemaphoreCreateBinary();
-    if (!iface->user_task_done) return ESP_ERR_NO_MEM;
+    iface->log_skipped_pkts = 0;
+    iface->log_error_pkts = 0;
+    iface->log_dropped_bytes = 0;
+    iface->log_failed_urbs = 0;
+    iface->last_issue_log_us = 0;
 
     iface->packet_size = calc_packet_size(config->sample_freq,
                                           as->nr_channels, as->sub_slot_size);
     if (iface->packet_size == 0 || iface->packet_size > iface->ep_mps) {
         ESP_LOGE(TAG, "Packet size %d invalid (MPS %d)", iface->packet_size, iface->ep_mps);
-        vSemaphoreDelete(iface->user_task_done);
-        iface->user_task_done = NULL;
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -1113,8 +1439,6 @@ static esp_err_t stream_resources_alloc(uac2_iface_t *iface,
 
     iface->ringbuf = xRingbufferCreate(rb_size, RINGBUF_TYPE_BYTEBUF);
     if (!iface->ringbuf) {
-        vSemaphoreDelete(iface->user_task_done);
-        iface->user_task_done = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1130,29 +1454,69 @@ static esp_err_t stream_resources_alloc(uac2_iface_t *iface,
                 usb_host_transfer_free(iface->xfer[j]);
                 iface->xfer[j] = NULL;
             }
+            iface->xfer_count = 0;  // or stream_has_resources() keeps the interface "busy"
             vRingbufferDelete(iface->ringbuf);
             iface->ringbuf = NULL;
-            vSemaphoreDelete(iface->user_task_done);
-            iface->user_task_done = NULL;
             return err;
         }
         iface->xfer_count = i + 1;
     }
 
-    // Feedback URB
+    // Feedback URB. An async endpoint without feedback would slowly drift
+    // against the device clock, so failing to allocate it fails the start.
     if (iface->fb_ep_addr != 0 && iface->dir == UAC2_STREAM_TX) {
         esp_err_t err = usb_host_transfer_alloc(4, 1, &iface->fb_xfer);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to allocate feedback URB: %s", esp_err_to_name(err));
-            iface->fb_ep_addr = 0;
+            ESP_LOGE(TAG, "Failed to allocate feedback URB: %s", esp_err_to_name(err));
+            for (int i = 0; i < iface->xfer_count; i++) {
+                usb_host_transfer_free(iface->xfer[i]);
+                iface->xfer[i] = NULL;
+            }
+            iface->xfer_count = 0;
+            vRingbufferDelete(iface->ringbuf);
+            iface->ringbuf = NULL;
+            return err;
         }
     }
 
     return ESP_OK;
 }
 
-static void stream_resources_free(uac2_iface_t *iface)
+/**
+ * Wake any task blocked in device_write/device_read and wait for it to leave.
+ * The caller must already have moved the stream out of ACTIVE, so callers that
+ * arrive later bail out before touching the ring buffer.
+ */
+static esp_err_t wait_for_rw_users_drained(uac2_iface_t *iface, uint32_t timeout_ms,
+                                           const char *stage)
 {
+    TickType_t start = xTaskGetTickCount();
+    while (atomic_load(&iface->rw_users) > 0) {
+        if (iface->ringbuf) {
+            if (iface->dir == UAC2_STREAM_TX) {
+                stream_flush_ringbuf(iface);    // make room for a blocked writer
+            } else {
+                uint8_t dummy = 0;
+                xRingbufferSend(iface->ringbuf, &dummy, 1, 0);  // wake a blocked reader
+            }
+        }
+        if ((xTaskGetTickCount() - start) >= pdMS_TO_TICKS(timeout_ms)) {
+            ESP_LOGE(TAG, "%s: %u read/write callers still active after %" PRIu32 "ms — retaining ring buffer",
+                     stage, (unsigned)atomic_load(&iface->rw_users), timeout_ms);
+            return ESP_ERR_TIMEOUT;
+        }
+        poll_delay();
+    }
+    return ESP_OK;
+}
+
+static esp_err_t stream_resources_free(uac2_iface_t *iface)
+{
+    esp_err_t err = wait_for_rw_users_drained(iface, 2000, "Stream free");
+    if (err != ESP_OK) {
+        return err;
+    }
+
     for (int i = 0; i < iface->xfer_count; i++) {
         if (iface->xfer[i]) {
             usb_host_transfer_free(iface->xfer[i]);
@@ -1167,29 +1531,10 @@ static void stream_resources_free(uac2_iface_t *iface)
     }
 
     if (iface->ringbuf) {
-        // Unblock any task waiting on the ringbuffer
-        if (iface->dir == UAC2_STREAM_TX) {
-            size_t item_size;
-            void *item;
-            while ((item = xRingbufferReceiveUpTo(iface->ringbuf, &item_size, 0,
-                                                   iface->ringbuf_size)) != NULL) {
-                vRingbufferReturnItem(iface->ringbuf, item);
-            }
-        } else {
-            uint8_t dummy = 0;
-            xRingbufferSend(iface->ringbuf, &dummy, 1, 0);
-        }
-        if (atomic_load(&iface->user_task_blocked)) {
-            xSemaphoreTake(iface->user_task_done, pdMS_TO_TICKS(200));
-        }
         vRingbufferDelete(iface->ringbuf);
         iface->ringbuf = NULL;
     }
-
-    if (iface->user_task_done) {
-        vSemaphoreDelete(iface->user_task_done);
-        iface->user_task_done = NULL;
-    }
+    return ESP_OK;
 }
 
 static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
@@ -1201,6 +1546,10 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
     iface->state = UAC2_IFACE_STATE_ACTIVE;
     portEXIT_CRITICAL(&iface->state_lock);
 
+    // Prepare every URB before submitting any: a completed TX URB's callback
+    // advances fb_accumulator, which the silent packets below also use.
+    uint32_t frame_bytes = (uint32_t)iface->channels * iface->sub_slot_size;
+    uint32_t max_samples = frame_bytes ? iface->ep_mps / frame_bytes : 0;
     for (int i = 0; i < iface->xfer_count; i++) {
         usb_transfer_t *xfer = iface->xfer[i];
         xfer->device_handle = dev->dev_hdl;
@@ -1209,12 +1558,20 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
         xfer->timeout_ms = 0;
 
         if (iface->dir == UAC2_STREAM_TX) {
+            // Silence, sized like stream_tx_xfer_submit() so a fractional
+            // rate (44.1 kHz) does not start with rounded-up packets
             xfer->callback = stream_tx_xfer_done;
-            memset(xfer->data_buffer, 0, iface->packet_size * num_pkts);
-            xfer->num_bytes = iface->packet_size * num_pkts;
+            int total = 0;
             for (int j = 0; j < num_pkts; j++) {
-                xfer->isoc_packet_desc[j].num_bytes = iface->packet_size;
+                int pkt_size = iface->packet_size;
+                if (iface->sample_rate != 0 && max_samples != 0) {
+                    pkt_size = (int)(tx_next_packet_samples(iface, max_samples) * frame_bytes);
+                }
+                xfer->isoc_packet_desc[j].num_bytes = pkt_size;
+                total += pkt_size;
             }
+            memset(xfer->data_buffer, 0, total);
+            xfer->num_bytes = total;
         } else {
             xfer->callback = stream_rx_xfer_done;
             xfer->num_bytes = iface->ep_mps * num_pkts;
@@ -1222,7 +1579,10 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
                 xfer->isoc_packet_desc[j].num_bytes = iface->ep_mps;
             }
         }
+    }
 
+    for (int i = 0; i < iface->xfer_count; i++) {
+        usb_transfer_t *xfer = iface->xfer[i];
         atomic_fetch_add(&iface->urbs_in_flight, 1);
         esp_err_t err = usb_host_transfer_submit(xfer);
         if (err != ESP_OK) {
@@ -1250,7 +1610,8 @@ static esp_err_t stream_submit_urbs(uac2_iface_t *iface)
         esp_err_t err = usb_host_transfer_submit(fb);
         if (err != ESP_OK) {
             atomic_fetch_sub(&iface->urbs_in_flight, 1);
-            ESP_LOGW(TAG, "Feedback URB submit failed: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "Feedback URB submit failed: %s", esp_err_to_name(err));
+            return err;     // caller rolls back the data URBs already submitted
         }
     }
 
@@ -1275,6 +1636,12 @@ static esp_err_t stream_abort_startup(uac2_iface_t *iface)
         }
     }
 
+    // Submitted URBs complete without resubmitting once the state is IDLE
+    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Startup abort", true);
+    if (wait_err != ESP_OK) {
+        return wait_err;
+    }
+
     if (iface->interface_claimed) {
         esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
         if (rel_err != ESP_OK) {
@@ -1286,12 +1653,10 @@ static esp_err_t stream_abort_startup(uac2_iface_t *iface)
         iface->interface_claimed = false;
     }
 
-    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Startup abort", true);
-    if (wait_err != ESP_OK) {
-        return wait_err;
+    esp_err_t free_err = stream_resources_free(iface);
+    if (free_err != ESP_OK) {
+        return free_err;
     }
-
-    stream_resources_free(iface);
     portENTER_CRITICAL(&iface->state_lock);
     iface->state = UAC2_IFACE_STATE_IDLE;
     portEXIT_CRITICAL(&iface->state_lock);
@@ -1324,6 +1689,7 @@ static void stream_flush_ringbuf(uac2_iface_t *iface)
 static void stream_reset_runtime_state(uac2_iface_t *iface)
 {
     atomic_store(&iface->consecutive_errors, 0);
+    atomic_store(&iface->fb_consecutive_errors, 0);
     atomic_store(&iface->fb_value, 0);
     iface->fb_accumulator = 0;
     atomic_store(&iface->first_frame_us, 0);
@@ -1335,6 +1701,9 @@ static esp_err_t resume_rollback_to_ready(uac2_iface_t *iface,
                                           const char *stage)
 {
     esp_err_t cleanup_err = stream_deactivate(iface);
+    if (cleanup_err == ESP_OK) {
+        cleanup_err = wait_for_rw_users_drained(iface, 2000, "Resume rollback");
+    }
     if (cleanup_err == ESP_OK) {
         stream_flush_ringbuf(iface);
         stream_reset_runtime_state(iface);
@@ -1639,9 +2008,13 @@ static esp_err_t ensure_sample_rate_applied(uac2_device_t *dev, uint32_t sample_
 {
     ESP_RETURN_ON_FALSE(dev, ESP_ERR_INVALID_ARG, TAG, "Invalid device");
 
-    validate_sample_rate(dev, sample_rate);
-    esp_err_t err = set_sample_rate_internal(dev, sample_rate);
+    esp_err_t err = validate_sample_rate(dev, sample_rate);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = set_sample_rate_internal(dev, sample_rate);
     if (err == ESP_OK) {
+        warn_if_rate_not_applied(dev, sample_rate);
         return ESP_OK;
     }
 
@@ -1664,24 +2037,32 @@ static esp_err_t ensure_sample_rate_applied(uac2_device_t *dev, uint32_t sample_
     return read_err;
 }
 
-static void validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate)
+/**
+ * Check sample_rate against the clock's advertised RANGE, honouring each
+ * range's resolution. A device may acknowledge a rate it cannot run and play
+ * silence, so a rate the device does not list is refused (unless
+ * CONFIG_UAC2_ALLOW_UNADVERTISED_RATES). If the list cannot be read, or has more
+ * ranges than were read, the device gets the benefit of the doubt.
+ */
+static esp_err_t validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate)
 {
-    if (dev->clock_source_id == 0) return;
+    if (dev->clock_source_id == 0) return ESP_OK;
 
     uint8_t buf[2 + UAC2_MAX_SAMPLE_RATE_RANGES * 12];
     uint16_t actual_len = 0;
     memset(buf, 0, sizeof(buf));
     esp_err_t err = ctrl_get_range(dev, dev->clock_source_id,
                                    UAC2_CS_SAM_FREQ_CONTROL, 0, buf, sizeof(buf), &actual_len);
-    if (err != ESP_OK) return;
+    if (err != ESP_OK) return ESP_OK;
 
-    uint16_t count = buf[0] | (buf[1] << 8);
+    uint16_t advertised = buf[0] | (buf[1] << 8);
+    uint16_t count = advertised;
     if (count > UAC2_MAX_SAMPLE_RATE_RANGES) count = UAC2_MAX_SAMPLE_RATE_RANGES;
-    if (count == 0) return;
+    if (count == 0) return ESP_OK;
 
     err = validate_range_payload_len("Sample-rate RANGE", actual_len, count,
                                      UAC2_MAX_SAMPLE_RATE_RANGES, 12);
-    if (err != ESP_OK) return;
+    if (err != ESP_OK) return ESP_OK;
 
     for (int i = 0; i < count; i++) {
         const uint8_t *p = buf + 2 + (i * 12);
@@ -1689,14 +2070,56 @@ static void validate_sample_rate(uac2_device_t *dev, uint32_t sample_rate)
                      | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
         uint32_t max = (uint32_t)p[4] | ((uint32_t)p[5] << 8)
                      | ((uint32_t)p[6] << 16) | ((uint32_t)p[7] << 24);
+        uint32_t res = (uint32_t)p[8] | ((uint32_t)p[9] << 8)
+                     | ((uint32_t)p[10] << 16) | ((uint32_t)p[11] << 24);
         if (min == max) {
-            if (sample_rate == min) return;
-        } else {
-            if (sample_rate >= min && sample_rate <= max) return;
+            if (sample_rate == min) return ESP_OK;
+        } else if (sample_rate >= min && sample_rate <= max &&
+                   (res == 0 || (sample_rate - min) % res == 0)) {
+            return ESP_OK;
         }
     }
+    if (advertised > count) {
+        // Only the first UAC2_MAX_SAMPLE_RATE_RANGES were read: no proof of exclusion
+        ESP_LOGW(TAG, "Sample rate %" PRIu32 " Hz not in the first %u of %u advertised ranges "
+                 "(continuing)", sample_rate, (unsigned)count, (unsigned)advertised);
+        return ESP_OK;
+    }
+#if CONFIG_UAC2_ALLOW_UNADVERTISED_RATES
     ESP_LOGW(TAG, "Sample rate %" PRIu32 " Hz not in device's advertised ranges "
-             "(continuing — some devices accept non-advertised rates)", sample_rate);
+             "(continuing: CONFIG_UAC2_ALLOW_UNADVERTISED_RATES)", sample_rate);
+    return ESP_OK;
+#else
+    ESP_LOGE(TAG, "Sample rate %" PRIu32 " Hz is not in the device's advertised ranges",
+             sample_rate);
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+/** Whether the resolved clock source's frequency control can be read (bmControls D1..0). */
+static bool clock_freq_readable(const uac2_device_t *dev)
+{
+    const uac2_device_info_t *info = &dev->desc_info;
+    for (int i = 0; i < info->num_clock_sources; i++) {
+        if (info->clock_sources[i].clock_id == dev->clock_source_id) {
+            return (info->clock_sources[i].controls & 0x03) != 0;
+        }
+    }
+    return false;
+}
+
+/**
+ * Read the clock back after a successful SET. A mismatch is only logged: some
+ * devices report a new rate only after a delay, so (like Linux) keep going.
+ */
+static void warn_if_rate_not_applied(uac2_device_t *dev, uint32_t sample_rate)
+{
+    if (!clock_freq_readable(dev)) return;
+    uint32_t current_rate = 0;
+    if (read_current_sample_rate(dev, &current_rate) == ESP_OK && current_rate != sample_rate) {
+        ESP_LOGW(TAG, "Device acknowledged %" PRIu32 " Hz but its clock reports %" PRIu32 " Hz",
+                 sample_rate, current_rate);
+    }
 }
 
 // ── String conversion ─────────────────────────────────────────────
@@ -1791,35 +2214,40 @@ static esp_err_t uac2_host_device_connected(uint8_t addr)
 
 static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
 {
-    uac2_device_t *dev = get_device_by_handle(dev_hdl);
-    if (!dev) return ESP_OK;  // Not a UAC2 device we track
-
-    // Cache addr before publishing gone=true. device_open() may tear down a
-    // provisional device immediately after seeing dev->gone, so avoid touching
-    // dev again after this point.
-    uint8_t dev_addr = dev->addr;
-
-    // Mark device as gone — stream_stop_internal will skip SET_INTERFACE and endpoint ops
-    atomic_store(&dev->gone, true);
-
-    // Collect interfaces to notify (don't modify the list during iteration)
     uac2_iface_t *to_notify[UAC2_MAX_AS_INTERFACES];
     int notify_count = 0;
+    uint8_t dev_addr = 0;
 
+    // Find the device, mark it gone, and take a reference on each of its
+    // interfaces in one critical section. device_destroy() and device_close()
+    // unlink under the same lock, and close only unlinks an interface with no
+    // references, so nothing collected here can be freed until it is released
+    // below. The device itself is not touched after the critical section.
     UAC2_ENTER_CRITICAL();
-    uac2_iface_t *iface;
-    STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
-        if (iface->parent && iface->parent->addr == dev_addr) {
-            if (notify_count < UAC2_MAX_AS_INTERFACES) {
+    uac2_device_t *dev = NULL;
+    STAILQ_FOREACH(dev, &s_uac2_driver->devices_tailq, tailq_entry) {
+        if (dev->dev_hdl == dev_hdl) {
+            break;
+        }
+    }
+    if (dev) {
+        dev_addr = dev->addr;
+        // stream_stop_internal skips SET_INTERFACE and endpoint ops once gone
+        atomic_store(&dev->gone, true);
+        uac2_iface_t *iface;
+        STAILQ_FOREACH(iface, &s_uac2_driver->ifaces_tailq, tailq_entry) {
+            if (iface->parent == dev && notify_count < UAC2_MAX_AS_INTERFACES) {
+                atomic_fetch_add(&iface->io_users, 1);
                 to_notify[notify_count++] = iface;
             }
         }
     }
     UAC2_EXIT_CRITICAL();
+    if (!dev) return ESP_OK;  // Not a UAC2 device we track
+    scan_forget_addr(dev_addr);
 
-    // Process each interface outside the critical section
     for (int i = 0; i < notify_count; i++) {
-        iface = to_notify[i];
+        uac2_iface_t *iface = to_notify[i];
 
         // Stop active stream — callbacks see IDLE and stop resubmitting
         portENTER_CRITICAL(&iface->state_lock);
@@ -1839,6 +2267,7 @@ static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
                          "call uac2_host_device_close() to free resources", dev_addr, iface->iface_num);
             }
         }
+        release_iface_io_ref(iface);
     }
 
     return ESP_OK;
@@ -1847,6 +2276,11 @@ static esp_err_t uac2_host_device_disconnected(usb_device_handle_t dev_hdl)
 static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
 {
     if (event->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+        if (consume_scan_duplicate(event->new_dev.address)) {
+            ESP_LOGD(TAG, "NEW_DEV addr %d already reported by install-time scan",
+                     event->new_dev.address);
+            return;
+        }
         uac2_host_device_connected(event->new_dev.address);
     } else if (event->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
         uac2_host_device_disconnected(event->dev_gone.dev_hdl);
@@ -1855,19 +2289,187 @@ static void client_event_cb(const usb_host_client_event_msg_t *event, void *arg)
 
 // ── Event handler task ────────────────────────────────────────────
 
+static esp_err_t handle_events_for(uac2_driver_t *expected, TickType_t timeout);
+
 static void event_handler_task(void *arg)
 {
+    // Bound to the installation that created it. Uninstall waits for
+    // event_task_done before freeing that driver, so the give is safe.
+    uac2_driver_t *driver = (uac2_driver_t *)arg;
     ESP_LOGD(TAG, "UAC2 event handling start");
-    while (uac2_host_handle_events(portMAX_DELAY) == ESP_OK) {
+    while (handle_events_for(driver, portMAX_DELAY) == ESP_OK) {
     }
     ESP_LOGD(TAG, "UAC2 event handling stop");
+    xSemaphoreGive(driver->event_task_done);
     vTaskDelete(NULL);
 }
 
 // ── Physical device management (internal) ─────────────────────────
 
+/**
+ * Hand dev's in-flight control URB, its completion semaphore and the USB
+ * device handle to the driver; the device stays open until reclaimed.
+ */
+static void orphan_ctrl_xfer(uac2_device_t *dev)
+{
+    uac2_orphaned_ctrl_t *node = dev->orphan_node;
+    dev->orphan_node = NULL;
+    node->xfer = dev->ctrl_xfer;
+    node->done = dev->ctrl_xfer_done;
+    node->dev_hdl = dev->dev_hdl;
+    node->addr = dev->addr;
+    UAC2_ENTER_CRITICAL();
+    STAILQ_INSERT_TAIL(&s_uac2_driver->orphans_tailq, node, tailq_entry);
+    UAC2_EXIT_CRITICAL();
+    // The URB may have completed, and the event task run its reclaim pass,
+    // since device_destroy() saw it pending. Wake the task so the next pass
+    // sees this node instead of waiting for an unrelated USB event.
+    usb_host_client_unblock(s_uac2_driver->client_handle);
+    // node may already be reclaimed and freed by the event task here
+    ESP_LOGW(TAG, "Control transfer still in flight at close of addr %d — keeping the device "
+             "open until it completes (device responds or is unplugged)", dev->addr);
+}
+
+static bool addr_has_orphaned_ctrl(uint8_t addr)
+{
+    bool found = false;
+    UAC2_ENTER_CRITICAL();
+    uac2_orphaned_ctrl_t *node;
+    STAILQ_FOREACH(node, &s_uac2_driver->orphans_tailq, tailq_entry) {
+        if (node->addr == addr) {
+            found = true;
+            break;
+        }
+    }
+    UAC2_EXIT_CRITICAL();
+    return found;
+}
+
+/**
+ * Drop this client's handle to a device that has carried control transfers.
+ *
+ * The in-tree USB Host Library of ESP-IDF 5.x hands a control completion to
+ * the client before decrementing the device's in-flight count (usbh.c
+ * handle_ep0_dequeue), and usbh_dev_close() asserts that count is 0 when the
+ * last handle closes. A client or caller task with higher priority than the
+ * USB Host library task can therefore get here before that bookkeeping runs.
+ * Blocking briefly lets the library task finish it. espressif/usb >= 1.6.0,
+ * which the manifest requires on IDF 6.x, retires the transfer first.
+ */
+static void close_device_after_ctrl(usb_device_handle_t dev_hdl)
+{
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+    vTaskDelay(pdMS_TO_TICKS(10) > 0 ? pdMS_TO_TICKS(10) : 1);
+#endif
+    usb_host_device_close(s_uac2_driver->client_handle, dev_hdl);
+}
+
+/**
+ * Free orphaned control URBs whose completion has been delivered. Runs on the
+ * event task right after usb_host_client_handle_events(), so any callback for
+ * these URBs has already returned. Only this function removes entries;
+ * device_destroy() only appends.
+ */
+static void reclaim_orphaned_ctrl_xfers(void)
+{
+    uac2_driver_t *driver = s_uac2_driver;
+    UAC2_ENTER_CRITICAL();
+    uac2_orphaned_ctrl_t *node = STAILQ_FIRST(&driver->orphans_tailq);
+    UAC2_EXIT_CRITICAL();
+    while (node) {
+        // Nodes are appended concurrently but only freed here, so node and
+        // its successor stay valid across the unlocked section.
+        UAC2_ENTER_CRITICAL();
+        uac2_orphaned_ctrl_t *next = STAILQ_NEXT(node, tailq_entry);
+        UAC2_EXIT_CRITICAL();
+
+        if (xSemaphoreTake(node->done, 0) == pdTRUE) {
+            UAC2_ENTER_CRITICAL();
+            STAILQ_REMOVE(&driver->orphans_tailq, node, uac2_orphaned_ctrl, tailq_entry);
+            UAC2_EXIT_CRITICAL();
+            usb_host_transfer_free(node->xfer);
+            vSemaphoreDelete(node->done);
+            close_device_after_ctrl(node->dev_hdl);
+            ESP_LOGI(TAG, "Reclaimed orphaned control transfer, addr %d closed", node->addr);
+            heap_caps_free(node);
+        }
+        node = next;
+    }
+}
+
+/**
+ * Report devices that finished enumerating before this client registered.
+ * USB Host only sends NEW_DEV to clients registered at the time, so without
+ * this a driver (re)installed while a device stays attached never sees it.
+ */
+static void scan_attached_devices(void)
+{
+    uac2_driver_t *driver = s_uac2_driver;
+    uint8_t addrs[UAC2_SCAN_MAX_DEVICES];
+    int count = 0;
+    if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &count) != ESP_OK) {
+        return;
+    }
+    if (count > UAC2_SCAN_MAX_DEVICES) {
+        count = UAC2_SCAN_MAX_DEVICES;
+    }
+
+    driver->scan_dedup_count = 0;
+    driver->scan_dedup_start = xTaskGetTickCount();
+    for (int i = 0; i < count; i++) {
+        driver->scan_dedup_addrs[driver->scan_dedup_count++] = addrs[i];
+        ESP_LOGD(TAG, "Already-attached device at addr %d", addrs[i]);
+        uac2_host_device_connected(addrs[i]);
+    }
+}
+
+/**
+ * A device that finished enumerating just after this client registered shows
+ * up in the install-time scan and also produces a NEW_DEV event. Drop that
+ * duplicate so the user callback fires once per interface. Matching by
+ * address is safe: ESP-IDF assigns addresses round-robin up to 127 (enum.c
+ * get_next_dev_addr), so a re-enumerated device never reuses its address
+ * within the window; scan_forget_addr() also drops it on DEV_GONE.
+ */
+static bool consume_scan_duplicate(uint8_t addr)
+{
+    uac2_driver_t *driver = s_uac2_driver;
+    if (driver->scan_dedup_count == 0) {
+        return false;
+    }
+    if ((xTaskGetTickCount() - driver->scan_dedup_start) > pdMS_TO_TICKS(UAC2_SCAN_DEDUP_WINDOW_MS)) {
+        driver->scan_dedup_count = 0;
+        return false;
+    }
+    for (int i = 0; i < driver->scan_dedup_count; i++) {
+        if (driver->scan_dedup_addrs[i] == addr) {
+            driver->scan_dedup_addrs[i] = driver->scan_dedup_addrs[--driver->scan_dedup_count];
+            return true;
+        }
+    }
+    return false;
+}
+
+/** A scanned device that went away cannot produce the duplicate NEW_DEV. Event task only. */
+static void scan_forget_addr(uint8_t addr)
+{
+    uac2_driver_t *driver = s_uac2_driver;
+    for (int i = 0; i < driver->scan_dedup_count; i++) {
+        if (driver->scan_dedup_addrs[i] == addr) {
+            driver->scan_dedup_addrs[i] = driver->scan_dedup_addrs[--driver->scan_dedup_count];
+            return;
+        }
+    }
+}
+
 static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
 {
+    if (addr_has_orphaned_ctrl(addr)) {
+        ESP_LOGE(TAG, "Device addr %d still has a timed-out control transfer pending; "
+                 "it cannot be reopened until it responds or is replugged", addr);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     uac2_device_t *dev = heap_caps_calloc(1, sizeof(uac2_device_t), MALLOC_CAP_DEFAULT);
     if (!dev) {
         return ESP_ERR_NO_MEM;
@@ -1935,6 +2537,8 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     dev->clock_source_id = resolve_clock_source(&dev->desc_info);
 
     // Allocate control transfer
+    dev->orphan_node = heap_caps_calloc(1, sizeof(uac2_orphaned_ctrl_t), MALLOC_CAP_DEFAULT);
+    if (!dev->orphan_node) { err = ESP_ERR_NO_MEM; goto fail; }
     err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + UAC2_CTRL_XFER_MAX_SIZE,
                                   0, &dev->ctrl_xfer);
     if (err != ESP_OK) goto fail;
@@ -1945,8 +2549,8 @@ static esp_err_t device_create(uint8_t addr, uac2_device_t **out_dev)
     dev->ctrl_mutex = xSemaphoreCreateMutex();
     if (!dev->ctrl_mutex) { err = ESP_ERR_NO_MEM; goto fail; }
 
-    atomic_init(&dev->ctrl_xfer_gen, 0);
-    atomic_init(&dev->ctrl_xfer_submitted_gen, 0);
+    dev->stream_mutex = xSemaphoreCreateMutex();
+    if (!dev->stream_mutex) { err = ESP_ERR_NO_MEM; goto fail; }
 
     ESP_LOGI(TAG, "UAC2 device opened: addr=%d VID=0x%04X PID=0x%04X \"%s\"",
              addr, dev->desc_info.vid, dev->desc_info.pid,
@@ -1969,16 +2573,30 @@ static void device_destroy(uac2_device_t *dev)
     // Wait for any in-progress control request to complete.
     // After this, no new ctrl_request can arrive because all interfaces are closed
     // (callers hold api_mutex on an interface, and all interfaces are removed from the list).
+    // ctrl_request always releases the mutex within its own bounded timeouts.
+    bool ctrl_in_flight = false;
     if (dev->ctrl_mutex) {
-        xSemaphoreTake(dev->ctrl_mutex, pdMS_TO_TICKS(UAC2_CTRL_XFER_TIMEOUT_MS));
+        xSemaphoreTake(dev->ctrl_mutex, portMAX_DELAY);
+        ctrl_in_flight = dev->ctrl_xfer_abandoned &&
+                         xSemaphoreTake(dev->ctrl_xfer_done, 0) != pdTRUE;
         xSemaphoreGive(dev->ctrl_mutex);
     }
 
-    if (dev->ctrl_xfer) usb_host_transfer_free(dev->ctrl_xfer);
-    if (dev->ctrl_xfer_done) vSemaphoreDelete(dev->ctrl_xfer_done);
     if (dev->ctrl_mutex) vSemaphoreDelete(dev->ctrl_mutex);
+    if (dev->stream_mutex) vSemaphoreDelete(dev->stream_mutex);
 
-    usb_host_device_close(s_uac2_driver->client_handle, dev->dev_hdl);
+    if (ctrl_in_flight) {
+        // A timed-out control URB is still owned by the host stack. Freeing it
+        // now would let its late completion touch freed memory, and closing the
+        // device with it in flight trips an ESP-IDF assert. Hand both to the
+        // driver to release on the event task once the URB completes.
+        orphan_ctrl_xfer(dev);
+    } else {
+        if (dev->ctrl_xfer) usb_host_transfer_free(dev->ctrl_xfer);
+        if (dev->ctrl_xfer_done) vSemaphoreDelete(dev->ctrl_xfer_done);
+        close_device_after_ctrl(dev->dev_hdl);
+    }
+    if (dev->orphan_node) heap_caps_free(dev->orphan_node);
     ESP_LOGI(TAG, "Physical device addr %d closed", dev->addr);
     heap_caps_free(dev);
 }
@@ -1987,7 +2605,6 @@ static void device_destroy(uac2_device_t *dev)
 
 esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
 {
-    ESP_RETURN_ON_FALSE(!s_uac2_driver, ESP_ERR_INVALID_STATE, TAG, "UAC2 driver already installed");
     ESP_RETURN_ON_FALSE(config, ESP_ERR_INVALID_ARG, TAG, "Config is NULL");
     ESP_RETURN_ON_FALSE(config->callback, ESP_ERR_INVALID_ARG, TAG, "Callback is NULL");
 
@@ -1996,24 +2613,30 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
         ESP_RETURN_ON_FALSE(config->task_priority != 0, ESP_ERR_INVALID_ARG, TAG, "Wrong task priority");
     }
 
+    SemaphoreHandle_t lock = lifecycle_mutex();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (s_uac2_driver) {
+        xSemaphoreGive(lock);
+        ESP_LOGE(TAG, "UAC2 driver already installed");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t err = ESP_ERR_NO_MEM;
     uac2_driver_t *driver = heap_caps_calloc(1, sizeof(uac2_driver_t), MALLOC_CAP_DEFAULT);
-    ESP_RETURN_ON_FALSE(driver, ESP_ERR_NO_MEM, TAG, "Unable to allocate driver");
+    if (!driver) goto fail;
 
     driver->user_cb = config->callback;
     driver->user_arg = config->callback_arg;
     driver->end_client_event_handling = false;
+    STAILQ_INIT(&driver->devices_tailq);
+    STAILQ_INIT(&driver->ifaces_tailq);
+    STAILQ_INIT(&driver->orphans_tailq);
 
     driver->all_events_handled = xSemaphoreCreateBinary();
-    if (!driver->all_events_handled) {
-        heap_caps_free(driver);
-        return ESP_ERR_NO_MEM;
-    }
-
-    driver->lifecycle_mutex = xSemaphoreCreateMutex();
-    if (!driver->lifecycle_mutex) {
-        vSemaphoreDelete(driver->all_events_handled);
-        heap_caps_free(driver);
-        return ESP_ERR_NO_MEM;
+    if (!driver->all_events_handled) goto fail;
+    if (config->create_background_task) {
+        driver->event_task_done = xSemaphoreCreateBinary();
+        if (!driver->event_task_done) goto fail;
     }
 
     usb_host_client_config_t client_config = {
@@ -2022,110 +2645,166 @@ esp_err_t uac2_host_install(const uac2_host_driver_config_t *config)
         .async.callback_arg = NULL,
         .max_num_event_msg = 16,
     };
-    esp_err_t err = usb_host_client_register(&client_config, &driver->client_handle);
+    err = usb_host_client_register(&client_config, &driver->client_handle);
     if (err != ESP_OK) {
-        vSemaphoreDelete(driver->lifecycle_mutex);
-        vSemaphoreDelete(driver->all_events_handled);
-        heap_caps_free(driver);
-        return err;
+        driver->client_handle = NULL;
+        goto fail;
     }
 
     UAC2_ENTER_CRITICAL();
     s_uac2_driver = driver;
-    STAILQ_INIT(&s_uac2_driver->devices_tailq);
-    STAILQ_INIT(&s_uac2_driver->ifaces_tailq);
     UAC2_EXIT_CRITICAL();
 
     if (config->create_background_task) {
         BaseType_t task_created = xTaskCreatePinnedToCore(
             event_handler_task, "uac2_host", config->stack_size,
-            NULL, config->task_priority, NULL, config->core_id);
+            driver, config->task_priority, NULL, config->core_id);
         if (!task_created) {
             UAC2_ENTER_CRITICAL();
             s_uac2_driver = NULL;
             UAC2_EXIT_CRITICAL();
-            usb_host_client_deregister(driver->client_handle);
-            vSemaphoreDelete(driver->lifecycle_mutex);
-            vSemaphoreDelete(driver->all_events_handled);
-            heap_caps_free(driver);
-            return ESP_ERR_NO_MEM;
+            err = ESP_ERR_NO_MEM;
+            goto fail;
         }
     }
 
+    xSemaphoreGive(lock);
     ESP_LOGI(TAG, "UAC2 Host driver installed, v%d.%d.%d",
              UAC2_HOST_VER_MAJOR, UAC2_HOST_VER_MINOR, UAC2_HOST_VER_PATCH);
     return ESP_OK;
+
+fail:
+    if (driver) {
+        if (driver->client_handle) usb_host_client_deregister(driver->client_handle);
+        if (driver->event_task_done) vSemaphoreDelete(driver->event_task_done);
+        if (driver->all_events_handled) vSemaphoreDelete(driver->all_events_handled);
+        heap_caps_free(driver);
+    }
+    xSemaphoreGive(lock);
+    return err;
 }
 
 esp_err_t uac2_host_uninstall(void)
 {
-    ESP_RETURN_ON_FALSE(s_uac2_driver, ESP_OK, TAG, "UAC2 driver not installed");
+    SemaphoreHandle_t lock = lifecycle_mutex();
+    xSemaphoreTake(lock, portMAX_DELAY);
+
     UAC2_ENTER_CRITICAL();
     uac2_driver_t *driver = s_uac2_driver;
-    bool uninstalling = driver && driver->end_client_event_handling;
-    UAC2_EXIT_CRITICAL();
-    if (!driver || uninstalling) {
-        return ESP_ERR_INVALID_STATE;
-    }
-
-    if (!driver->lifecycle_mutex ||
-        xSemaphoreTake(driver->lifecycle_mutex, portMAX_DELAY) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
-
-    UAC2_ENTER_CRITICAL();
-    if (driver != s_uac2_driver) {
+    if (!driver) {
         UAC2_EXIT_CRITICAL();
-        xSemaphoreGive(driver->lifecycle_mutex);
+        xSemaphoreGive(lock);
+        return ESP_OK;
+    }
+    if (driver->end_client_event_handling) {
+        // Another uninstall is already tearing this driver down.
+        UAC2_EXIT_CRITICAL();
+        xSemaphoreGive(lock);
         return ESP_ERR_INVALID_STATE;
     }
     if (!STAILQ_EMPTY(&driver->devices_tailq) ||
         !STAILQ_EMPTY(&driver->ifaces_tailq)) {
         UAC2_EXIT_CRITICAL();
-        xSemaphoreGive(driver->lifecycle_mutex);
+        xSemaphoreGive(lock);
         ESP_LOGE(TAG, "Cannot uninstall: devices/interfaces still open");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!STAILQ_EMPTY(&driver->orphans_tailq)) {
+        // Deregistering now would leave the host stack completing a URB for a
+        // client that no longer exists. The URB completes once the hung device
+        // answers or is disconnected.
+        UAC2_EXIT_CRITICAL();
+        xSemaphoreGive(lock);
+        ESP_LOGE(TAG, "Cannot uninstall: a timed-out control transfer is still pending");
+        return ESP_ERR_INVALID_STATE;
+    }
     driver->end_client_event_handling = true;
+    bool wait_for_events = driver->handling_events;
     UAC2_EXIT_CRITICAL();
-    xSemaphoreGive(driver->lifecycle_mutex);
+    // Released while waiting: driver callbacks run inside handle_events and
+    // may hand off to tasks that call open(), which now fails fast.
+    xSemaphoreGive(lock);
 
-    if (driver->event_handling_started) {
+    if (wait_for_events) {
         esp_err_t unblock_err = usb_host_client_unblock(driver->client_handle);
         if (unblock_err != ESP_OK) {
             ESP_LOGE(TAG, "client_unblock failed: %s", esp_err_to_name(unblock_err));
         }
         xSemaphoreTake(driver->all_events_handled, portMAX_DELAY);
     }
-    vSemaphoreDelete(driver->all_events_handled);
+    if (driver->event_task_done) {
+        // Even if it never got to run yet: its next call sees the end flag.
+        xSemaphoreTake(driver->event_task_done, portMAX_DELAY);
+    }
+
+    xSemaphoreTake(lock, portMAX_DELAY);
     esp_err_t dereg_err = usb_host_client_deregister(driver->client_handle);
     if (dereg_err != ESP_OK) {
         ESP_LOGE(TAG, "client_deregister failed: %s", esp_err_to_name(dereg_err));
     }
-    vSemaphoreDelete(driver->lifecycle_mutex);
     UAC2_ENTER_CRITICAL();
-    if (s_uac2_driver == driver) {
-        s_uac2_driver = NULL;
-    }
+    s_uac2_driver = NULL;
     UAC2_EXIT_CRITICAL();
+    xSemaphoreGive(lock);
+
+    if (driver->event_task_done) vSemaphoreDelete(driver->event_task_done);
+    vSemaphoreDelete(driver->all_events_handled);
     heap_caps_free(driver);
     ESP_LOGI(TAG, "UAC2 Host driver uninstalled");
     return ESP_OK;
 }
 
-esp_err_t uac2_host_handle_events(TickType_t timeout)
+/**
+ * One event-pump iteration. With expected != NULL (the background task) it
+ * only runs for that installation. The driver pointer is read and the call
+ * registered under the static lock, so a call racing uninstall is either
+ * waited for or never touches the driver.
+ */
+static esp_err_t handle_events_for(uac2_driver_t *expected, TickType_t timeout)
 {
-    ESP_RETURN_ON_FALSE(s_uac2_driver, ESP_ERR_INVALID_STATE, TAG, "UAC2 driver not installed");
-    s_uac2_driver->event_handling_started = true;
-    esp_err_t ret = usb_host_client_handle_events(s_uac2_driver->client_handle, timeout);
     UAC2_ENTER_CRITICAL();
-    if (s_uac2_driver->end_client_event_handling) {
+    uac2_driver_t *driver = s_uac2_driver;
+    if (!driver || (expected && driver != expected)) {
         UAC2_EXIT_CRITICAL();
-        xSemaphoreGive(s_uac2_driver->all_events_handled);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (driver->end_client_event_handling) {
+        UAC2_EXIT_CRITICAL();
         return ESP_FAIL;
     }
+    if (driver->handling_events) {
+        // usb_host_client_handle_events() supports one caller per client
+        UAC2_EXIT_CRITICAL();
+        return ESP_ERR_INVALID_STATE;
+    }
+    driver->handling_events = true;
+    bool scan = !driver->initial_scan_done;
+    driver->initial_scan_done = true;
     UAC2_EXIT_CRITICAL();
+
+    if (scan) {
+        // Done here rather than in install so driver callbacks for already-
+        // attached devices run in the same context as NEW_DEV callbacks.
+        scan_attached_devices();
+    }
+    esp_err_t ret = usb_host_client_handle_events(driver->client_handle, timeout);
+    reclaim_orphaned_ctrl_xfers();
+
+    UAC2_ENTER_CRITICAL();
+    bool ending = driver->end_client_event_handling;
+    driver->handling_events = false;
+    UAC2_EXIT_CRITICAL();
+    if (ending) {
+        // The end flag was set while this call ran, so uninstall is waiting.
+        xSemaphoreGive(driver->all_events_handled);
+        return ESP_FAIL;
+    }
     return ret;
+}
+
+esp_err_t uac2_host_handle_events(TickType_t timeout)
+{
+    return handle_events_for(NULL, timeout);
 }
 
 // ── Public API: Device management ─────────────────────────────────
@@ -2330,22 +3009,15 @@ esp_err_t uac2_host_device_close(uac2_host_device_handle_t handle)
         return stop_err;
     }
 
-    esp_err_t io_err = wait_for_iface_io_quiesced(iface, pdMS_TO_TICKS(2000));
+    uac2_device_t *dev = iface->parent;
+    uint8_t remaining = 0;
+    esp_err_t io_err = unlink_iface_when_unreferenced(iface, pdMS_TO_TICKS(2000), &remaining);
     if (io_err != ESP_OK) {
         ESP_LOGE(TAG, "device_close: timed out waiting for pending I/O");
         atomic_store(&iface->closing, false);
         driver_lifecycle_unlock();
         return io_err;
     }
-
-    uac2_device_t *dev = iface->parent;
-
-    // Remove interface from list
-    UAC2_ENTER_CRITICAL();
-    STAILQ_REMOVE(&s_uac2_driver->ifaces_tailq, iface, uac2_interface, tailq_entry);
-    dev->opened_cnt--;
-    uint8_t remaining = dev->opened_cnt;
-    UAC2_EXIT_CRITICAL();
 
     if (iface->api_mutex) vSemaphoreDelete(iface->api_mutex);
     ESP_LOGI(TAG, "Closed interface addr=%d iface=%d (device refs=%d)",
@@ -2437,7 +3109,24 @@ esp_err_t uac2_host_device_set_sample_rate(uac2_host_device_handle_t handle,
         release_locked_iface(iface);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    ret = set_sample_rate_internal(dev, sample_rate);
+    // The clock is shared by every interface on the device, and a running or
+    // suspended stream sizes its packets from the rate it was started with.
+    // stream_mutex keeps a sibling from starting between the check and the SET.
+    xSemaphoreTake(dev->stream_mutex, portMAX_DELAY);
+    if (device_has_stream(dev)) {
+        ESP_LOGE(TAG, "Stop streams on this device before changing the sample rate "
+                 "(device_start applies the stream's sample_freq)");
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        ret = validate_sample_rate(dev, sample_rate);
+        if (ret == ESP_OK) {
+            ret = set_sample_rate_internal(dev, sample_rate);
+        }
+        if (ret == ESP_OK) {
+            warn_if_rate_not_applied(dev, sample_rate);
+        }
+    }
+    xSemaphoreGive(dev->stream_mutex);
     release_locked_iface(iface);
     return ret;
 }
@@ -2447,6 +3136,7 @@ esp_err_t uac2_host_device_get_sample_rate_range(uac2_host_device_handle_t handl
                                                  uint8_t *num_ranges)
 {
     ESP_RETURN_ON_FALSE(handle && ranges && num_ranges, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+    uint8_t capacity = *num_ranges ? *num_ranges : UAC2_MAX_SAMPLE_RATE_RANGES;
     uac2_iface_t *iface = NULL;
     esp_err_t ret = acquire_locked_iface(handle, &iface);
     ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
@@ -2474,6 +3164,11 @@ esp_err_t uac2_host_device_get_sample_rate_range(uac2_host_device_handle_t handl
         return ret;
     }
     if (count > UAC2_MAX_SAMPLE_RATE_RANGES) count = UAC2_MAX_SAMPLE_RATE_RANGES;
+    if (count > capacity) {
+        ESP_LOGW(TAG, "Device reports %u sample-rate ranges, caller has room for %u",
+                 (unsigned)count, (unsigned)capacity);
+        count = capacity;
+    }
 
     for (int i = 0; i < count; i++) {
         const uint8_t *p = buf + 2 + (i * 12);
@@ -2512,6 +3207,173 @@ esp_err_t uac2_host_device_get_clock_valid(uac2_host_device_handle_t handle, boo
 
 // ── Public API: Streaming ─────────────────────────────────────────
 
+/**
+ * Descriptor checks for carrying this stream on an alt setting, before
+ * anything is allocated. ESP_ERR_NOT_SUPPORTED if it cannot.
+ */
+static esp_err_t check_alt_usable(const uac2_iface_t *iface, const uac2_as_iface_t *as,
+                                  const uac2_host_stream_config_t *config)
+{
+    if (fractional_playback_requires_feedback(iface->dir, as->fb_ep_addr,
+                                              UAC2_EP_SYNC_TYPE(as->ep_attributes),
+                                              config->sample_freq)) {
+        ESP_LOGE(TAG, "Playback %.2f kHz on alt %d requires a feedback endpoint "
+                 "(asynchronous endpoint without one)",
+                 config->sample_freq / 1000.0, as->alt_setting);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    // Endpoint intervals come from the (untrusted) device descriptor and reach
+    // the HCD unmodified through usb_host_interface_claim().
+    if (!iso_ep_interval_supported(as->ep_interval, UAC2_NUM_PACKETS_PER_URB, true)) {
+        ESP_LOGE(TAG, "Data EP 0x%02X bInterval=%d unsupported (full-speed audio requires 1)",
+                 as->ep_addr, as->ep_interval);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (iface->dir == UAC2_STREAM_TX && as->fb_ep_addr != 0 &&
+        !iso_ep_interval_supported(as->fb_ep_interval, 1, false)) {
+        ESP_LOGE(TAG, "Feedback EP 0x%02X bInterval=%d unsupported by the USB host controller",
+                 as->fb_ep_addr, as->fb_ep_interval);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return ESP_OK;
+}
+
+/**
+ * Body of device_start. Caller holds the api lock and dev->stream_mutex;
+ * this function never releases either.
+ *
+ * *alt_specific is set when the failure belongs to this alt setting (packet
+ * size above its MPS, or the host could not allocate its endpoints) and the
+ * stream was left IDLE with nothing allocated, so another alt may be tried.
+ */
+static esp_err_t stream_start_reserved(uac2_iface_t *iface, const uac2_as_iface_t *as,
+                                       const uac2_host_stream_config_t *config,
+                                       bool *alt_specific)
+{
+    uac2_device_t *dev = iface->parent;
+    *alt_specific = false;
+
+    ESP_LOGI(TAG, "Starting %s stream: iface %d alt %d, %dch %d-bit, ep 0x%02X (MPS %d)",
+             iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
+             as->interface_num, as->alt_setting,
+             as->nr_channels, as->bit_resolution,
+             as->ep_addr, as->ep_max_packet_size);
+
+    // Allocate stream resources
+    esp_err_t err = stream_resources_alloc(iface, as, config);
+    if (err != ESP_OK) {
+        *alt_specific = err == ESP_ERR_INVALID_SIZE && !stream_has_resources(iface);
+        return err;
+    }
+
+    // Claim interface
+    err = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
+                                   iface->iface_num, iface->alt_setting);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to claim iface %d alt %d: %s",
+                 iface->iface_num, iface->alt_setting, esp_err_to_name(err));
+        esp_err_t free_err = stream_resources_free(iface);
+        if (free_err != ESP_OK) {
+            err = free_err;     // resources retained; device_close retries cleanup
+        } else {
+            // The HCD refuses endpoints it cannot fit, e.g. an MPS above the
+            // FIFO the host configured ("EP MPS exceeds supported limit")
+            *alt_specific = err == ESP_ERR_NOT_SUPPORTED;
+        }
+        return err;
+    }
+    iface->interface_claimed = true;
+    iface->state = UAC2_IFACE_STATE_READY;
+
+    // Set the clock before activating the alt setting, the order Linux
+    // snd-usb-audio uses for UAC2 (snd_usb_endpoint_prepare): some devices need
+    // the rate first, and the endpoint is never enabled without a clock (a
+    // source of start-up noise on some DACs)
+    if (dev->clock_source_id != 0 && config->sample_freq > 0) {
+        err = ensure_sample_rate_applied(dev, config->sample_freq);
+        if (err != ESP_OK) {
+            esp_err_t cleanup_err = stream_abort_startup(iface);
+            if (cleanup_err != ESP_OK) {
+                ESP_LOGE(TAG, "Startup abort failed after sample-rate error %s: %s",
+                         esp_err_to_name(err), esp_err_to_name(cleanup_err));
+                err = cleanup_err;
+            }
+            return err;
+        }
+        err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                            "device_start after sample-rate setup");
+        if (err != ESP_OK) {
+            esp_err_t cleanup_err = stream_abort_startup(iface);
+            if (cleanup_err != ESP_OK) {
+                ESP_LOGE(TAG, "Startup abort failed after disconnect during sample-rate setup: %s",
+                         esp_err_to_name(cleanup_err));
+                err = cleanup_err;
+            }
+            return err;
+        }
+    }
+
+    // SET_INTERFACE to activate endpoints on device
+    err = ctrl_request_no_data(dev,
+        USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
+        USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after SET_INTERFACE error %s: %s",
+                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        return err;
+    }
+    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                        "device_start after SET_INTERFACE");
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after disconnect during SET_INTERFACE: %s",
+                     esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        return err;
+    }
+
+    // Check for suspend-after-start flag
+    if (config->flags & UAC2_FLAG_STREAM_SUSPEND_AFTER_START) {
+        ESP_LOGI(TAG, "%s stream started (suspended)", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
+        return ESP_OK;
+    }
+
+    // Submit URBs
+    err = stream_submit_urbs(iface);
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after submit error %s: %s",
+                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        return err;
+    }
+    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
+                                        "device_start after URB submit");
+    if (err != ESP_OK) {
+        esp_err_t cleanup_err = stream_abort_startup(iface);
+        if (cleanup_err != ESP_OK) {
+            ESP_LOGE(TAG, "Startup abort failed after disconnect during URB submit: %s",
+                     esp_err_to_name(cleanup_err));
+            err = cleanup_err;
+        }
+        return err;
+    }
+
+    ESP_LOGI(TAG, "%s stream started (pkt_size=%d, ringbuf=%" PRIu32 ")",
+             iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
+             iface->packet_size, iface->ringbuf_size);
+    return ESP_OK;
+}
+
 esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
                                  const uac2_host_stream_config_t *config)
 {
@@ -2528,10 +3390,22 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
 
     uac2_device_t *dev = iface->parent;
 
-    // Find matching AS interface for this interface number + requested format
-    const uac2_as_iface_t *as = find_matching_as_iface(&dev->desc_info, iface->dir,
-                                                        config, iface->iface_num);
-    if (!as) {
+    // A disconnect leaves the stream IDLE with its resources until close()
+    // (or stop()) reclaims them; allocating over them would leak them and
+    // reset the in-flight count under callbacks that may still be pending
+    if (atomic_load(&dev->gone) || stream_has_resources(iface)) {
+        ESP_LOGE(TAG, "Cannot start: %s", atomic_load(&dev->gone)
+                 ? "device disconnected (close the handle)"
+                 : "previous stream not torn down (call stop or close)");
+        release_locked_iface(iface);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // AS alt settings of this interface that carry the requested format, best first
+    const uac2_as_iface_t *candidates[UAC2_MAX_AS_INTERFACES];
+    int num_candidates = find_matching_as_ifaces(&dev->desc_info, iface->dir, config,
+                                                 iface->iface_num, candidates);
+    if (num_candidates == 0) {
         ESP_LOGE(TAG, "No matching AS interface for %s %dch/%dbit",
                  iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
                  config->channels, config->bit_resolution);
@@ -2539,142 +3413,37 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle,
         return ESP_ERR_NOT_FOUND;
     }
 
-    if (fractional_playback_requires_feedback(iface->dir, as->fb_ep_addr, config->sample_freq)) {
-        ESP_LOGE(TAG, "Playback %.2f kHz requires a feedback endpoint on this alt setting",
-                 config->sample_freq / 1000.0);
-        release_locked_iface(iface);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
+    xSemaphoreTake(dev->stream_mutex, portMAX_DELAY);
     if (device_has_opposite_direction_stream(iface)) {
-        ESP_LOGE(TAG, "ESP32-S3 does not support simultaneous TX and RX audio streams");
-        release_locked_iface(iface);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (as->ep_interval != 1) {
-        ESP_LOGW(TAG, "Data EP 0x%02X bInterval=%d (expected 1 at FS), using 1ms framing",
-                 as->ep_addr, as->ep_interval);
-    }
-
-    ESP_LOGI(TAG, "Starting %s stream: iface %d alt %d, %dch %d-bit, ep 0x%02X (MPS %d)",
-             iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
-             as->interface_num, as->alt_setting,
-             as->nr_channels, as->bit_resolution,
-             as->ep_addr, as->ep_max_packet_size);
-
-    // Allocate stream resources
-    esp_err_t err = stream_resources_alloc(iface, as, config);
-    if (err != ESP_OK) {
-        release_locked_iface(iface);
-        return err;
-    }
-
-    // Claim interface
-    err = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
-                                   iface->iface_num, iface->alt_setting);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to claim iface %d alt %d: %s",
-                 iface->iface_num, iface->alt_setting, esp_err_to_name(err));
-        stream_resources_free(iface);
-        release_locked_iface(iface);
-        return err;
-    }
-    iface->interface_claimed = true;
-
-    // SET_INTERFACE to activate endpoints on device
-    err = ctrl_request_no_data(dev,
-        USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-        USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
-    if (err != ESP_OK) {
-        esp_err_t cleanup_err = stream_abort_startup(iface);
-        if (cleanup_err != ESP_OK) {
-            ESP_LOGE(TAG, "Startup abort failed after SET_INTERFACE error %s: %s",
-                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
-            err = cleanup_err;
-        }
-        release_locked_iface(iface);
-        return err;
-    }
-
-    iface->state = UAC2_IFACE_STATE_READY;
-    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
-                                        "device_start after SET_INTERFACE");
-    if (err != ESP_OK) {
-        esp_err_t cleanup_err = stream_abort_startup(iface);
-        if (cleanup_err != ESP_OK) {
-            ESP_LOGE(TAG, "Startup abort failed after disconnect during SET_INTERFACE: %s",
-                     esp_err_to_name(cleanup_err));
-            err = cleanup_err;
-        }
-        release_locked_iface(iface);
-        return err;
-    }
-
-    // Validate and set sample rate
-    if (dev->clock_source_id != 0 && config->sample_freq > 0) {
-        err = ensure_sample_rate_applied(dev, config->sample_freq);
-        if (err != ESP_OK) {
-            esp_err_t cleanup_err = stream_abort_startup(iface);
-            if (cleanup_err != ESP_OK) {
-                ESP_LOGE(TAG, "Startup abort failed after sample-rate error %s: %s",
-                         esp_err_to_name(err), esp_err_to_name(cleanup_err));
-                err = cleanup_err;
+        ESP_LOGE(TAG, "ESP32-S3: a stream in the other direction is running "
+                 "(simultaneous TX and RX needs CONFIG_UAC2_ALLOW_DUPLEX and a custom FIFO split)");
+        ret = ESP_ERR_NOT_SUPPORTED;
+    } else if (device_has_stream_at_other_rate(iface, config->sample_freq)) {
+        ESP_LOGE(TAG, "Another stream on this device runs at a different sample rate (shared clock)");
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        // Move on to the next alt only when this one cannot carry the stream
+        // (descriptor checks, packet size, endpoints the host cannot fit); a
+        // device-level failure (control request, disconnect) ends the attempt
+        for (int i = 0; i < num_candidates; i++) {
+            bool alt_specific = true;
+            ret = check_alt_usable(iface, candidates[i], config);
+            if (ret == ESP_OK) {
+                ret = stream_start_reserved(iface, candidates[i], config, &alt_specific);
             }
-            release_locked_iface(iface);
-            return err;
-        }
-        err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
-                                            "device_start after sample-rate setup");
-        if (err != ESP_OK) {
-            esp_err_t cleanup_err = stream_abort_startup(iface);
-            if (cleanup_err != ESP_OK) {
-                ESP_LOGE(TAG, "Startup abort failed after disconnect during sample-rate setup: %s",
-                         esp_err_to_name(cleanup_err));
-                err = cleanup_err;
+            if (ret == ESP_OK || !alt_specific) {
+                break;
             }
-            release_locked_iface(iface);
-            return err;
+            if (i + 1 < num_candidates) {
+                ESP_LOGW(TAG, "Alt %d cannot carry the stream (%s), trying alt %d",
+                         candidates[i]->alt_setting, esp_err_to_name(ret),
+                         candidates[i + 1]->alt_setting);
+            }
         }
     }
-
-    // Check for suspend-after-start flag
-    if (config->flags & UAC2_FLAG_STREAM_SUSPEND_AFTER_START) {
-        ESP_LOGI(TAG, "%s stream started (suspended)", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
-        release_locked_iface(iface);
-        return ESP_OK;
-    }
-
-    // Submit URBs
-    err = stream_submit_urbs(iface);
-    if (err != ESP_OK) {
-        esp_err_t cleanup_err = stream_abort_startup(iface);
-        if (cleanup_err != ESP_OK) {
-            ESP_LOGE(TAG, "Startup abort failed after submit error %s: %s",
-                     esp_err_to_name(err), esp_err_to_name(cleanup_err));
-            err = cleanup_err;
-        }
-        release_locked_iface(iface);
-        return err;
-    }
-    err = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
-                                        "device_start after URB submit");
-    if (err != ESP_OK) {
-        esp_err_t cleanup_err = stream_abort_startup(iface);
-        if (cleanup_err != ESP_OK) {
-            ESP_LOGE(TAG, "Startup abort failed after disconnect during URB submit: %s",
-                     esp_err_to_name(cleanup_err));
-            err = cleanup_err;
-        }
-        release_locked_iface(iface);
-        return err;
-    }
-
-    ESP_LOGI(TAG, "%s stream started (pkt_size=%d, ringbuf=%" PRIu32 ")",
-             iface->dir == UAC2_STREAM_TX ? "TX" : "RX",
-             iface->packet_size, iface->ringbuf_size);
+    xSemaphoreGive(dev->stream_mutex);
     release_locked_iface(iface);
-    return ESP_OK;
+    return ret;
 }
 
 // Internal stream_stop — caller must hold api_mutex (or be in close path)
@@ -2715,6 +3484,12 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
         }
     }
 
+    // Let the flushed URBs' callbacks run before releasing (see release_interface_claim)
+    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Stream stop", true);
+    if (wait_err != ESP_OK) {
+        return wait_err;
+    }
+
     // Release interface — retry for ESP-IDF bug #17707 even after DEV_GONE.
     // The physical device may be gone, but the host library still needs the
     // client-side interface claim released so the bus can reach ALL_FREE and
@@ -2727,12 +3502,18 @@ static esp_err_t stream_stop_internal(uac2_iface_t *iface)
         iface->interface_claimed = false;
     }
 
-    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Stream stop", true);
-    if (wait_err != ESP_OK) {
-        return wait_err;
+    esp_err_t free_err = stream_resources_free(iface);
+    if (free_err != ESP_OK) {
+        portENTER_CRITICAL(&iface->state_lock);
+        iface->state = UAC2_IFACE_STATE_ERROR;
+        portEXIT_CRITICAL(&iface->state_lock);
+        return free_err;
     }
-
-    stream_resources_free(iface);
+    // Everything is torn down: IDLE again even if a callback that raced the
+    // start of this stop marked the stream ERROR
+    portENTER_CRITICAL(&iface->state_lock);
+    iface->state = UAC2_IFACE_STATE_IDLE;
+    portEXIT_CRITICAL(&iface->state_lock);
     ESP_LOGI(TAG, "%s stream stopped", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
     return ESP_OK;
 }
@@ -2753,28 +3534,23 @@ esp_err_t uac2_host_device_write(uac2_host_device_handle_t handle,
                                  uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(handle && data && size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = acquire_iface_io_ref(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = acquire_stream_io_ref(handle);
+    if (!iface) return ESP_ERR_INVALID_STATE;
 
-    if (!iface->ringbuf || iface->state != UAC2_IFACE_STATE_ACTIVE) {
+    if (!acquire_ringbuf_user(iface)) {
         release_iface_io_ref(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
-    atomic_store(&iface->user_task_blocked, true);
     BaseType_t ok = xRingbufferSend(iface->ringbuf, data, size,
                                     pdMS_TO_TICKS(timeout_ms));
 
-    bool still_active = (iface->state == UAC2_IFACE_STATE_ACTIVE);
+    bool still_active = stream_is_active(iface);
     if (ok == pdTRUE && still_active) {
         atomic_store(&iface->tx_done_pending, false);
     }
 
-    // Signal stream_resources_free only on actual blocked→unblocked transition
-    if (atomic_exchange(&iface->user_task_blocked, false) && iface->user_task_done) {
-        xSemaphoreGive(iface->user_task_done);
-    }
-
+    atomic_fetch_sub(&iface->rw_users, 1);
     release_iface_io_ref(iface);
     if (!still_active) return ESP_ERR_INVALID_STATE;
     return ok == pdTRUE ? ESP_OK : ESP_ERR_TIMEOUT;
@@ -2786,21 +3562,21 @@ esp_err_t uac2_host_device_read(uac2_host_device_handle_t handle,
                                 uint32_t timeout_ms)
 {
     ESP_RETURN_ON_FALSE(handle && data && bytes_read && size > 0, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
-    uac2_iface_t *iface = acquire_iface_io_ref(handle);
-    ESP_RETURN_ON_FALSE(iface, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    *bytes_read = 0;
+    uac2_iface_t *iface = acquire_stream_io_ref(handle);
+    if (!iface) return ESP_ERR_INVALID_STATE;
 
-    if (!iface->ringbuf || iface->state != UAC2_IFACE_STATE_ACTIVE) {
+    if (!acquire_ringbuf_user(iface)) {
         release_iface_io_ref(iface);
         return ESP_ERR_INVALID_STATE;
     }
 
-    atomic_store(&iface->user_task_blocked, true);
     size_t item_size = 0;
     void *item = xRingbufferReceiveUpTo(iface->ringbuf, &item_size,
                                         pdMS_TO_TICKS(timeout_ms), size);
 
     esp_err_t ret;
-    bool still_active = (iface->state == UAC2_IFACE_STATE_ACTIVE);
+    bool still_active = stream_is_active(iface);
     if (!still_active) {
         if (item) vRingbufferReturnItem(iface->ringbuf, item);
         *bytes_read = 0;
@@ -2815,9 +3591,7 @@ esp_err_t uac2_host_device_read(uac2_host_device_handle_t handle,
         ret = ESP_OK;
     }
 
-    if (atomic_exchange(&iface->user_task_blocked, false) && iface->user_task_done) {
-        xSemaphoreGive(iface->user_task_done);
-    }
+    atomic_fetch_sub(&iface->rw_users, 1);
     release_iface_io_ref(iface);
     return ret;
 }
@@ -2827,7 +3601,8 @@ int64_t uac2_host_device_get_start_time(uac2_host_device_handle_t handle)
     if (!handle) return 0;
     uac2_iface_t *iface = acquire_iface_io_ref(handle);
     if (!iface) return 0;
-    int64_t start = atomic_load(&iface->first_frame_us);
+    // The cached value outlives stop/unplug; documented as 0 without a stream
+    int64_t start = stream_is_live(iface) ? atomic_load(&iface->first_frame_us) : 0;
     release_iface_io_ref(iface);
     return start;
 }
@@ -2837,9 +3612,74 @@ uint32_t uac2_host_device_get_feedback(uac2_host_device_handle_t handle)
     if (!handle) return 0;
     uac2_iface_t *iface = acquire_iface_io_ref(handle);
     if (!iface) return 0;
-    uint32_t feedback = atomic_load(&iface->fb_value);
+    uint32_t feedback = stream_is_live(iface) ? atomic_load(&iface->fb_value) : 0;
     release_iface_io_ref(iface);
     return feedback;
+}
+
+esp_err_t uac2_host_device_get_stream_info(uac2_host_device_handle_t handle,
+                                           uac2_host_stream_info_t *info)
+{
+    ESP_RETURN_ON_FALSE(handle && info, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+    uac2_iface_t *iface = NULL;
+    esp_err_t ret = acquire_locked_iface(handle, &iface);
+    ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
+
+    portENTER_CRITICAL(&iface->state_lock);
+    uac2_iface_state_t state = iface->state;
+    portEXIT_CRITICAL(&iface->state_lock);
+    if (state != UAC2_IFACE_STATE_ACTIVE && state != UAC2_IFACE_STATE_READY) {
+        release_locked_iface(iface);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *info = (uac2_host_stream_info_t) {
+        .alt_setting = iface->alt_setting,
+        .channels = iface->channels,
+        .bit_resolution = iface->bit_resolution,
+        .sub_slot_size = iface->sub_slot_size,
+        .sample_freq = iface->sample_rate,
+        .ep_max_packet_size = iface->ep_mps,
+        .ep_addr = iface->ep_addr,
+        .fb_ep_addr = iface->fb_ep_addr,
+        .sync_type = (uac2_ep_sync_type_t)iface->ep_sync_type,
+        .active = state == UAC2_IFACE_STATE_ACTIVE,
+    };
+    release_locked_iface(iface);
+    return ESP_OK;
+}
+
+esp_err_t uac2_host_device_get_buffer_status(uac2_host_device_handle_t handle,
+                                             uac2_host_buffer_status_t *status)
+{
+    ESP_RETURN_ON_FALSE(handle && status, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+    uac2_iface_t *iface = acquire_stream_io_ref(handle);
+    if (!iface) return ESP_ERR_INVALID_STATE;
+
+    if (!acquire_ringbuf_user(iface)) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t capacity = iface->ringbuf_size;
+    size_t free_bytes = xRingbufferGetCurFreeSize(iface->ringbuf);
+    uint32_t queued = free_bytes < capacity ? capacity - (uint32_t)free_bytes : 0;
+    uint64_t byte_rate = (uint64_t)iface->sample_rate * iface->channels * iface->sub_slot_size;
+    // urbs_in_flight also counts the feedback URB
+    int urbs = atomic_load(&iface->urbs_in_flight);
+    if (urbs > iface->xfer_count) urbs = iface->xfer_count;
+    if (urbs < 0) urbs = 0;
+
+    *status = (uac2_host_buffer_status_t) {
+        .ring_bytes = queued,
+        .ring_capacity = capacity,
+        .ring_us = byte_rate ? (uint32_t)(((uint64_t)queued * 1000000) / byte_rate) : 0,
+        .in_flight_us = (uint32_t)urbs * UAC2_NUM_PACKETS_PER_URB * 1000,
+    };
+
+    atomic_fetch_sub(&iface->rw_users, 1);
+    release_iface_io_ref(iface);
+    return ESP_OK;
 }
 
 // ── Public API: Volume / Mute ─────────────────────────────────────
@@ -2978,6 +3818,7 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t handle,
                                             uint8_t *num_ranges)
 {
     ESP_RETURN_ON_FALSE(handle && ranges && num_ranges, ESP_ERR_INVALID_ARG, TAG, "Invalid arguments");
+    uint8_t capacity = *num_ranges ? *num_ranges : UAC2_MAX_VOLUME_RANGES;
     uac2_iface_t *iface = NULL;
     esp_err_t ret = acquire_locked_iface(handle, &iface);
     ESP_RETURN_ON_FALSE(ret == ESP_OK, ret, TAG, "Invalid handle");
@@ -3015,6 +3856,11 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t handle,
         return ret;
     }
     if (count > UAC2_MAX_VOLUME_RANGES) count = UAC2_MAX_VOLUME_RANGES;
+    if (count > capacity) {
+        ESP_LOGW(TAG, "Device reports %u volume ranges, caller has room for %u",
+                 (unsigned)count, (unsigned)capacity);
+        count = capacity;
+    }
     for (int i = 0; i < count; i++) {
         const uint8_t *p = buf + 2 + (i * 6);
         ranges[i].min = (int16_t)(p[0] | (p[1] << 8));
@@ -3052,13 +3898,22 @@ esp_err_t uac2_host_device_set_volume_percent(uac2_host_device_handle_t handle,
     }
     int16_t min_db256 = 0;
     int16_t max_db256 = 0;
-    err = get_volume_range_triplet(iface, channel, &min_db256, &max_db256, NULL);
+    int16_t res_db256 = 0;
+    err = get_volume_range_triplet(iface, channel, &min_db256, &max_db256, &res_db256);
     if (err != ESP_OK) {
         release_locked_iface(iface);
         return err == ESP_ERR_NOT_FOUND ? ESP_ERR_NOT_SUPPORTED : err;
     }
-    int16_t db256 = min_db256 +
-        (int16_t)(((int32_t)(max_db256 - min_db256) * percent) / 100);
+    int32_t span = (int32_t)max_db256 - min_db256;
+    int32_t offset = span > 0 ? (span * percent) / 100 : 0;
+    if (res_db256 > 0 && offset > 0) {
+        // Snap to the device's step grid so the request is a supported value
+        offset = ((offset + res_db256 / 2) / res_db256) * res_db256;
+        if (offset > span) {
+            offset -= res_db256;
+        }
+    }
+    int16_t db256 = (int16_t)(min_db256 + offset);
     uac2_device_t *dev = iface->parent;
     uint8_t data[2] = { (uint8_t)(db256 & 0xFF), (uint8_t)((db256 >> 8) & 0xFF) };
     err = ctrl_set_cur(dev, iface->feature_unit_id, UAC2_FU_VOLUME_CONTROL, channel, data, 2);
@@ -3110,6 +3965,39 @@ esp_err_t uac2_host_device_get_volume_percent(uac2_host_device_handle_t handle,
     return ESP_OK;
 }
 
+/**
+ * Write mute or volume to every channel in ch_map (bit 0 = master). Some
+ * devices advertise a master control that STALLs while their per-channel
+ * controls work, so a failed master write does not stop the channel writes;
+ * it is only reported if there were no channel controls to fall back to.
+ */
+static esp_err_t set_all_channels(uac2_host_device_handle_t handle, uint32_t ch_map,
+                                  uint8_t nr_channels, bool is_mute, int16_t volume_db256,
+                                  bool mute)
+{
+    esp_err_t master_err = ESP_OK;
+    bool wrote_channel = false;
+    for (uint8_t ch = 0; ch <= nr_channels && ch < 32; ch++) {
+        if (!(ch_map & (1u << ch))) {
+            continue;
+        }
+        esp_err_t err = is_mute ? uac2_host_device_set_mute(handle, ch, mute)
+                                : uac2_host_device_set_volume(handle, ch, volume_db256);
+        if (err != ESP_OK) {
+            if (ch != 0) return err;
+            master_err = err;
+            continue;
+        }
+        if (ch != 0) wrote_channel = true;
+    }
+    if (master_err != ESP_OK) {
+        if (!wrote_channel) return master_err;
+        ESP_LOGW(TAG, "Master %s failed (%s); set per channel instead",
+                 is_mute ? "mute" : "volume", esp_err_to_name(master_err));
+    }
+    return ESP_OK;
+}
+
 esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t handle,
                                                    int16_t volume_db256)
 {
@@ -3135,13 +4023,30 @@ esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t han
     uint8_t nr_channels = fu->nr_channels;
     release_iface_io_ref(iface);
 
-    for (uint8_t ch = 0; ch <= nr_channels && ch < 32; ch++) {
-        if (ch_map & (1u << ch)) {
-            err = uac2_host_device_set_volume(handle, ch, volume_db256);
-            if (err != ESP_OK) return err;
-        }
+    return set_all_channels(handle, ch_map, nr_channels, false, volume_db256, false);
+}
+
+esp_err_t uac2_host_device_set_mute_all_channels(uac2_host_device_handle_t handle, bool mute)
+{
+    ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
+    uac2_iface_t *iface = NULL;
+    esp_err_t err = acquire_iface_runtime_ref(handle, &iface);
+    ESP_RETURN_ON_FALSE(err == ESP_OK, err, TAG, "Invalid handle");
+    if (!iface->has_feature_unit || !iface->has_mute) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_NOT_SUPPORTED;
     }
-    return ESP_OK;
+
+    const uac2_feature_unit_t *fu = get_iface_feature_unit(iface);
+    if (!fu) {
+        release_iface_io_ref(iface);
+        return ESP_ERR_NOT_FOUND;
+    }
+    uint32_t ch_map = fu->mute_ch_map;
+    uint8_t nr_channels = fu->nr_channels;
+    release_iface_io_ref(iface);
+
+    return set_all_channels(handle, ch_map, nr_channels, true, 0, mute);
 }
 
 // ── Public API: Debug Print ───────────────────────────────────────
@@ -3231,6 +4136,11 @@ static esp_err_t stream_deactivate(uac2_iface_t *iface)
         }
     }
 
+    esp_err_t wait_err = wait_for_urbs_quiesced(iface, 2000, "Deactivate", false);
+    if (wait_err != ESP_OK) {
+        return wait_err;
+    }
+
     if (iface->interface_claimed) {
         esp_err_t rel_err = release_interface_claim(dev, iface, pdMS_TO_TICKS(2000));
         if (rel_err != ESP_OK) {
@@ -3238,8 +4148,7 @@ static esp_err_t stream_deactivate(uac2_iface_t *iface)
         }
         iface->interface_claimed = false;
     }
-
-    return wait_for_urbs_quiesced(iface, 2000, "Deactivate", false);
+    return ESP_OK;
 }
 
 esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
@@ -3266,6 +4175,11 @@ esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
     }
 
     ret = stream_deactivate(iface);
+    if (ret == ESP_OK) {
+        // A writer that raced the deactivate must finish before the flush, or
+        // its stale audio would be played after resume.
+        ret = wait_for_rw_users_drained(iface, 2000, "Suspend");
+    }
     if (ret != ESP_OK) {
         portENTER_CRITICAL(&iface->state_lock);
         iface->state = UAC2_IFACE_STATE_ERROR;
@@ -3284,6 +4198,65 @@ esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t handle)
     ESP_LOGI(TAG, "%s stream suspended", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
     release_locked_iface(iface);
     return ESP_OK;
+}
+
+/**
+ * Body of device_resume. Caller holds the api lock and dev->stream_mutex;
+ * this function never releases either.
+ */
+static esp_err_t stream_resume_reserved(uac2_iface_t *iface)
+{
+    uac2_device_t *dev = iface->parent;
+    esp_err_t ret;
+
+    if (!iface->interface_claimed) {
+        ret = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
+                                       iface->iface_num, iface->alt_setting);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        iface->interface_claimed = true;
+    }
+
+    // Clock first, then the alt setting, as in stream_start_reserved()
+    if (dev->clock_source_id != 0 && iface->sample_rate > 0) {
+        ret = ensure_sample_rate_applied(dev, iface->sample_rate);
+        if (ret != ESP_OK) {
+            return resume_rollback_to_ready(iface, ret, "sample-rate setup");
+        }
+        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                            "device_resume after sample-rate setup");
+        if (ret != ESP_OK) {
+            return resume_rollback_to_ready(iface, ret, "disconnect after sample-rate setup");
+        }
+    }
+
+    ret = ctrl_request_no_data(dev,
+        USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
+        USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
+    if (ret != ESP_OK) {
+        return resume_rollback_to_ready(iface, ret, "SET_INTERFACE");
+    }
+    ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
+                                        "device_resume after SET_INTERFACE");
+    if (ret != ESP_OK) {
+        return resume_rollback_to_ready(iface, ret, "disconnect after SET_INTERFACE");
+    }
+
+    ret = stream_submit_urbs(iface);
+    if (ret != ESP_OK) {
+        ret = resume_rollback_to_ready(iface, ret, "URB submit");
+    } else {
+        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
+                                            "device_resume after URB submit");
+        if (ret != ESP_OK) {
+            ret = resume_rollback_to_ready(iface, ret, "disconnect after URB submit");
+        } else {
+            ESP_LOGI(TAG, "%s stream resumed", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
+        }
+    }
+
+    return ret;
 }
 
 esp_err_t uac2_host_device_resume(uac2_host_device_handle_t handle)
@@ -3312,71 +4285,24 @@ esp_err_t uac2_host_device_resume(uac2_host_device_handle_t handle)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (fractional_playback_requires_feedback(iface->dir, iface->fb_ep_addr, iface->ep_sync_type,
+                                              iface->sample_rate)) {
+        release_locked_iface(iface);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    xSemaphoreTake(dev->stream_mutex, portMAX_DELAY);
     if (device_has_opposite_direction_stream(iface)) {
-        release_locked_iface(iface);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (fractional_playback_requires_feedback(iface->dir, iface->fb_ep_addr, iface->sample_rate)) {
-        release_locked_iface(iface);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    if (!iface->interface_claimed) {
-        ret = usb_host_interface_claim(s_uac2_driver->client_handle, dev->dev_hdl,
-                                       iface->iface_num, iface->alt_setting);
-        if (ret != ESP_OK) {
-            release_locked_iface(iface);
-            return ret;
-        }
-        iface->interface_claimed = true;
-    }
-
-    ret = ctrl_request_no_data(dev,
-        USB_BM_REQUEST_TYPE_DIR_OUT | USB_BM_REQUEST_TYPE_TYPE_STANDARD | USB_BM_REQUEST_TYPE_RECIP_INTERFACE,
-        USB_B_REQUEST_SET_INTERFACE, iface->alt_setting, iface->iface_num);
-    if (ret != ESP_OK) {
-        ret = resume_rollback_to_ready(iface, ret, "SET_INTERFACE");
-        release_locked_iface(iface);
-        return ret;
-    }
-    ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
-                                        "device_resume after SET_INTERFACE");
-    if (ret != ESP_OK) {
-        ret = resume_rollback_to_ready(iface, ret, "disconnect after SET_INTERFACE");
-        release_locked_iface(iface);
-        return ret;
-    }
-
-    if (dev->clock_source_id != 0 && iface->sample_rate > 0) {
-        ret = ensure_sample_rate_applied(dev, iface->sample_rate);
-        if (ret != ESP_OK) {
-            ret = resume_rollback_to_ready(iface, ret, "sample-rate setup");
-            release_locked_iface(iface);
-            return ret;
-        }
-        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_READY,
-                                            "device_resume after sample-rate setup");
-        if (ret != ESP_OK) {
-            ret = resume_rollback_to_ready(iface, ret, "disconnect after sample-rate setup");
-            release_locked_iface(iface);
-            return ret;
-        }
-    }
-
-    ret = stream_submit_urbs(iface);
-    if (ret != ESP_OK) {
-        ret = resume_rollback_to_ready(iface, ret, "URB submit");
+        ESP_LOGE(TAG, "ESP32-S3: a stream in the other direction is running "
+                 "(simultaneous TX and RX needs CONFIG_UAC2_ALLOW_DUPLEX and a custom FIFO split)");
+        ret = ESP_ERR_NOT_SUPPORTED;
+    } else if (device_has_stream_at_other_rate(iface, iface->sample_rate)) {
+        ESP_LOGE(TAG, "Another stream on this device runs at a different sample rate (shared clock)");
+        ret = ESP_ERR_INVALID_STATE;
     } else {
-        ret = ensure_iface_device_available(iface, UAC2_IFACE_STATE_ACTIVE,
-                                            "device_resume after URB submit");
-        if (ret != ESP_OK) {
-            ret = resume_rollback_to_ready(iface, ret, "disconnect after URB submit");
-        } else {
-            ESP_LOGI(TAG, "%s stream resumed", iface->dir == UAC2_STREAM_TX ? "TX" : "RX");
-        }
+        ret = stream_resume_reserved(iface);
     }
-
+    xSemaphoreGive(dev->stream_mutex);
     release_locked_iface(iface);
     return ret;
 }

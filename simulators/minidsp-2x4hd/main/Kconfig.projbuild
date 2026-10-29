@@ -18,4 +18,26 @@ config MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
         advertises no playback controls. This exists only to validate the
         host's per-channel capability handling.
 
+config MINIDSP_SIM_EP0_HANG_TEST_BUILD
+    bool "Build control-transfer hang test image"
+    default n
+    help
+        Same descriptors and behavior as the default image, except that the
+        first GET CUR clock-valid request after boot is never answered (its
+        data stage stays NAKed). 12 seconds later the simulator
+        soft-disconnects for 1 second and reconnects, with the fault disarmed
+        until the next reboot. This drives the host's control-timeout path:
+        abandoned request, orphaned control URB on close, and its reclaim when
+        the device goes away. Product string "miniDSP 2x4HD [sim ep0-hang]".
+
+config MINIDSP_SIM_FEEDBACK_DRIFT_TEST_BUILD
+    bool "Build feedback drift test image"
+    default n
+    help
+        Same descriptors as the default image, but the explicit feedback
+        reports 2 Hz above the nominal rate (about 42 ppm), like a device
+        whose clock runs fast. The simulator's periodic PACKET SIZING CHECK
+        then shows whether the host follows the feedback instead of sending
+        the nominal rate. Product string "miniDSP 2x4HD [sim fb-drift]".
+
 endmenu

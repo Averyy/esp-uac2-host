@@ -1,0 +1,7 @@
+CONFIG_IDF_TARGET="linux"
+# 1 ms ticks, so a tick is one USB frame
+CONFIG_FREERTOS_HZ=1000
+# Shortest allowed control timeout keeps the timeout tests quick
+CONFIG_UAC2_CTRL_XFER_TIMEOUT_MS=1000
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y

@@ -24,6 +24,14 @@ void tone_gen_init(tone_gen_t *gen, const tone_gen_config_t *config)
     gen->config = *config;
     gen->phase = 0.0f;
     gen->phase_inc = (2.0f * (float)M_PI * config->frequency) / (float)config->sample_rate;
+    gen->env = 0.0f;
+    gen->env_target = 1.0f;
+    gen->env_step = 1.0f / (0.02f * (float)config->sample_rate);  // 20 ms ramps
+}
+
+void tone_gen_fade_out(tone_gen_t *gen)
+{
+    gen->env_target = 0.0f;
 }
 
 uint32_t tone_gen_fill(tone_gen_t *gen, uint8_t *buf, uint32_t buf_size)
@@ -34,7 +42,12 @@ uint32_t tone_gen_fill(tone_gen_t *gen, uint8_t *buf, uint32_t buf_size)
     uint32_t bytes_written = num_frames * frame_size;
 
     for (uint32_t i = 0; i < num_frames; i++) {
-        float sample = gen->config.amplitude * sinf(gen->phase);
+        if (gen->env < gen->env_target) {
+            gen->env = fminf(gen->env + gen->env_step, gen->env_target);
+        } else if (gen->env > gen->env_target) {
+            gen->env = fmaxf(gen->env - gen->env_step, gen->env_target);
+        }
+        float sample = gen->config.amplitude * gen->env * sinf(gen->phase);
 
         gen->phase += gen->phase_inc;
         if (gen->phase >= 2.0f * (float)M_PI) {

@@ -1,0 +1,36 @@
+version: "0.1.3"
+description: "USB Audio Class 2.0 (UAC2) host driver for ESP32-S3: playback and capture with USB DACs, audio interfaces and miniDSP processors"
+url: "https://github.com/Averyy/esp-uac2-host"
+repository: "https://github.com/Averyy/esp-uac2-host.git"
+repository_info:
+  path: "components/usb_host_uac2"
+license: "MIT"
+tags:
+  - usb
+  - usb-host
+  - audio
+  - uac
+  - uac2
+documentation: "https://github.com/Averyy/esp-uac2-host/tree/main/components/usb_host_uac2"
+issues: "https://github.com/Averyy/esp-uac2-host/issues"
+dependencies:
+  idf:
+    version: ">=5.4"
+  # ESP-IDF 6.0 moved the USB Host Library out of IDF into this component.
+  # On 5.x the built-in 'usb' component is used. 1.6.0 is the first release
+  # that retires a control transfer before notifying the client, so closing a
+  # device right after a control request cannot trip usbh_dev_close()'s assert.
+  espressif/usb:
+    version: "^1.6.0"
+    rules:
+      - if: "idf_version >=6.0"
+targets:
+  - esp32s3
+# Never pack local build output (examples built in place leave build*/ dirs)
+files:
+  exclude:
+    - "**/build*/**"
+    - "**/managed_components/**"
+    - "**/sdkconfig"
+    - "**/sdkconfig.old"
+    - "**/dependencies.lock"

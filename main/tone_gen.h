@@ -32,6 +32,9 @@ typedef struct {
     tone_gen_config_t config;
     float phase;                // current phase in radians
     float phase_inc;            // phase increment per sample
+    float env;                  // gain envelope, 0..1
+    float env_step;             // envelope change per sample frame
+    float env_target;           // 1 while playing, 0 after tone_gen_fade_out()
 } tone_gen_t;
 
 /**
@@ -48,6 +51,12 @@ void tone_gen_init(tone_gen_t *gen, const tone_gen_config_t *config);
  * @return          Number of bytes written (always buf_size, rounded down to frame boundary)
  */
 uint32_t tone_gen_fill(tone_gen_t *gen, uint8_t *buf, uint32_t buf_size);
+
+/**
+ * Ramp the tone down to silence over the next 20 ms of samples. Tones always
+ * start with a 20 ms ramp up, so neither edge clicks.
+ */
+void tone_gen_fade_out(tone_gen_t *gen);
 
 #ifdef __cplusplus
 }

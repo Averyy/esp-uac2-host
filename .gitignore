@@ -37,3 +37,11 @@ flash_args
 bootloader-flash_args
 app-flash_args
 partition-table.bin
+
+# Host-side fuzzing output
+test/host/fuzz-out/
+
+# Driver-on-Linux test build output
+test/host/driver/bout/
+test/host/driver/sdkconfig
+logs/

@@ -1,0 +1,80 @@
+menu "UAC2 Host Driver"
+
+    config UAC2_NUM_ISOC_URBS
+        int "Number of isochronous URBs kept in flight"
+        default 3
+        range 2 8
+        help
+            Number of isochronous transfer URBs kept in flight simultaneously.
+            More URBs reduce the chance of underrun but use more memory.
+
+    config UAC2_NUM_PACKETS_PER_URB
+        int "Number of isochronous packets per URB"
+        default 3
+        range 1 8
+        help
+            Number of 1ms isochronous packets bundled into each URB.
+            Higher values increase the resubmission margin (URBs * packets ms)
+            at the cost of latency and memory. With the default 3 URBs and
+            3 packets/URB, the HCD pipeline is 9ms — enough to absorb WiFi
+            power-save wakeups and task scheduling jitter.
+
+    config UAC2_CTRL_XFER_TIMEOUT_MS
+        int "Control transfer timeout (ms)"
+        default 5000
+        range 1000 30000
+        help
+            Timeout for USB control transfers (SET_CUR, GET_CUR, GET_RANGE, etc.).
+
+    config UAC2_CTRL_XFER_MAX_SIZE
+        int "Max control transfer data size (bytes)"
+        default 256
+        range 194 1024
+        help
+            Maximum data payload for class-specific control transfers
+            (GET_CUR, GET_RANGE, SET_CUR). The sample-rate GET_RANGE request
+            asks for up to 16 triplets (2 + 16 * 12 = 194 bytes), so smaller
+            values would make every sample-rate range query fail.
+            Note: config descriptor fetching uses USB_HOST_CONTROL_TRANSFER_MAX_SIZE,
+            not this setting.
+
+    config UAC2_MAX_CONSECUTIVE_ERRORS
+        int "Max consecutive transfer errors before stopping"
+        default 10
+        range 1 100
+        help
+            Stop URB re-submission after this many consecutive isochronous
+            transfer errors.
+
+    config UAC2_ALLOW_DUPLEX
+        bool "Allow playback and capture streams at the same time (ESP32-S3)"
+        default n
+        help
+            On ESP32-S3 the driver refuses to start a stream while one in the
+            opposite direction runs, because the USB Host Library's FIFO
+            presets cannot hold both: the PERIODIC_OUT bias leaves 128 bytes
+            for IN packets. Enable this only if the application installs the
+            USB Host Library with usb_host_config_t.fifo_settings_custom
+            (ESP-IDF 5.5+ or the espressif/usb component) giving both the
+            periodic TX FIFO and the RX FIFO room for the endpoints in use
+            (see UAC2_HOST_DUPLEX_FIFO_* in uac2_host.h). Without that split
+            the second stream's start fails with ESP_ERR_NOT_SUPPORTED when the
+            host refuses its endpoint. No effect on other targets.
+
+            The device must support playback and capture at the same time.
+            This is unverified on the miniDSP 2x4 HD: both streams run at
+            full rate, but its output stayed silent until a power cycle after
+            a session that streamed both (cause not yet isolated).
+
+    config UAC2_ALLOW_UNADVERTISED_RATES
+        bool "Allow sample rates the device does not advertise"
+        default n
+        help
+            By default uac2_host_device_start() and
+            uac2_host_device_set_sample_rate() refuse a sample rate outside the
+            ranges the device's clock source reports (ESP_ERR_NOT_SUPPORTED),
+            because some devices acknowledge a rate they cannot run and then
+            play silence. Enable for a device whose advertised ranges are
+            incomplete: the rate is then sent with only a warning.
+
+endmenu

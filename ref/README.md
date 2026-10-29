@@ -7,7 +7,7 @@ These are **not compiled** as part of this project. Do not modify them.
 
 ### Espressif UAC1 Host Driver (Apache-2.0)
 
-Baseline architecture to fork for UAC2. From `espressif/esp-usb` v1.3.3+.
+Baseline architecture to fork for UAC2. From `espressif/esp-usb`: labelled v1.3.3 when copied, but the source matches upstream `usb_host_uac` v1.4.0 (it already has the 64-bit packet sizing, AC descriptor bounds check, core-affinity and PSRAM fixes made after v1.3.3). Upstream is at v1.5.0 (2026); its later fixes were reviewed against this driver during v0.1.3.
 
 | File | Source |
 |------|--------|

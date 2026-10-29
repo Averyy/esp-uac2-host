@@ -8,4 +8,22 @@ config UAC2_TEST12_DURATION_SEC
         Duration for the long-running stability test in the boot harness.
         Set to 0 to skip Test 12 entirely during local smoke runs.
 
+config UAC2_TEST_TONES_SUBWOOFER
+    bool "Play test tones in the subwoofer range"
+    default n
+    help
+        The harness plays 1 kHz tones (plus 440/880/750 Hz and 100-900 Hz
+        cycles), which a subwoofer's low-pass filter removes. Enable for
+        listening checks through a subwoofer: every tone moves to 30-110 Hz
+        at -12 dBFS.
+
+config UAC2_DUPLEX_TEST_SEC
+    int "Duplex streaming check duration (seconds)"
+    range 5 3600
+    default 30
+    depends on UAC2_ALLOW_DUPLEX
+    help
+        How long the duplex live check plays and captures at the same time
+        (builds with CONFIG_UAC2_ALLOW_DUPLEX only).
+
 endmenu

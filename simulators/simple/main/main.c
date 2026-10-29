@@ -149,9 +149,9 @@ static uint8_t const desc_configuration[] = {
     // Feature Unit ID=10 (src=2, master+2ch, mute+volume)
     FEATURE_UNIT_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_FEATURE_UNIT,
     FEATURE_UNIT_ID, INPUT_TERMINAL_ID,
-    U32_TO_U8S_LE(0x00000003),  // master: mute + volume
-    U32_TO_U8S_LE(0x00000003),  // ch1
-    U32_TO_U8S_LE(0x00000003),  // ch2
+    U32_TO_U8S_LE(0x0000000F),  // master: mute + volume (R/W each)
+    U32_TO_U8S_LE(0x0000000F),  // ch1
+    U32_TO_U8S_LE(0x0000000F),  // ch2
     0x00,
 
     // Output Terminal ID=20 (Speaker, src=10, clock=40)

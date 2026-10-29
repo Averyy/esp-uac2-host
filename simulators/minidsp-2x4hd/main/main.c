@@ -39,9 +39,24 @@
 static const char *TAG = "minidsp-sim";
 static const DRAM_ATTR char TAG_ISR[] = "minidsp-sim";  // ISR-safe copy in DRAM
 
-#if CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD && CONFIG_MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
+#if (CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD + CONFIG_MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD + \
+     CONFIG_MINIDSP_SIM_EP0_HANG_TEST_BUILD + CONFIG_MINIDSP_SIM_FEEDBACK_DRIFT_TEST_BUILD) > 1
 #error "Select only one miniDSP simulator test profile at a time"
 #endif
+
+// Feedback reported above the nominal rate by the fb-drift profile, like a
+// device whose crystal runs fast (2 Hz at 48 kHz is ~42 ppm). Small enough to
+// stay inside the host harness's feedback tolerance in Test 6.
+#if CONFIG_MINIDSP_SIM_FEEDBACK_DRIFT_TEST_BUILD
+#define SIM_FEEDBACK_DRIFT_HZ 2
+#else
+#define SIM_FEEDBACK_DRIFT_HZ 0
+#endif
+
+// ep0-hang profile: seconds between leaving the clock-valid request
+// unanswered and soft-disconnecting (longer than the host's 5 s control
+// timeout plus its follow-up checks).
+#define SIM_EP0_HANG_RELEASE_S 12
 
 // ── USB PHY init ──────────────────────────────────────────────────
 
@@ -103,12 +118,21 @@ static volatile uint32_t total_pb_bytes = 0;
 static volatile uint32_t pb_frames_received = 0;
 static volatile uint8_t  current_pb_alt = 0;     // 0=idle, 1=24-bit, 2=16-bit
 
-#if CFG_TUD_AUDIO_ENABLE_EP_OUT && CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
-static uint32_t sample_rate_to_feedback_q16(uint32_t sample_rate_hz)
-{
-    return (uint32_t)(((uint64_t)sample_rate_hz << 16) / 1000);
-}
+// Per-stream packet sizing check: an async host must make its average packet
+// match the reported feedback. Reset on every playback SET_INTERFACE.
+static portMUX_TYPE pb_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t pb_stats_generation;     // bumped on every playback SET_INTERFACE
+static uint32_t pb_stats_packets;
+static uint64_t pb_stats_sample_frames;
+static volatile uint32_t last_reported_fb_q16;
+
+// ep0-hang profile state: armed until the first clock-valid request, then the
+// time that request was left unanswered (0 once released)
+#if CONFIG_MINIDSP_SIM_EP0_HANG_TEST_BUILD
+static volatile bool ep0_hang_armed = true;
+static volatile int64_t ep0_hang_started_us;
 #endif
+
 
 static bool no_feedback_mode_enabled(void)
 {
@@ -140,6 +164,10 @@ static bool playback_fu_channel_supported(uint8_t channel)
 #define SIM_PRODUCT_STRING "miniDSP 2x4HD [sim no-fb]"
 #elif CONFIG_MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
 #define SIM_PRODUCT_STRING "miniDSP 2x4HD [sim ch-only]"
+#elif CONFIG_MINIDSP_SIM_EP0_HANG_TEST_BUILD
+#define SIM_PRODUCT_STRING "miniDSP 2x4HD [sim ep0-hang]"
+#elif CONFIG_MINIDSP_SIM_FEEDBACK_DRIFT_TEST_BUILD
+#define SIM_PRODUCT_STRING "miniDSP 2x4HD [sim fb-drift]"
 #else
 #define SIM_PRODUCT_STRING "miniDSP 2x4HD"
 #endif
@@ -148,6 +176,21 @@ static inline uint32_t load_current_sample_rate(void)
 {
     return atomic_load_explicit(&current_sample_rate, memory_order_relaxed);
 }
+
+#if CFG_TUD_AUDIO_ENABLE_EP_OUT && CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
+static uint32_t sample_rate_to_feedback_q16(uint32_t sample_rate_hz)
+{
+    return (uint32_t)(((uint64_t)sample_rate_hz << 16) / 1000);
+}
+
+/** 16.16 samples/frame for the current rate (plus the fb-drift offset). */
+static uint32_t reported_feedback_q16(void)
+{
+    uint32_t fb = sample_rate_to_feedback_q16(load_current_sample_rate() + SIM_FEEDBACK_DRIFT_HZ);
+    last_reported_fb_q16 = fb;
+    return fb;
+}
+#endif
 
 static inline void store_current_sample_rate(uint32_t sample_rate_hz)
 {
@@ -226,13 +269,13 @@ static void dsp_param_set(uint32_t addr, float value)
 // ── Fault injection ──────────────────────────────────────────────
 
 static struct {
-    volatile bool     config_switch_delay;   // NAK audio for 4-5s after SetConfig
+    volatile bool     config_switch_delay;   // discard received audio for 4.5 s after a HID SetConfig
     volatile bool     empty_hid_response;    // return zero-length HID response
     volatile uint8_t  hid_nak_count;         // reject first N HID writes
     volatile bool     command_timeout;       // withhold HID response for >10s
     uint32_t slow_boot_ms;                   // delay TinyUSB init
-    volatile int64_t  config_switch_until;   // timestamp when NAK period ends
-    volatile uint8_t  hid_naks_remaining;    // counter for NAK injection
+    volatile int64_t  config_switch_until;   // timestamp when the discard period ends
+    volatile uint8_t  hid_naks_remaining;    // HID commands still to drop
 } fault = {0};
 
 // ── HID response queue ──────────────────────────────────────────
@@ -406,16 +449,16 @@ _Static_assert(CONFIG_TOTAL_LEN_NO_FEEDBACK == 313, "Config total must be 313 by
     CLOCK_SELECTOR_ID, 1, CLOCK_SOURCE_ID, 0x03, 0x08, \
     INPUT_TERMINAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_INPUT_TERMINAL, \
     INPUT_TERMINAL_PB_ID, U16_TO_U8S_LE(AUDIO_TERM_TYPE_USB_STREAMING), \
-    0x00, CLOCK_SELECTOR_ID, 2, U32_TO_U8S_LE(0x00000000), 0x00, U16_TO_U8S_LE(0x0016), 0x0B, \
+    0x00, CLOCK_SELECTOR_ID, 2, U32_TO_U8S_LE(0x00000000), 0x16, U16_TO_U8S_LE(0x0000), 0x0B, \
     FEATURE_UNIT_PB_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_FEATURE_UNIT, \
     FEATURE_UNIT_PB_ID, INPUT_TERMINAL_PB_ID, \
     PLAYBACK_FU_MASTER_CTRL_BYTES, U32_TO_U8S_LE(0x0000000F), U32_TO_U8S_LE(0x0000000F), 0x00, \
     OUTPUT_TERMINAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_OUTPUT_TERMINAL, \
-    OUTPUT_TERMINAL_PB_ID, U16_TO_U8S_LE(AUDIO_TERM_TYPE_OUT_DESKTOP_SPEAKER), \
+    OUTPUT_TERMINAL_PB_ID, U16_TO_U8S_LE(AUDIO_TERM_TYPE_OUT_GENERIC_SPEAKER), \
     0x00, FEATURE_UNIT_PB_ID, CLOCK_SELECTOR_ID, U16_TO_U8S_LE(0x0000), 0x00, \
     INPUT_TERMINAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_INPUT_TERMINAL, \
     INPUT_TERMINAL_CAP_ID, U16_TO_U8S_LE(0x0201), \
-    0x00, CLOCK_SELECTOR_ID, 2, U32_TO_U8S_LE(0x00000000), 0x00, U16_TO_U8S_LE(0x0018), 0x00, \
+    0x00, CLOCK_SELECTOR_ID, 2, U32_TO_U8S_LE(0x00000000), 0x18, U16_TO_U8S_LE(0x0000), 0x00, \
     FEATURE_UNIT_CAP_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AC_INTERFACE_FEATURE_UNIT, \
     FEATURE_UNIT_CAP_ID, INPUT_TERMINAL_CAP_ID, \
     U32_TO_U8S_LE(0x0000000F), U32_TO_U8S_LE(0x0000000F), U32_TO_U8S_LE(0x0000000F), \
@@ -425,12 +468,12 @@ _Static_assert(CONFIG_TOTAL_LEN_NO_FEEDBACK == 313, "Config total must be 313 by
     0x00, FEATURE_UNIT_CAP_ID, CLOCK_SELECTOR_ID, U16_TO_U8S_LE(0x0000), 0x0B, \
     9, TUSB_DESC_INTERFACE, \
     ITF_NUM_AUDIO_STREAMING_PB, 0, 0, \
-    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 0,
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11,
 
 #define DESC_CONFIG_ALT1_WITH_FEEDBACK \
     9, TUSB_DESC_INTERFACE, \
     ITF_NUM_AUDIO_STREAMING_PB, 1, 2, \
-    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 0, \
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11, \
     AS_GENERAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_AS_GENERAL, \
     INPUT_TERMINAL_PB_ID, 0x00, AUDIO_FORMAT_TYPE_I, U32_TO_U8S_LE(0x00000001), \
     2, U32_TO_U8S_LE(0x00000000), 0x16, \
@@ -446,7 +489,7 @@ _Static_assert(CONFIG_TOTAL_LEN_NO_FEEDBACK == 313, "Config total must be 313 by
 #define DESC_CONFIG_ALT1_NO_FEEDBACK \
     9, TUSB_DESC_INTERFACE, \
     ITF_NUM_AUDIO_STREAMING_PB, 1, 1, \
-    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 0, \
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11, \
     AS_GENERAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_AS_GENERAL, \
     INPUT_TERMINAL_PB_ID, 0x00, AUDIO_FORMAT_TYPE_I, U32_TO_U8S_LE(0x00000001), \
     2, U32_TO_U8S_LE(0x00000000), 0x16, \
@@ -460,7 +503,7 @@ _Static_assert(CONFIG_TOTAL_LEN_NO_FEEDBACK == 313, "Config total must be 313 by
 #define DESC_CONFIG_ALT2_WITH_FEEDBACK \
     9, TUSB_DESC_INTERFACE, \
     ITF_NUM_AUDIO_STREAMING_PB, 2, 2, \
-    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 0, \
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11, \
     AS_GENERAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_AS_GENERAL, \
     INPUT_TERMINAL_PB_ID, 0x00, AUDIO_FORMAT_TYPE_I, U32_TO_U8S_LE(0x00000001), \
     2, U32_TO_U8S_LE(0x00000000), 0x16, \
@@ -476,7 +519,7 @@ _Static_assert(CONFIG_TOTAL_LEN_NO_FEEDBACK == 313, "Config total must be 313 by
 #define DESC_CONFIG_ALT2_NO_FEEDBACK \
     9, TUSB_DESC_INTERFACE, \
     ITF_NUM_AUDIO_STREAMING_PB, 2, 1, \
-    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 0, \
+    TUSB_CLASS_AUDIO, AUDIO_SUBCLASS_STREAMING, AUDIO_INT_PROTOCOL_CODE_V2, 11, \
     AS_GENERAL_LEN, TUSB_DESC_CS_INTERFACE, AUDIO_CS_AS_INTERFACE_AS_GENERAL, \
     INPUT_TERMINAL_PB_ID, 0x00, AUDIO_FORMAT_TYPE_I, U32_TO_U8S_LE(0x00000001), \
     2, U32_TO_U8S_LE(0x00000000), 0x16, \
@@ -726,7 +769,18 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
                 return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &range, sizeof(range));
             }
         }
-        if (ctrlSel == AUDIO_CS_CTRL_CLK_VALID) {
+        if (ctrlSel == AUDIO_CS_CTRL_CLK_VALID && p_request->bRequest == AUDIO_CS_REQ_CUR) {
+#if CONFIG_MINIDSP_SIM_EP0_HANG_TEST_BUILD
+            if (ep0_hang_armed) {
+                // Accept the request but never arm its data stage: the host's
+                // IN tokens are NAKed until the soft disconnect resets the bus.
+                ep0_hang_armed = false;
+                ep0_hang_started_us = esp_timer_get_time();
+                ESP_LOGW(TAG, "FAULT: leaving GET clock valid unanswered; soft disconnect in %d s",
+                         SIM_EP0_HANG_RELEASE_S);
+                return true;
+            }
+#endif
             ESP_LOGI(TAG, "GET clock valid -> %d", clock_valid);
             audio_control_cur_1_t valid = { .bCur = clock_valid };
             return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &valid, sizeof(valid));
@@ -735,7 +789,8 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 
     // Playback Feature Unit (ID=10)
     if (entityID == FEATURE_UNIT_PB_ID) {
-        if (ctrlSel == AUDIO_FU_CTRL_MUTE && playback_fu_channel_supported(channelNum)) {
+        if (ctrlSel == AUDIO_FU_CTRL_MUTE && p_request->bRequest == AUDIO_CS_REQ_CUR &&
+            playback_fu_channel_supported(channelNum)) {
             audio_control_cur_1_t cur = { .bCur = pb_mute[channelNum] };
             return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &cur, sizeof(cur));
         }
@@ -758,7 +813,8 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 
     // Capture Feature Unit (ID=11)
     if (entityID == FEATURE_UNIT_CAP_ID) {
-        if (ctrlSel == AUDIO_FU_CTRL_MUTE && channelNum < 5) {
+        if (ctrlSel == AUDIO_FU_CTRL_MUTE && p_request->bRequest == AUDIO_CS_REQ_CUR &&
+            channelNum < 5) {
             audio_control_cur_1_t cur = { .bCur = cap_mute[channelNum] };
             return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &cur, sizeof(cur));
         }
@@ -767,7 +823,7 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
                 audio_control_cur_2_t cur = { .bCur = cap_volume[channelNum] };
                 return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &cur, sizeof(cur));
             }
-            if (p_request->bRequest == AUDIO_CS_REQ_RANGE) {
+            if (p_request->bRequest == AUDIO_CS_REQ_RANGE && channelNum < 5) {
                 audio_control_range_2_n_t(1) range = {
                     .wNumSubRanges = 1,
                     .subrange = {{ .bMin = -90 * 256, .bMax = 0, .bRes = 256 }}
@@ -779,7 +835,7 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p
 
     // Clock Selector (ID=40)
     if (entityID == CLOCK_SELECTOR_ID) {
-        if (ctrlSel == 0x01) {
+        if (ctrlSel == 0x01 && p_request->bRequest == AUDIO_CS_REQ_CUR) {
             audio_control_cur_1_t cur = { .bCur = 1 };
             return tud_audio_buffer_and_schedule_control_xfer(rhport, p_request, &cur, sizeof(cur));
         }
@@ -834,6 +890,11 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 
     if (itf == ITF_NUM_AUDIO_STREAMING_PB) {
         current_pb_alt = alt;
+        portENTER_CRITICAL(&pb_stats_lock);
+        pb_stats_generation++;
+        pb_stats_packets = 0;
+        pb_stats_sample_frames = 0;
+        portEXIT_CRITICAL(&pb_stats_lock);
         ESP_LOGI(TAG, "Playback SET_INTERFACE alt=%d (%s, %s)",
                  alt,
                  alt == 0 ? "STOP" : (alt == 1 ? "24-bit" : "16-bit"),
@@ -841,7 +902,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 
 #if CFG_TUD_AUDIO_ENABLE_EP_OUT && CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP
         if (alt > 0) {
-            tud_audio_fb_set(sample_rate_to_feedback_q16(load_current_sample_rate()));
+            tud_audio_fb_set(reported_feedback_q16());
         }
 #endif
     }
@@ -867,7 +928,7 @@ TU_ATTR_FAST_FUNC void tud_audio_feedback_interval_isr(uint8_t func_id, uint32_t
     (void)frame_number;
     (void)interval_shift;
 
-    tud_audio_fb_set(sample_rate_to_feedback_q16(load_current_sample_rate()));
+    tud_audio_fb_set(reported_feedback_q16());
 }
 #endif
 
@@ -877,7 +938,9 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
 {
     (void)rhport; (void)func_id; (void)ep_out; (void)cur_alt_setting;
 
-    // Config switch fault injection: simulate NAK during config switch
+    // Config switch fault injection: packets are still ACKed on the bus (this
+    // is not a USB NAK); their audio is discarded, like a device that goes
+    // silent while switching configs
     if (fault.config_switch_delay && fault.config_switch_until > 0) {
         if (esp_timer_get_time() < fault.config_switch_until) {
             // Discard audio during config switch
@@ -890,12 +953,19 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
             }
             return true;
         }
-        fault.config_switch_until = 0;  // NAK period over
+        fault.config_switch_until = 0;  // discard period over
         ESP_DRAM_LOGI(TAG_ISR, "Config switch delay ended, resuming audio");
     }
 
     total_pb_bytes += n_bytes_received;
     pb_frames_received++;
+
+    // Each callback is one isochronous packet (one USB frame)
+    uint32_t frame_bytes = current_pb_alt == 2 ? 4 : 6;  // 16- or 24-bit stereo
+    portENTER_CRITICAL_ISR(&pb_stats_lock);
+    pb_stats_packets++;
+    pb_stats_sample_frames += n_bytes_received / frame_bytes;
+    portEXIT_CRITICAL_ISR(&pb_stats_lock);
 
     if (pb_frames_received % 1000 == 0) {
         ESP_DRAM_LOGI(TAG_ISR, "Playback: %lu frames, %lu bytes (alt %d)",
@@ -1369,10 +1439,11 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 
     if (bufsize < 1) return;
 
-    // Fault injection: NAK first N writes
+    // Fault injection: drop the next N commands after they were received
+    // (the OUT transfer itself completes; no USB NAK). The host sees no reply.
     if (fault.hid_naks_remaining > 0) {
         fault.hid_naks_remaining--;
-        ESP_LOGW(TAG, "FAULT: NAK HID write (%d remaining)", fault.hid_naks_remaining);
+        ESP_LOGW(TAG, "FAULT: Dropping HID command (%d remaining)", fault.hid_naks_remaining);
         return;
     }
 
@@ -1430,7 +1501,7 @@ static void check_serial_commands(void)
     case '3':
         fault.hid_nak_count = 3;
         fault.hid_naks_remaining = 3;
-        ESP_LOGI(TAG, "FAULT: HID NAK next 3 writes");
+        ESP_LOGI(TAG, "FAULT: Drop next 3 HID commands");
         break;
     case '4':
         fault.command_timeout = !fault.command_timeout;
@@ -1453,21 +1524,58 @@ static void check_serial_commands(void)
                  no_feedback_mode_enabled() ? "WITHOUT" : "WITH");
         ESP_LOGI(TAG, "  Playback FU master channel: %s",
                  playback_channel_only_fu_mode_enabled() ? "UNSUPPORTED (channels 1/2 only)" : "SUPPORTED");
-        ESP_LOGI(TAG, "  Faults: csw_delay=%d empty_hid=%d nak=%d timeout=%d",
+        ESP_LOGI(TAG, "  Faults: csw_delay=%d empty_hid=%d drop=%d timeout=%d",
                  fault.config_switch_delay, fault.empty_hid_response,
                  fault.hid_naks_remaining, fault.command_timeout);
         break;
     case 'h':
         ESP_LOGI(TAG, "Fault injection keys:");
-        ESP_LOGI(TAG, "  1: Toggle config switch delay (4.5s audio NAK after SetConfig)");
+        ESP_LOGI(TAG, "  1: Toggle config switch delay (discard audio for 4.5s after a HID SetConfig)");
         ESP_LOGI(TAG, "  2: Toggle empty HID response");
-        ESP_LOGI(TAG, "  3: NAK next 3 HID writes");
+        ESP_LOGI(TAG, "  3: Drop next 3 HID commands (no reply)");
         ESP_LOGI(TAG, "  4: Toggle command timeout");
         ESP_LOGI(TAG, "  s: Show simulator state");
         ESP_LOGI(TAG, "  h: Show this help");
         break;
     }
 }
+
+// ── Descriptor fidelity ───────────────────────────────────────────
+
+#if !CONFIG_MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD && !CONFIG_MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
+#include "../../../ref/minidsp_2x4hd_descriptors.h"
+
+_Static_assert(sizeof(desc_configuration_real) == sizeof(minidsp_2x4hd_config1_desc),
+               "Default config descriptor must be the captured device's length");
+_Static_assert(sizeof(desc_device) == sizeof(minidsp_2x4hd_device_desc),
+               "Device descriptor must be the captured device's length");
+
+// The default image claims byte-for-byte fidelity with the captured miniDSP
+// (ref/minidsp_2x4hd_descriptors.h). The one known difference is
+// bNumConfigurations: the real device reports 2, but only configuration 1 was
+// captured (it is the one ESP-IDF enumerates), so the simulator reports 1.
+static void log_descriptor_fidelity(void)
+{
+    uint8_t expected_device[sizeof(minidsp_2x4hd_device_desc)];
+    memcpy(expected_device, minidsp_2x4hd_device_desc, sizeof(expected_device));
+    expected_device[17] = 1;  // bNumConfigurations, see above
+    bool device_match = memcmp(&desc_device, expected_device, sizeof(expected_device)) == 0;
+    bool config_match = memcmp(desc_configuration_real, minidsp_2x4hd_config1_desc,
+                               sizeof(minidsp_2x4hd_config1_desc)) == 0;
+    if (device_match && config_match) {
+        ESP_LOGI(TAG, "Descriptors: byte-identical to the captured miniDSP 2x4 HD "
+                 "(except bNumConfigurations 1 vs 2)");
+    } else {
+        ESP_LOGE(TAG, "Descriptors DIFFER from the captured miniDSP 2x4 HD (device: %s, config: %s)",
+                 device_match ? "match" : "differs", config_match ? "match" : "differs");
+    }
+}
+#else
+static void log_descriptor_fidelity(void)
+{
+    ESP_LOGI(TAG, "Descriptors: reduced test variant (intentionally differs from the real miniDSP)");
+}
+#endif
 
 // ── Main ──────────────────────────────────────────────────────────
 
@@ -1480,11 +1588,61 @@ static void tusb_device_task(void *arg)
     }
 }
 
+/**
+ * Every 10 s of playback, compare the host's average samples per packet with
+ * the rate this device asks for: the reported feedback, or the nominal rate
+ * without a feedback endpoint. Over 5000+ packets the average resolves
+ * 0.0002 samples/packet, so a host that ignores feedback drift shows up.
+ */
+static void log_packet_sizing_check(void)
+{
+    portENTER_CRITICAL(&pb_stats_lock);
+    uint32_t generation = pb_stats_generation;
+    uint32_t packets = pb_stats_packets;
+    uint64_t frames = pb_stats_sample_frames;
+    portEXIT_CRITICAL(&pb_stats_lock);
+    uint8_t alt = current_pb_alt;
+    double expected = no_feedback_mode_enabled()
+                          ? load_current_sample_rate() / 1000.0
+                          : last_reported_fb_q16 / 65536.0;
+    // The rate and alt are only meaningful for the stream the totals came
+    // from; skip this round if a SET_INTERFACE started another one meanwhile.
+    portENTER_CRITICAL(&pb_stats_lock);
+    bool same_stream = generation == pb_stats_generation;
+    portEXIT_CRITICAL(&pb_stats_lock);
+    if (!same_stream || alt == 0 || packets < 5000) {
+        return;
+    }
+    double avg = (double)frames / packets;
+    double diff = avg - expected;
+    bool ok = diff > -0.0005 && diff < 0.0005;
+    ESP_LOGI(TAG, "PACKET SIZING CHECK %s: host averages %.4f samples/packet over %lu packets, "
+             "device asks for %.4f", ok ? "PASS" : "FAIL", avg, (unsigned long)packets, expected);
+}
+
 static void monitor_task(void *arg)
 {
     (void)arg;
+    int64_t last_sizing_log_us = esp_timer_get_time();
     while (1) {
         check_serial_commands();
+
+        int64_t now = esp_timer_get_time();
+        if (now - last_sizing_log_us >= 10 * 1000000LL) {
+            last_sizing_log_us = now;
+            log_packet_sizing_check();
+        }
+#if CONFIG_MINIDSP_SIM_EP0_HANG_TEST_BUILD
+        if (ep0_hang_started_us != 0 &&
+            now - ep0_hang_started_us >= SIM_EP0_HANG_RELEASE_S * 1000000LL) {
+            ep0_hang_started_us = 0;
+            ESP_LOGW(TAG, "FAULT: soft disconnect to release the unanswered request");
+            tud_disconnect();
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            tud_connect();
+            ESP_LOGI(TAG, "Reconnected (fault disarmed until reboot)");
+        }
+#endif
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -1517,6 +1675,7 @@ void app_main(void)
     ESP_LOGI(TAG, "EEPROM: preset=%d source=%d vol=%d mute=%d serial=%d",
              eeprom.current_preset, eeprom.current_source,
              eeprom.master_volume, eeprom.master_mute, eeprom.serial_number);
+    log_descriptor_fidelity();
     ESP_LOGI(TAG, "Press 'h' for fault injection help");
 
     // Fault injection: slow boot

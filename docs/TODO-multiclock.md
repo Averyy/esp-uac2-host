@@ -26,7 +26,7 @@ Desired end state:
 
 - each opened AS interface resolves its own effective clock source
 - all clock-control APIs operate on that interface's resolved clock entity
-- playback and capture interfaces can coexist as independent control paths even if the ESP32-S3 still rejects simultaneous streaming
+- playback and capture interfaces can coexist as independent control paths (simultaneous streaming on ESP32-S3 is opt-in via `CONFIG_UAC2_ALLOW_DUPLEX`)
 - single-clock devices continue to work unchanged
 
 ## Proposed Design
