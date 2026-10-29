@@ -1,57 +1,20 @@
-# Publish to ESP Component Registry
+# ESP Component Registry
 
-Publishing `usb_host_uac2` on [components.espressif.com](https://components.espressif.com). Driver is complete and hardware-verified — these are the remaining packaging tasks.
+Published as [`averyy/usb_host_uac2`](https://components.espressif.com/components/averyy/usb_host_uac2) (first release 0.1.3, 2026-10-29). The component lives in `components/usb_host_uac2`, named after the registry component like Espressif's own `usb_host_<class>` drivers, and the example depends on `averyy/usb_host_uac2` with an `override_path` (stripped when a project is created from the registry).
 
----
+## Releasing a version
 
-## 1. Component Packaging
+1. Bump the version in `components/usb_host_uac2/idf_component.yml`, `UAC2_HOST_VER_*` in `include/usb/uac2_host.h` and `PROJECT_VER` in the root `CMakeLists.txt`.
+2. Add a dated section to `components/usb_host_uac2/CHANGELOG.md` (Keep a Changelog; list anything existing callers must change under "Breaking Changes").
+3. Commit, push to `main` and wait for CI.
+4. Tag and release: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`, then `gh release create vX.Y.Z --title vX.Y.Z --notes-file <CHANGELOG section>`.
+5. Publish: `gh workflow run publish-component.yml --ref main -f namespace=averyy -f execute_upload=true`. The workflow builds the example, then uploads with GitHub OIDC. The registry trusts `Averyy/esp-uac2-host`, workflow `publish-component.yml`, branch `main` (set under Permissions -> averyy -> usb_host_uac2 -> Trusted Uploaders). A version can be uploaded only once.
+6. Check: the registry page, `idf.py add-dependency "averyy/usb_host_uac2^X.Y.Z"` in a fresh project, and `idf.py create-project-from-example "averyy/usb_host_uac2^X.Y.Z:basic_playback"`.
 
-- [x] `idf_component.yml` created
-- [x] Component-level `README.md` for the registry page (usage, API overview, quick start, hardware requirements)
-- [x] Verify `CMakeLists.txt` uses `idf_component_register()` correctly for standalone consumption
+`compote component pack --name usb_host_uac2` (in a copy of the component folder) shows exactly what will ship; `files.exclude` in the manifest keeps local build output out.
 
-## 2. Examples Directory
+## Open
 
-The registry auto-discovers `examples/` and displays them on the component page.
-
-- [x] `components/usb_host_uac2/examples/basic_playback/` — minimal: enumerate, open, stream 48kHz sine wave
-- [x] Each example needs its own `CMakeLists.txt`, `main/`, and `README.md`
-- [x] Examples use `idf_component.yml` with dependency on the component for standalone local builds (`path` now, registry dependency after publish)
-
-## 3. GitHub Repo Prep
-
-- [x] Final namespace chosen: `averyy` (matching GitHub username)
-- [x] Clean up repo: ignore generated `build/`, `sdkconfig`, `dependencies.lock`, and example artifacts; keep `ref/` and `simulators/` clearly separated
-- [x] Top-level `README.md` with local component usage and planned Component Registry install instructions
-- [ ] Component Registry badge in README
-- [ ] Tag conventions: semver with `v` prefix matching `idf_component.yml` (`v0.1.3`, `v0.2.0`, ... `v1.0.0`)
-
-## 4. CI / GitHub Actions
-
-- [x] Build CI (root project + component example against ESP-IDF v5.4 and v6.1; all simulator profiles against v5.4)
-- [x] Manual/gated publish workflow scaffold added (`espressif/upload-components-ci-action@v2`) but not enabled for automatic release
-- [ ] Test against [staging registry](https://components-staging.espressif.com) first
-
-## 5. Registry Account Setup
-
-- [x] Create account on components.espressif.com (GitHub OAuth)
-- [x] Confirm default namespace exists: `averyy`
-- [ ] Verify OIDC token permissions for GitHub Actions uploads
-  Add `Averyy/esp-uac2-host` as a trusted uploader in the ESP Component Registry UI for the `Publish Component` workflow (`publish-component.yml`) before enabling workflow-based uploads.
-
-## 6. Post-Publish
-
-- [ ] Verify component page renders correctly
-- [ ] Test install from fresh project: `idf.py add-dependency "averyy/usb_host_uac2^<published version>"`
-- [ ] Announce: ESP32 forum, Reddit r/esp32
-- [ ] Update `llms.txt` with install instructions
-- [ ] Tested device compatibility list in README
-
----
-
-## Naming
-
-Espressif convention: `usb_host_<class>` (`usb_host_cdc_acm`, `usb_host_hid`, `usb_host_uac`).
-
-**Component name: `usb_host_uac2`**
-**Planned package name: `averyy/usb_host_uac2`**
+- [ ] Comment on [espressif/esp-usb#173](https://github.com/espressif/esp-usb/issues/173) (UAC 2.0 support request) offering the driver
+- [ ] Announce: ESP32 forum, r/esp32
+- [ ] Tested-device list in the README as reports come in

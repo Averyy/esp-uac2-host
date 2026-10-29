@@ -1,5 +1,7 @@
 # esp-uac2-host
 
+[![Component Registry](https://components.espressif.com/components/averyy/usb_host_uac2/badge.svg)](https://components.espressif.com/components/averyy/usb_host_uac2)
+
 > [!NOTE]
 > Verified on an ESP32-S3 with a miniDSP 2x4 HD, the UAC2 device I have on hand. Other UAC2 devices should work too. If yours doesn't, or you'd like a feature or a change, please [open an issue](https://github.com/Averyy/esp-uac2-host/issues). Pull requests are welcome.
 

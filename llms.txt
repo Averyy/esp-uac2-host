@@ -8,6 +8,8 @@ A UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio t
 
 v0.1.3 (2026-10-29), on the ESP Component Registry as `averyy/usb_host_uac2` (folder `components/usb_host_uac2`): verified on a miniDSP 2x4 HD under ESP-IDF 5.4.0, 6.0.3 and 6.1 (full harness, hot-unplug, a downstream app's sweeps and a 10-minute run checked with a measurement mic). A harness session once left the miniDSP stuck silent until power-cycled; it didn't reproduce. Duplex is unverified on the 2x4 HD. Single-clock UAC2 devices; builds clean with `-Werror -Wextra`.
 
+Install: `idf.py add-dependency "averyy/usb_host_uac2^0.1.3"` (or a `git:` dependency on this repo with `path: components/usb_host_uac2`).
+
 ## Architecture
 
 ```
