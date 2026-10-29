@@ -20,7 +20,7 @@ v0.1.3 (2026-10-29): verified on the miniDSP 2x4 HD under ESP-IDF 5.4.0, 6.0.3 a
 - Not testable on this hardware: two streams racing the duplex guard, URBs whose every packet fails (static review only)
 - [x] `basic_playback` example on hardware (2026-10-29, IDF 6.1, committed tree): boot -> connect -> "Playback started" (packed 24-bit layout check passed), a minute of streaming with no warnings, unplug (stopped, closed on the first try, device freed), replug (plays again at a new address), and a quick double replug (each cycle clean, ends playing). Cleanup took <1 ms, so a reconnect landing mid-cleanup (the mailbox path) is covered by review only. Log: `logs/example-test.log`
 - [x] Released v0.1.3 (2026-10-29): commit `1300e61` on `main` (CI 15/15), tag and GitHub release `v0.1.3` (older releases v0.1.0-v0.1.2 backfilled at their version-bump commits), published to the ESP Component Registry as `averyy/usb_host_uac2` 0.1.3 by the `publish-component.yml` workflow (OIDC trusted uploader). Verified: registry page and badge, a fresh IDF 5.4 project installs it with `idf.py add-dependency` and builds, and the registry example builds on IDF 6.1 with its override stripped. Release steps for future versions: `docs/TODO-publish-component-registry.md`
-- [ ] Comment on espressif/esp-usb#173 offering the driver (draft approved by the user before posting)
+- [x] Offered the driver on espressif/esp-usb#173 (2026-10-29): https://github.com/espressif/esp-usb/issues/173#issuecomment-6510933805 (as a separate `usb_host_uac2` component or folded into `usb_host_uac`; waiting on Espressif)
 - Not planned: UAC1 (`docs/TODO-uac1-coexistence.md`), multi-clock (`docs/TODO-multiclock.md`)
 
 ## v0.1.3 hardware runs

@@ -15,6 +15,6 @@ Published as [`averyy/usb_host_uac2`](https://components.espressif.com/component
 
 ## Open
 
-- [ ] Comment on [espressif/esp-usb#173](https://github.com/espressif/esp-usb/issues/173) (UAC 2.0 support request) offering the driver
+- [x] Offered the driver on [espressif/esp-usb#173](https://github.com/espressif/esp-usb/issues/173#issuecomment-6510933805) (2026-10-29); if Espressif wants a PR, title it `USB-173: ...`
 - [ ] Announce: ESP32 forum, r/esp32
 - [ ] Tested-device list in the README as reports come in
