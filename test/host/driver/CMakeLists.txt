@@ -15,3 +15,14 @@ if(UAC2_SANITIZE)
 endif()
 
 project(uac2_host_driver_test)
+
+# Darwin longjmp() restores the signal mask process-wide, unblocking SIGALRM
+# on suspended FreeRTOS pthreads after a Unity assertion fails. Only the
+# running task may receive the POSIX port's tick signal. Use Unity's hooks
+# with the jump pair that leaves signal masks alone, in Unity and its users.
+if(APPLE)
+    idf_component_get_property(unity_lib unity COMPONENT_LIB)
+    target_compile_options(${unity_lib} PUBLIC
+        "-DUNITY_TEST_PROTECT()=(_setjmp(Unity.AbortFrame)==0)"
+        "-DUNITY_TEST_ABORT()=_longjmp(Unity.AbortFrame,1)")
+endif()

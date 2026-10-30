@@ -237,6 +237,156 @@ static void test_many_alt_settings(void)
     }
 }
 
+/** REAL with extra interfaces appended (wTotalLength and bNumInterfaces updated). */
+static uint8_t *append_function(const uint8_t *extra, uint16_t extra_len, uint8_t extra_ifaces,
+                                uint16_t *out_len)
+{
+    uint16_t len = (uint16_t)(REAL_LEN + extra_len);
+    uint8_t *d = malloc(len);
+    memcpy(d, REAL, REAL_LEN);
+    memcpy(d + REAL_LEN, extra, extra_len);
+    set_total_length(d, len);
+    d[4] = (uint8_t)(d[4] + extra_ifaces);
+    *out_len = len;
+    return d;
+}
+
+// A legacy (UAC1, protocol 0) AudioControl interface for a USB-MIDI function
+// after the UAC2 audio function, as on the MOTU UltraLite AVB and Focusrite
+// 1235:8201: IF5 AC, IF6 MIDIStreaming
+static const uint8_t k_midi_function[] = {
+    0x09, 0x04, 0x05, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+    0x09, 0x24, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x06,     // header bcdADC 1.00, IF6
+    0x09, 0x04, 0x06, 0x00, 0x02, 0x01, 0x03, 0x00, 0x00,
+    0x07, 0x24, 0x01, 0x00, 0x01, 0x19, 0x00,                 // MS header
+    0x09, 0x05, 0x03, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,     // bulk OUT 0x03
+    0x05, 0x25, 0x01, 0x01, 0x01,
+    0x09, 0x05, 0x84, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,     // bulk IN 0x84
+    0x05, 0x25, 0x01, 0x01, 0x03,
+};
+
+// A UAC1 PCM function after the UAC2 one: IF5 AC, IF6 AudioStreaming with
+// UAC1 descriptor layouts (protocol 0)
+static const uint8_t k_uac1_pcm_function[] = {
+    0x09, 0x04, 0x05, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+    0x09, 0x24, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x06,     // header bcdADC 1.00, IF6
+    0x09, 0x04, 0x06, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00,     // alt 0
+    0x09, 0x04, 0x06, 0x01, 0x01, 0x01, 0x02, 0x00, 0x00,     // alt 1
+    0x07, 0x24, 0x01, 0x01, 0x01, 0x01, 0x00,                 // UAC1 AS_GENERAL, PCM
+    0x0B, 0x24, 0x02, 0x01, 0x02, 0x02, 0x10, 0x01, 0x80, 0xBB, 0x00,  // 2ch 16-bit 48k
+    0x09, 0x05, 0x03, 0x05, 0xC0, 0x00, 0x01, 0x00, 0x00,     // iso OUT 0x03, 192 B
+    0x07, 0x25, 0x01, 0x00, 0x00, 0x00, 0x00,
+};
+
+static void test_trailing_midi_function(void)
+{
+    // Class requests go to the UAC2 function's AC interface, not the MIDI one
+    uint16_t len;
+    uint8_t *d = append_function(k_midi_function, sizeof(k_midi_function), 2, &len);
+    uac2_device_info_t info;
+    CHECK(parse("UAC1 MIDI AC after the UAC2 function", d, len, &info));
+    CHECK(info.is_uac2);
+    CHECK(info.ac_iface_num == 0);
+    CHECK(info.bcdADC == 0x0200);
+    CHECK(info.num_as_ifaces == 3);
+    free(d);
+}
+
+static void test_uac1_streaming_interface_ignored(void)
+{
+    uint16_t len;
+    uint8_t *d = append_function(k_uac1_pcm_function, sizeof(k_uac1_pcm_function), 2, &len);
+    uac2_device_info_t info;
+    CHECK(parse("UAC1 AudioStreaming interface ignored", d, len, &info));
+    CHECK(info.ac_iface_num == 0);
+    CHECK(info.bcdADC == 0x0200);
+    CHECK(info.num_as_ifaces == 3);
+    CHECK(find_alt(&info, 6, 1) == NULL);
+    free(d);
+}
+
+/**
+ * A second UAC2 audio function after REAL (optionally without REAL's IAD):
+ * its own IAD (when with_iad), AC interface 5 and a copy of REAL's capture
+ * interface renumbered 6. Its streaming interface must not be reported, since
+ * its requests would address the first function's AC interface.
+ */
+static uint8_t *second_function_config(bool with_iad, uint16_t *out_len)
+{
+    static const uint8_t iad[] = {0x08, 0x0B, 0x05, 0x02, 0x01, 0x00, 0x20, 0x00};
+    static const uint8_t ac[] = {
+        0x09, 0x04, 0x05, 0x00, 0x00, 0x01, 0x01, 0x20, 0x00,
+        0x09, 0x24, 0x01, 0x00, 0x02, 0x08, 0x09, 0x00, 0x00,   // UAC2 header
+    };
+    int as_start = intf_offset(REAL, REAL_LEN, 2, 0);
+    int as_end = intf_offset(REAL, REAL_LEN, 3, 0);
+    int real_iad = -1;
+    for (int off = 0; off < REAL_LEN; off += REAL[off]) {
+        if (REAL[off + 1] == 0x0B) {
+            real_iad = off;
+            break;
+        }
+    }
+    int drop = with_iad ? 0 : 8;
+    uint16_t len = (uint16_t)(REAL_LEN - drop + (with_iad ? sizeof(iad) : 0) + sizeof(ac) +
+                              (as_end - as_start));
+    uint8_t *d = malloc(len);
+    uint16_t n = 0;
+    if (with_iad) {
+        memcpy(d, REAL, REAL_LEN);
+        n = REAL_LEN;
+        memcpy(d + n, iad, sizeof(iad));
+        n += sizeof(iad);
+    } else {
+        memcpy(d, REAL, real_iad);
+        memcpy(d + real_iad, REAL + real_iad + 8, REAL_LEN - real_iad - 8);
+        n = REAL_LEN - 8;
+    }
+    memcpy(d + n, ac, sizeof(ac));
+    n += sizeof(ac);
+    memcpy(d + n, REAL + as_start, as_end - as_start);
+    for (int off = n; off < n + (as_end - as_start); off += d[off]) {
+        if (d[off + 1] == 0x04) d[off + 2] = 6;
+        if (d[off + 1] == 0x05) d[off + 2] = 0x85;
+    }
+    n += (uint16_t)(as_end - as_start);
+    set_total_length(d, n);
+    d[4] = (uint8_t)(d[4] + 2);
+    *out_len = n;
+    return d;
+}
+
+static void test_second_uac2_function_not_reported(void)
+{
+    for (int with_iad = 1; with_iad >= 0; with_iad--) {
+        uint16_t len;
+        uint8_t *d = second_function_config(with_iad, &len);
+        uac2_device_info_t info;
+        CHECK(parse(with_iad ? "second UAC2 function, scoped by IADs"
+                             : "second UAC2 function, no IADs", d, len, &info));
+        CHECK(info.ac_iface_num == 0);
+        CHECK(info.num_as_ifaces == 3);
+        CHECK(find_alt(&info, 2, 1) != NULL);
+        CHECK(find_alt(&info, 6, 1) == NULL);
+        free(d);
+    }
+}
+
+static void test_uac1_only_device_rejected(void)
+{
+    // The UAC1 function alone: nothing for this driver
+    uint16_t len = (uint16_t)(9 + sizeof(k_uac1_pcm_function));
+    uint8_t *d = malloc(len);
+    memcpy(d, REAL, 9);                     // configuration descriptor
+    memcpy(d + 9, k_uac1_pcm_function, sizeof(k_uac1_pcm_function));
+    set_total_length(d, len);
+    d[4] = 2;
+    uac2_device_info_t info;
+    CHECK(!parse("UAC1-only configuration not reported", d, len, &info));
+    CHECK(info.num_as_ifaces == 0);
+    free(d);
+}
+
 int main(void)
 {
     test_real_device();
@@ -248,6 +398,10 @@ int main(void)
     test_duplicate_alt();
     test_duplicate_alt_first_incomplete();
     test_many_alt_settings();
+    test_trailing_midi_function();
+    test_uac1_streaming_interface_ignored();
+    test_uac1_only_device_rejected();
+    test_second_uac2_function_not_reported();
 
     if (s_failures) {
         printf("%d check(s) FAILED\n", s_failures);

@@ -61,10 +61,8 @@ menu "UAC2 Host Driver"
             the second stream's start fails with ESP_ERR_NOT_SUPPORTED when the
             host refuses its endpoint. No effect on other targets.
 
-            The device must support playback and capture at the same time.
-            This is unverified on the miniDSP 2x4 HD: both streams run at
-            full rate, but its output stayed silent until a power cycle after
-            a session that streamed both (cause not yet isolated).
+            The device must support playback and capture at the same time
+            (verified on the miniDSP 2x4 HD).
 
     config UAC2_ALLOW_UNADVERTISED_RATES
         bool "Allow sample rates the device does not advertise"
@@ -76,5 +74,24 @@ menu "UAC2 Host Driver"
             because some devices acknowledge a rate they cannot run and then
             play silence. Enable for a device whose advertised ranges are
             incomplete: the rate is then sent with only a warning.
+
+    config UAC2_STOP_STREAMS_ON_RESTART
+        bool "Stop streams before esp_restart()"
+        default n
+        help
+            uac2_host_install() registers an esp_restart() shutdown handler
+            (one of ESP-IDF's five) that stops every started stream first, as
+            stop() does, so the device sees alt 0 before the host goes away,
+            the order Linux uses at shutdown. It takes about 10 ms per stream,
+            but can hold the restart for seconds if the device stops
+            answering. It does nothing when esp_restart() is called from the
+            task that pumps driver events. Panics, watchdog resets and the
+            reset pin skip it.
+
+            Enable for a device that misbehaves when the host restarts
+            mid-stream. The miniDSP 2x4 HD isn't known to need it:
+            esp_restart() leaves the USB controller running, and its
+            occasional silent state followed hardware resets, never a
+            software restart.
 
 endmenu

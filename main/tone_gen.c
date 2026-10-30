@@ -26,12 +26,20 @@ void tone_gen_init(tone_gen_t *gen, const tone_gen_config_t *config)
     gen->phase_inc = (2.0f * (float)M_PI * config->frequency) / (float)config->sample_rate;
     gen->env = 0.0f;
     gen->env_target = 1.0f;
-    gen->env_step = 1.0f / (0.02f * (float)config->sample_rate);  // 20 ms ramps
+    // 20 ms or four periods: a subwoofer turns a ramp shorter than its tone's
+    // period into a thump
+    float ramp_s = fmaxf(0.02f, 4.0f / config->frequency);
+    gen->env_step = 1.0f / (ramp_s * (float)config->sample_rate);
 }
 
 void tone_gen_fade_out(tone_gen_t *gen)
 {
     gen->env_target = 0.0f;
+}
+
+bool tone_gen_silent(const tone_gen_t *gen)
+{
+    return gen->env_target == 0.0f && gen->env <= 0.0f;
 }
 
 uint32_t tone_gen_fill(tone_gen_t *gen, uint8_t *buf, uint32_t buf_size)

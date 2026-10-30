@@ -45,6 +45,7 @@ typedef struct fake_xfer {
     bool hung;                  // control transfer left unanswered
     uint64_t due_frame;
     bool is_feedback;
+    uint16_t fb_mps;            // feedback endpoint wMaxPacketSize (3: answers in 10.14)
     bool is_out_data;
     usb_transfer_t xfer;        // last: ends in a flexible array
 } fake_xfer_t;
@@ -58,6 +59,7 @@ typedef struct {
     int ctrl_in_flight;
     bool claimed[MAX_IFACES];
     uint8_t claimed_alt[MAX_IFACES];
+    uint8_t dev_alt[MAX_IFACES];        // alt setting the device runs (last SET_INTERFACE)
     bool halted[32];
     uint64_t ep_next_frame[32];   // URBs on one endpoint run back to back, as in the HCD
     int ctrl_retire_pending;      // completed control transfers not yet retired (IDF 5.x order)
@@ -101,9 +103,17 @@ static struct {
     bool armed;
     uint8_t entity;
     uint8_t cs;
+    uint8_t request;    // bRequest to match, 0 for any
     bool get;
 } s_hang;
 static uint16_t s_max_iso_out_mps;
+static int16_t s_volume_range[3];   // feature-unit volume RANGE reply: min, max, res
+static uint8_t s_device_desc[sizeof(minidsp_2x4hd_device_desc)];   // bMaxPacketSize0 settable
+static uint64_t s_ep0_usable_frame;  // IDF 5.x: EP0 refuses submits until this frame after an error
+static int s_ep0_recovery_frames;   // how long that lasts
+static uint8_t s_fail_submit_ep;
+static int s_fail_submit_count;
+static uint8_t s_error_halt_ep;        // next transfer completing here fails with a channel error (0: none)
 static uint8_t s_capture_next;          // next byte of the capture stream's counter pattern
 static int s_alloc_fail_after = -1;     // transfer allocations left before one fails (-1: never)
 static uint8_t s_out_prev;              // last nonzero playback byte (0: none yet)
@@ -270,6 +280,49 @@ static const usb_ep_desc_t *claimed_ep_locked(uint8_t ep_addr)
     return NULL;
 }
 
+/** Claimed interface whose alt has ep_addr, or -1. */
+static int claimed_iface_of_ep_locked(uint8_t ep_addr)
+{
+    const usb_config_desc_t *cfg = (const usb_config_desc_t *)s_dev->cfg;
+    for (int i = 0; i < MAX_IFACES; i++) {
+        if (!s_dev->claimed[i]) continue;
+        int off = 0;
+        const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, i, s_dev->claimed_alt[i], &off);
+        if (!intf) continue;
+        for (int e = 0; e < intf->bNumEndpoints; e++) {
+            int eoff = off;
+            const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, e, cfg->wTotalLength, &eoff);
+            if (ep && ep->bEndpointAddress == ep_addr) return i;
+        }
+    }
+    return -1;
+}
+
+/** A transfer on ep_addr is with the "HCD" (submitted, not completed). */
+static bool ep_busy_locked(uint8_t ep_addr)
+{
+    for (fake_xfer_t *fx = s_pending; fx; fx = fx->next) {
+        if (fx->xfer.bEndpointAddress == ep_addr) return true;
+    }
+    return false;
+}
+
+/** A transfer is with the "HCD" on an endpoint of interface n's claimed alt. */
+static bool iface_busy_locked(int n)
+{
+    if (n < 0 || n >= MAX_IFACES || !s_dev->claimed[n]) return false;
+    const usb_config_desc_t *cfg = (const usb_config_desc_t *)s_dev->cfg;
+    int off = 0;
+    const usb_intf_desc_t *intf = usb_parse_interface_descriptor(cfg, n, s_dev->claimed_alt[n], &off);
+    if (!intf) return false;
+    for (int e = 0; e < intf->bNumEndpoints; e++) {
+        int eoff = off;
+        const usb_ep_desc_t *ep = usb_parse_endpoint_descriptor_by_index(intf, e, cfg->wTotalLength, &eoff);
+        if (ep && ep_busy_locked(ep->bEndpointAddress)) return true;
+    }
+    return false;
+}
+
 static void free_device_locked(void)
 {
     free(s_dev->cfg);
@@ -292,9 +345,13 @@ static void complete_iso_locked(fake_xfer_t *fx)
             p->status = s_fb_status;
             p->actual_num_bytes = 0;
         } else {
-            int n = p->num_bytes < 4 ? p->num_bytes : 4;
+            // A 3-byte endpoint reports the USB spec's 10.14, a larger one
+            // 16.16 in 4 bytes as XMOS devices do
+            uint32_t value = fx->fb_mps == 3 ? s_feedback_q16 >> 2 : s_feedback_q16;
+            int n = fx->fb_mps == 3 ? 3 : 4;
+            if (n > p->num_bytes) n = p->num_bytes;
             for (int i = 0; i < n; i++) {
-                x->data_buffer[i] = (uint8_t)(s_feedback_q16 >> (8 * i));
+                x->data_buffer[i] = (uint8_t)(value >> (8 * i));
             }
             p->status = USB_TRANSFER_STATUS_COMPLETED;
             p->actual_num_bytes = n;
@@ -375,7 +432,21 @@ static void bus_task(void *arg)
             fake_xfer_t *next = fx->next;
             bool halted = s_dev && s_dev->halted[ep_index(fx->xfer.bEndpointAddress)];
             if (!fx->hung && fx->xfer.bEndpointAddress != 0 && !halted && fx->due_frame <= s_frame) {
-                complete_iso_locked(fx);
+                if (s_error_halt_ep && fx->xfer.bEndpointAddress == s_error_halt_ep) {
+                    // hcd_dwc.c's ERROR branch: this URB fails, the pipe halts and
+                    // the URBs queued behind it stay pending until a flush
+                    s_error_halt_ep = 0;
+                    s_dev->halted[ep_index(fx->xfer.bEndpointAddress)] = true;
+                    for (int i = 0; i < fx->xfer.num_isoc_packets; i++) {
+                        fx->xfer.isoc_packet_desc[i].status = USB_TRANSFER_STATUS_ERROR;
+                        fx->xfer.isoc_packet_desc[i].actual_num_bytes = 0;
+                    }
+                    fx->xfer.actual_num_bytes = 0;
+                    fx->xfer.status = USB_TRANSFER_STATUS_ERROR;
+                    complete_locked(fx);
+                } else {
+                    complete_iso_locked(fx);
+                }
             }
             fx = next;
         }
@@ -417,6 +488,14 @@ void fake_usb_reset(void)
     s_release_busy = 0;
     s_hang.armed = false;
     s_max_iso_out_mps = 0;
+    s_fail_submit_count = 0;
+    s_error_halt_ep = 0;
+    s_ep0_usable_frame = 0;
+    s_ep0_recovery_frames = 2;
+    memcpy(s_device_desc, minidsp_2x4hd_device_desc, sizeof(s_device_desc));
+    s_volume_range[0] = -90 * 256;
+    s_volume_range[1] = 0;
+    s_volume_range[2] = 256;
     s_stall.armed = false;
     s_alloc_fail_after = -1;
     s_out_prev = 0;
@@ -496,19 +575,50 @@ void fake_usb_fail_out_urbs(usb_transfer_status_t packet_status, int count)
     lock(); s_out_fail_status = packet_status; s_out_fail_count = count; unlock();
 }
 
-void fake_usb_hang_ctrl(uint8_t entity, uint8_t control_selector, bool get)
+void fake_usb_hang_ctrl_request(uint8_t entity, uint8_t control_selector, uint8_t request, bool get)
 {
     lock();
     s_hang.armed = true;
     s_hang.entity = entity;
     s_hang.cs = control_selector;
+    s_hang.request = request;
     s_hang.get = get;
     unlock();
+}
+
+void fake_usb_hang_ctrl(uint8_t entity, uint8_t control_selector, bool get)
+{
+    fake_usb_hang_ctrl_request(entity, control_selector, 0, get);
 }
 
 void fake_usb_set_release_busy(int count) { lock(); s_release_busy = count; unlock(); }
 
 void fake_usb_set_max_iso_out_mps(uint16_t limit) { lock(); s_max_iso_out_mps = limit; unlock(); }
+
+void fake_usb_set_ep0_mps(uint8_t mps) { lock(); s_device_desc[7] = mps; unlock(); }
+
+void fake_usb_set_ep0_recovery_frames(int frames) { lock(); s_ep0_recovery_frames = frames; unlock(); }
+
+void fake_usb_stall_ctrl_clear(void) { lock(); s_stall.armed = false; unlock(); }
+
+void fake_usb_fail_submits(uint8_t ep_addr, int count)
+{
+    lock();
+    s_fail_submit_ep = ep_addr;
+    s_fail_submit_count = count;
+    unlock();
+}
+
+void fake_usb_error_halt_endpoint(uint8_t ep_addr) { lock(); s_error_halt_ep = ep_addr; unlock(); }
+
+void fake_usb_set_volume_range(int16_t min, int16_t max, int16_t res)
+{
+    lock();
+    s_volume_range[0] = min;
+    s_volume_range[1] = max;
+    s_volume_range[2] = res;
+    unlock();
+}
 
 void fake_usb_fail_transfer_alloc_after(int n) { lock(); s_alloc_fail_after = n; unlock(); }
 
@@ -562,6 +672,69 @@ uint16_t fake_usb_no_feedback_config(uint8_t sync_type, uint8_t *out, uint16_t o
     out[2] = len & 0xFF;
     out[3] = len >> 8;
     return len;
+}
+
+uint16_t fake_usb_feedback_mps_config(uint16_t fb_mps, uint8_t *out, uint16_t out_size)
+{
+    uint16_t len = sizeof(minidsp_2x4hd_config1_desc);
+    if (len > out_size) return 0;
+    memcpy(out, minidsp_2x4hd_config1_desc, len);
+    for (uint16_t off = 0; off < len && out[off] >= 2; off += out[off]) {
+        uint8_t *d = out + off;
+        if (d[1] == USB_B_DESCRIPTOR_TYPE_ENDPOINT && (d[3] & 0x30) == 0x10) {
+            d[4] = fb_mps & 0xFF;
+            d[5] = fb_mps >> 8;
+        }
+    }
+    return len;
+}
+
+uint16_t fake_usb_minidsp_config(uint8_t *out, uint16_t out_size)
+{
+    uint16_t len = sizeof(minidsp_2x4hd_config1_desc);
+    if (len > out_size) return 0;
+    memcpy(out, minidsp_2x4hd_config1_desc, len);
+    return len;
+}
+
+uint16_t fake_usb_midi_function_config(uint8_t *out, uint16_t out_size)
+{
+    // A legacy (UAC1, protocol 0) AudioControl interface for a USB-MIDI
+    // function after the audio function, as on the MOTU UltraLite AVB and
+    // Focusrite 1235:8201: IF5 AC, IF6 MIDIStreaming
+    static const uint8_t midi[] = {
+        0x09, 0x04, 0x05, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+        0x09, 0x24, 0x01, 0x00, 0x01, 0x09, 0x00, 0x01, 0x06,
+        0x09, 0x04, 0x06, 0x00, 0x02, 0x01, 0x03, 0x00, 0x00,
+        0x07, 0x24, 0x01, 0x00, 0x01, 0x19, 0x00,
+        0x09, 0x05, 0x03, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x25, 0x01, 0x01, 0x01,
+        0x09, 0x05, 0x84, 0x02, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x25, 0x01, 0x01, 0x03,
+    };
+    uint16_t base = sizeof(minidsp_2x4hd_config1_desc);
+    uint16_t len = (uint16_t)(base + sizeof(midi));
+    if (len > out_size) return 0;
+    memcpy(out, minidsp_2x4hd_config1_desc, base);
+    memcpy(out + base, midi, sizeof(midi));
+    out[2] = len & 0xFF;
+    out[3] = len >> 8;
+    out[4] += 2;    // bNumInterfaces
+    return len;
+}
+
+bool fake_usb_config_set_fu_controls(uint8_t *config, uint16_t len, uint8_t unit_id,
+                                     uint8_t channel, uint32_t bma_controls)
+{
+    for (uint16_t off = 0; off < len && config[off] >= 2; off += config[off]) {
+        uint8_t *d = config + off;
+        // CS_INTERFACE FEATURE_UNIT: bmaControls(channel) at 5 + 4 * channel
+        if (d[1] == 0x24 && d[2] == 0x06 && d[3] == unit_id && 5 + 4 * channel + 4 <= d[0]) {
+            for (int i = 0; i < 4; i++) d[5 + 4 * channel + i] = (uint8_t)(bma_controls >> (8 * i));
+            return true;
+        }
+    }
+    return false;
 }
 
 fake_usb_stats_t fake_usb_stats(void)
@@ -624,6 +797,11 @@ static int handle_ctrl_locked(const usb_setup_packet_t *setup, uint8_t *data)
     // Standard SET_INTERFACE
     if (setup->bmRequestType == 0x01 && setup->bRequest == 0x0B) {
         s_stats.set_interface_calls++;
+        if ((setup->wIndex & 0xFF) < MAX_IFACES) s_dev->dev_alt[setup->wIndex & 0xFF] = setup->wValue;
+        if (setup->wValue == 0 && iface_busy_locked(setup->wIndex & 0xFF)) {
+            ESP_LOGE(TAG, "SET_INTERFACE(%d, 0) with its transfers in flight", setup->wIndex & 0xFF);
+            s_stats.alt0_with_urbs_in_flight++;
+        }
         if (setup->wValue != 0) {
             if (!s_dev->rate_set_since_alt) s_stats.alt_enabled_without_rate++;
             s_dev->rate_set_since_alt = false;
@@ -631,6 +809,12 @@ static int handle_ctrl_locked(const usb_setup_packet_t *setup, uint8_t *data)
         return 0;
     }
     if ((setup->bmRequestType & 0x60) != 0x20) {
+        return -1;
+    }
+    // Class requests to the audio function name its AudioControl interface
+    // (IF0) in wIndex's low byte; another function's interface STALLs
+    if ((setup->bmRequestType & 0x1F) == 0x01 && (setup->wIndex & 0xFF) != 0) {
+        s_stats.ctrl_wrong_interface++;
         return -1;
     }
     uint8_t entity = setup->wIndex >> 8;
@@ -641,6 +825,16 @@ static int handle_ctrl_locked(const usb_setup_packet_t *setup, uint8_t *data)
     if (s_stall.armed && entity == s_stall.entity && cs == s_stall.cs && ch == s_stall.ch &&
         get == s_stall.get) {
         return -1;
+    }
+    if (get && cur) {
+        // A GET CUR asks for exactly the control's size (UAC2 5.2.3)
+        int size = -1;
+        if (entity == ENT_CLOCK_SOURCE && cs == 0x01) size = 4;
+        if (entity == ENT_CLOCK_SOURCE && cs == 0x02) size = 1;
+        if (entity == ENT_CLOCK_SELECTOR && cs == 0x01) size = 1;
+        if ((entity == ENT_FU_PLAYBACK || entity == ENT_FU_CAPTURE) && cs == 0x01) size = 1;
+        if ((entity == ENT_FU_PLAYBACK || entity == ENT_FU_CAPTURE) && cs == 0x02) size = 2;
+        if (size >= 0 && setup->wLength != size) s_stats.ctrl_bad_wlength++;
     }
 
     if (entity == ENT_CLOCK_SOURCE && cs == 0x01) {
@@ -699,10 +893,9 @@ static int handle_ctrl_locked(const usb_setup_packet_t *setup, uint8_t *data)
             return 0;
         }
         if (cs == 0x02 && range && get) {
-            const int16_t r[3] = {-90 * 256, 0, 256};
             data[0] = 1;
             data[1] = 0;
-            memcpy(data + 2, r, 6);
+            memcpy(data + 2, s_volume_range, 6);
             return 8;
         }
     }
@@ -725,6 +918,12 @@ static void answer_ctrl_locked(fake_xfer_t *fx)
     if (len < 0) {
         x->status = USB_TRANSFER_STATUS_STALL;
         x->actual_num_bytes = sizeof(setup);
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(6, 0, 0)
+        // In-tree IDF 5.x (usbh.c ep0_pipe_callback): the halted EP0 pipe is
+        // dequeued and cleared later in the library task, so a submit right
+        // after the failure finds it inactive ("HCD Pipe not in active state")
+        s_ep0_usable_frame = s_frame + (uint64_t)s_ep0_recovery_frames;
+#endif
     } else {
         if (get) {
             if (len > setup.wLength) len = setup.wLength;
@@ -944,7 +1143,7 @@ esp_err_t usb_host_device_info(usb_device_handle_t dev_hdl, usb_device_info_t *d
     memset(dev_info, 0, sizeof(*dev_info));
     dev_info->speed = USB_SPEED_FULL;
     dev_info->dev_addr = d->addr;
-    dev_info->bMaxPacketSize0 = 64;
+    dev_info->bMaxPacketSize0 = s_device_desc[7];
     dev_info->bConfigurationValue = 1;
     dev_info->str_desc_product = (const usb_str_desc_t *)s_product_str;
     unlock();
@@ -957,7 +1156,7 @@ esp_err_t usb_host_get_device_descriptor(usb_device_handle_t dev_hdl, const usb_
     fake_dev_t *d = check_dev_locked(dev_hdl);
     unlock();
     if (!d) return ESP_ERR_INVALID_ARG;
-    *device_desc = (const usb_device_desc_t *)minidsp_2x4hd_device_desc;
+    *device_desc = (const usb_device_desc_t *)s_device_desc;
     return ESP_OK;
 }
 
@@ -1057,6 +1256,12 @@ esp_err_t usb_host_endpoint_halt(usb_device_handle_t dev_hdl, uint8_t bEndpointA
     } else if (!d->gone && !claimed_ep_locked(bEndpointAddress)) {
         ret = ESP_ERR_NOT_FOUND;
     } else {
+        if (!d->gone && !d->halted[ep_index(bEndpointAddress)] && ep_busy_locked(bEndpointAddress)) {
+            // The HCD waits for the channel to stop with no timeout, and a
+            // channel error during that wait never wakes it (hcd_dwc.c)
+            ESP_LOGE(TAG, "halt of EP 0x%02X with a transfer executing", bEndpointAddress);
+            s_stats.halt_while_active++;
+        }
         d->halted[ep_index(bEndpointAddress)] = true;
     }
     unlock();
@@ -1209,6 +1414,9 @@ esp_err_t usb_host_transfer_submit(usb_transfer_t *transfer)
         ret = ESP_ERR_INVALID_ARG;
     } else if (d->gone) {
         ret = ESP_ERR_INVALID_STATE;
+    } else if (s_fail_submit_count > 0 && transfer->bEndpointAddress == s_fail_submit_ep) {
+        s_fail_submit_count--;
+        ret = ESP_ERR_INVALID_STATE;     // as for a pipe the HCD no longer accepts URBs on
     } else if (!(ep = claimed_ep_locked(transfer->bEndpointAddress))) {
         ret = ESP_ERR_NOT_FOUND;
     } else if (d->halted[ep_index(transfer->bEndpointAddress)]) {
@@ -1222,6 +1430,7 @@ esp_err_t usb_host_transfer_submit(usb_transfer_t *transfer)
     } else {
         int interval = 1 << (ep->bInterval - 1);
         fx->is_feedback = (ep->bEndpointAddress & 0x80) && ((ep->bmAttributes >> 4) & 0x03) == 0x01;
+        fx->fb_mps = ep->wMaxPacketSize;
         fx->is_out_data = !(ep->bEndpointAddress & 0x80);
         fx->hung = false;
         uint64_t *next = &d->ep_next_frame[ep_index(ep->bEndpointAddress)];
@@ -1230,6 +1439,12 @@ esp_err_t usb_host_transfer_submit(usb_transfer_t *transfer)
         *next = fx->due_frame;
         fx->in_flight = true;
         pending_append(fx);
+        int n = claimed_iface_of_ep_locked(ep->bEndpointAddress);
+        if (n >= 0 && d->dev_alt[n] != d->claimed_alt[n]) {
+            ESP_LOGE(TAG, "transfer on EP 0x%02X while the device runs alt %d of interface %d",
+                     ep->bEndpointAddress, d->dev_alt[n], n);
+            s_stats.submit_on_inactive_alt++;
+        }
     }
     if (ret != ESP_OK) s_stats.submit_rejected++;
     unlock();
@@ -1263,8 +1478,11 @@ esp_err_t usb_host_transfer_submit_control(usb_host_client_handle_t client_hdl, 
             unlock();
             return ESP_ERR_INVALID_ARG;
         }
+        if (in && (transfer->num_bytes - (int)sizeof(chk)) % s_device_desc[7] != 0) {
+            s_stats.ctrl_in_unrounded++;
+        }
     }
-    if (d->gone) {
+    if (d->gone || s_frame < s_ep0_usable_frame) {
         s_stats.submit_rejected++;
         unlock();
         return ESP_ERR_INVALID_STATE;
@@ -1280,7 +1498,8 @@ esp_err_t usb_host_transfer_submit_control(usb_host_client_handle_t client_hdl, 
     memcpy(&setup, transfer->data_buffer, sizeof(setup));
     bool get = setup.bmRequestType & 0x80;
     if (s_hang.armed && (setup.bmRequestType & 0x60) == 0x20 &&
-        (setup.wIndex >> 8) == s_hang.entity && (setup.wValue >> 8) == s_hang.cs && get == s_hang.get) {
+        (setup.wIndex >> 8) == s_hang.entity && (setup.wValue >> 8) == s_hang.cs && get == s_hang.get &&
+        (s_hang.request == 0 || setup.bRequest == s_hang.request)) {
         s_hang.armed = false;
         fx->hung = true;         // answered by fake_usb_release_hung_ctrl() or detach
     } else {

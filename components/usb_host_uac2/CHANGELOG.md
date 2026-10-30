@@ -4,6 +4,32 @@ All notable changes to this component will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking Changes
+
+- **`uac2_host_device_write()` larger than the ring buffer returns `ESP_ERR_INVALID_SIZE`** at once (0.1.3 returned `ESP_ERR_TIMEOUT` on every call).
+- **`start()` returns `ESP_ERR_INVALID_SIZE`** for a `buffer_size` smaller than one packet (after trying the next matching alt) or a `buffer_threshold` above the ring size.
+- **Mute and volume setters return `ESP_ERR_NOT_SUPPORTED` for read-only controls** without sending a request. The `*_all_channels()` setters skip read-only channels.
+- **A volume RANGE with max below min** makes the volume setters and `get_volume_percent()` return `ESP_ERR_INVALID_RESPONSE`.
+- **Only UAC2 interfaces (`bInterfaceProtocol` 0x20) of the first UAC2 audio function are reported.** UAC1 alt settings are skipped, and a second UAC2 function isn't reported.
+- **A clock-setup request that times out during `start()`, `resume()` or `set_sample_rate()` returns `ESP_ERR_TIMEOUT`.** 0.1.3 reported the next request's `ESP_ERR_INVALID_STATE` instead.
+- **`uac2_host_buffer_status_t`, `uac2_feature_unit_t` and `uac2_device_info_t` grew** (fields below). Recompile, and update hand-written bindings such as Rust FFI before calling `get_buffer_status()` or `get_info()`.
+
+### Added
+
+- `uac2_host_buffer_status_t.underrun_bytes` and `.dropped_bytes`: playback silence sent after the ring ran dry, and capture bytes dropped on a full ring, since `start()`/`resume()`.
+- `uac2_feature_unit_t.mute_wr_ch_map` and `.volume_wr_ch_map`: channels whose control can be set.
+- `CONFIG_UAC2_STOP_STREAMS_ON_RESTART` (default off): stop started streams before `esp_restart()`, for devices that need an orderly stop. The miniDSP 2x4 HD isn't known to.
+
+### Fixed
+
+- Asynchronous playback with a feedback endpoint other than 4 bytes, including the spec's 3-byte 10.14 format, failed to start. The driver now requests the endpoint's `wMaxPacketSize`.
+- Devices with a USB-MIDI function after the audio function (MOTU UltraLite AVB, Focusrite 1235:8201) had their class requests sent to the MIDI interface.
+- `stop()` and `suspend()` could hang forever if a channel error hit during an endpoint halt (an ESP-IDF bug in 5.4 and `espressif/usb` 1.6.0). Teardown now lets submitted URBs finish (about 9 ms) before SET_INTERFACE(0), as Linux does, so their audio plays out.
+- On ESP-IDF 5.x, the control request right after a STALL could fail with `ESP_ERR_INVALID_STATE`. The driver retries for up to 50 ms.
+- Control IN requests are rounded up to whole `bMaxPacketSize0` packets, as Espressif's class drivers do.
+
 ## [0.1.3] - 2026-10-29
 
 ### Breaking Changes

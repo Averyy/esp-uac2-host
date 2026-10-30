@@ -11,7 +11,7 @@ I built it to play measurement sweeps through a miniDSP 2x4 HD from an ESP32 for
 
 ## Status
 
-**v0.1.3** is verified on a miniDSP 2x4 HD under ESP-IDF 5.4, 6.0.3 and 6.1: the full test harness and hot-unplug pass, and a downstream app's measurement sweeps and a 10-minute playback run were checked with a measurement microphone. Once, the miniDSP's output went silent until it was power-cycled; that didn't reproduce (see [Known limitations](#known-limitations)).
+**v0.1.3** is verified on a miniDSP 2x4 HD under ESP-IDF 5.4, 6.0.3 and 6.1: the full test harness and hot-unplug pass, and a downstream app's measurement sweeps and a 10-minute playback run were checked with a measurement microphone. An ESP32 hardware reset mid-stream sometimes leaves the miniDSP silent until it reboots (see [Known limitations](#known-limitations)).
 
 New in v0.1.3:
 
@@ -127,6 +127,7 @@ For other devices, prefer `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024`: comp
 Component options:
 
 - `CONFIG_UAC2_ALLOW_UNADVERTISED_RATES` (default off): send sample rates outside the clock's advertised ranges with a warning instead of refusing them, for devices whose ranges are incomplete.
+- `CONFIG_UAC2_STOP_STREAMS_ON_RESTART` (default off): stop started streams before `esp_restart()` (a shutdown handler), so the device sees alt 0 before the ESP32 resets. For devices that misbehave when the host restarts mid-stream; the miniDSP 2x4 HD isn't known to need it.
 - `CONFIG_UAC2_ALLOW_DUPLEX` (default off): allow playback and capture at the same time. Set it only together with a custom FIFO split at `usb_host_install()` (ESP-IDF 5.5+/6.x):
 
 ```c
@@ -175,7 +176,7 @@ The harness in `main/` runs on boot against any connected UAC2 device:
 11. Ring buffer starvation and recovery
 12. Long-running stability (`CONFIG_UAC2_TEST12_DURATION_SEC`, default 1 hour; `sdkconfig.smoke.defaults` sets 20 s)
 
-Then come live checks: suspend/resume, the duplex guard (or, in `sdkconfig.duplex.defaults` builds, a playback + capture streaming check, skipped on the miniDSP 2x4 HD for now), a sample-rate guard (another handle can't change the shared clock under a stream) and a driver reinstall with the device attached. Tones fade in and out and drain before each stop, so they don't click. For listening through a subwoofer, set `CONFIG_UAC2_TEST_TONES_SUBWOOFER=y` to move every tone to 30-110 Hz.
+Then come live checks: suspend/resume, the duplex guard (or, in `sdkconfig.duplex.defaults` builds, a playback + capture streaming check), a sample-rate guard (another handle can't change the shared clock under a stream) and a driver reinstall with the device attached. Tones fade in and out and drain before each stop, so they don't click. For listening through a subwoofer, set `CONFIG_UAC2_TEST_TONES_SUBWOOFER=y` to move every tone to 30-110 Hz.
 
 Harness build variants: add `sdkconfig.smoke.defaults` (short run), `sdkconfig.duplex.defaults` (playback + capture, ESP-IDF 5.5+/6.x) or `sdkconfig.heaptrace.defaults` (per-cycle leak trace) after `sdkconfig.defaults`. Give each variant its own `sdkconfig` as well as its own build directory, or an existing root `sdkconfig` overrides the defaults:
 
@@ -187,13 +188,13 @@ idf.py -B build-smoke -DSDKCONFIG=build-smoke/sdkconfig \
 You don't need audio hardware for the other tests, and CI runs them on every pull request:
 
 - `IDF_PATH=~/esp/esp-idf test/host/run.sh`: the descriptor parser against the captured miniDSP descriptor and malformed variants, and hour-long simulated playback streams that must send exactly the samples the rate asks for.
-- `test/host/driver/run.sh` (with ESP-IDF activated): the real driver on the ESP-IDF Linux target against a fake USB Host Library that simulates unplugs, control timeouts, endpoint failures and other descriptors. Its 38 tests check what goes over the bus (lost or repeated audio bytes, inserted silence) and every USB Host rule the real library enforces.
+- `test/host/driver/run.sh` (with ESP-IDF activated): the real driver on the ESP-IDF Linux target against a fake USB Host Library that simulates unplugs, control timeouts, endpoint failures and other descriptors. Its 53 tests check what goes over the bus (lost or repeated audio bytes, inserted silence) and every USB Host rule the real library enforces.
 - `test/host/fuzz.sh`: a libFuzzer target over the parser (needs clang with libFuzzer).
 
 ## Known limitations
 
 - Playback and capture at the same time is opt-in (see [Configuration](#configuration)). Without the custom FIFO split, ESP-IDF's presets leave only 128 bytes for incoming packets, so the driver refuses a stream while one in the other direction runs. The split lowers the largest playback packet from 600 to 360 bytes. On ESP-IDF 6.x, stopping one stream while the other keeps running can take up to 10 RTOS ticks inside `usb_host_interface_release()`.
-- Playback and capture together is unverified on the miniDSP 2x4 HD. Both streams run at full rate, but once, after a session that included them, the miniDSP's output stayed silent until it was power-cycled (it has its own power supply, so a USB replug or host reset doesn't clear it). Tested on its own afterwards, capture didn't trigger it.
+- A miniDSP 2x4 HD sometimes goes silent when the ESP32 is hardware-reset (reset pin, flashing) mid-stream with VBUS up: it keeps accepting USB audio but outputs nothing until it's power-cycled or rebooted with its own HID reboot command. The host can't detect this, and 0.1.3 does it too. It followed 5 of 14 such resets in testing, each after 15 s or more of streaming. Software restarts (`esp_restart()`), resets with no stream running and unplugging the cable didn't trigger it.
 - Single-clock UAC2 devices only.
 - `uac2_host_device_set_sample_rate()` is refused while any stream on the device is started or suspended; `uac2_host_device_start()` applies the stream's own rate.
 - Full-speed audio data endpoints must use `bInterval = 1`.

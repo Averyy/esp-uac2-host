@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -53,10 +54,16 @@ void tone_gen_init(tone_gen_t *gen, const tone_gen_config_t *config);
 uint32_t tone_gen_fill(tone_gen_t *gen, uint8_t *buf, uint32_t buf_size);
 
 /**
- * Ramp the tone down to silence over the next 20 ms of samples. Tones always
- * start with a 20 ms ramp up, so neither edge clicks.
+ * Ramp the tone down to silence. Tones always start with a ramp up, so
+ * neither edge clicks; each ramp lasts 20 ms or four periods of the tone,
+ * whichever is longer.
  */
 void tone_gen_fade_out(tone_gen_t *gen);
+
+/**
+ * True once a fade-out has reached silence.
+ */
+bool tone_gen_silent(const tone_gen_t *gen);
 
 #ifdef __cplusplus
 }

@@ -17,6 +17,16 @@ config UAC2_TEST_TONES_SUBWOOFER
         listening checks through a subwoofer: every tone moves to 30-110 Hz
         at -12 dBFS.
 
+config UAC2_TEST_RESTART_SEC
+    int "Restart the ESP32 this many seconds into Test 12 (0 = off)"
+    range 0 3600
+    default 0
+    help
+        Calls esp_restart() mid-stream, once per power-on (a boot after a
+        software restart skips it); listen for the next boot's tones. With
+        CONFIG_UAC2_STOP_STREAMS_ON_RESTART the driver stops the stream
+        first. Keep it below CONFIG_UAC2_TEST12_DURATION_SEC.
+
 config UAC2_DUPLEX_TEST_SEC
     int "Duplex streaming check duration (seconds)"
     range 5 3600

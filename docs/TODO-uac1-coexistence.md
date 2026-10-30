@@ -21,7 +21,7 @@ Do not add UAC1 to `usb_host_uac2`.
 
 - [ ] A short guide (component README section) for running both drivers in one application:
   - both register as USB Host clients and both see every new device;
-  - this driver only reports interfaces with the UAC2 protocol code (`bInterfaceProtocol` 0x20);
+  - this driver only reports and parses UAC2 interfaces (`bInterfaceProtocol` 0x20): AudioStreaming alts of other protocols are skipped, and the AudioControl interface, header and units come from the first protocol-0x20 AudioControl interface (`uac2_desc.c` `uac2_parse_config_descriptor()`), so a trailing UAC1 AC interface (USB-MIDI) is ignored. Only the first UAC2 audio function is used: its streaming interfaces are those inside the IAD holding its AC interface (without IADs, those before a second UAC2 AC interface), and a second UAC2 function is not reported;
   - Espressif's driver's connect callback also reports UAC2 streaming interfaces (the music player filters by VID/PID before opening, `main/sb_play3_output.c`), so the application must open only UAC1 devices from it;
   - the format and lifecycle code the application writes twice (open, pick a format, start, stop, close with retry, unplug handling) and how to share it.
 - [ ] Optionally, an example that plays to whichever kind of device is plugged in, using both drivers.

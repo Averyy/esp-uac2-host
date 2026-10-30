@@ -57,6 +57,7 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 - `CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512` or more (the miniDSP 2x4 HD's configuration descriptor is 373 bytes); 1024 for composite headsets such as Apple USB-C EarPods
 - `CONFIG_USB_HOST_HUBS_SUPPORTED=y` for devices behind a hub, including internal ones
 - `CONFIG_UAC2_ALLOW_UNADVERTISED_RATES` (default off): send sample rates outside the device's advertised ranges with a warning instead of refusing them
+- `CONFIG_UAC2_STOP_STREAMS_ON_RESTART` (default off): stop started streams before `esp_restart()` (a shutdown handler), so the device sees alt 0 before the ESP32 resets. For devices that misbehave when the host restarts mid-stream; the miniDSP 2x4 HD isn't known to need it.
 - `CONFIG_UAC2_ALLOW_DUPLEX` (default off): allow playback and capture at the same time; needs a custom FIFO split at `usb_host_install()` (`usb_host_config_t.fifo_settings_custom` with `UAC2_HOST_DUPLEX_FIFO_*`, ESP-IDF 5.5+/6.x)
 
 ### Example code
@@ -187,7 +188,7 @@ dependencies:
 ## Known issues
 
 - Playback and capture at the same time needs `CONFIG_UAC2_ALLOW_DUPLEX` plus a custom FIFO split; without it the driver refuses a stream while one in the other direction runs (ESP-IDF's FIFO presets leave 128 bytes for incoming packets). The split lowers the largest playback packet from 600 to 360 bytes.
-- Playback and capture together is unverified on the miniDSP 2x4 HD: once, after a test session that included it, the device's output stayed silent until it was power-cycled. That didn't reproduce, including with capture tested on its own.
+- A miniDSP 2x4 HD sometimes goes silent when the ESP32 is hardware-reset (reset pin, flashing) mid-stream with VBUS up: it keeps accepting USB audio but outputs nothing until it's power-cycled or rebooted with its own HID reboot command. The host can't detect this, and 0.1.3 does it too. It followed 5 of 14 such resets in testing, each after 15 s or more of streaming. Software restarts (`esp_restart()`), resets with no stream running and unplugging the cable didn't trigger it.
 - `uac2_host_device_set_sample_rate()` returns `ESP_ERR_INVALID_STATE` while any stream on the device is started or suspended (the clock is shared; `uac2_host_device_start()` applies the stream's rate).
 - 44.1 kHz on an asynchronous playback endpoint needs its feedback endpoint; implicit feedback isn't supported.
 - Full-speed audio data endpoints must use `bInterval = 1`, and only a device's first 8 streaming alt settings are used.

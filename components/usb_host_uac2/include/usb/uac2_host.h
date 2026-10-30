@@ -176,8 +176,11 @@ typedef struct {
 typedef struct {
     uint8_t addr;                      /**< USB device address (from driver callback) */
     uint8_t iface_num;                 /**< Interface number (from driver callback) */
-    uint32_t buffer_size;              /**< Ring buffer size in bytes (0 = auto ~100ms) */
-    uint32_t buffer_threshold;         /**< Threshold for TX_DONE/RX_DONE events (0 = half) */
+    uint32_t buffer_size;              /**< Ring buffer size in bytes (0 = auto ~100ms). At least
+                                            one packet: start() refuses an alt setting whose
+                                            max packet size is larger. */
+    uint32_t buffer_threshold;         /**< Threshold for TX_DONE/RX_DONE events (0 = half), at
+                                            most the ring buffer size */
     uac2_host_device_event_cb_t callback; /**< Device event callback (may be NULL) */
     void *callback_arg;                /**< User argument passed to device callback */
 } uac2_host_device_config_t;
@@ -230,8 +233,8 @@ typedef struct {
  * bytes and capture endpoints up to 368 (48 kHz 24-bit stereo uses 288-294),
  * plus 64-byte control transfers. Larger endpoints need a different split.
  *
- * The device must also support both directions at once; this is unverified
- * on the miniDSP 2x4 HD (see the repo README's Limitations).
+ * The device must also support both directions at once (the miniDSP 2x4 HD
+ * does, verified with this split).
  */
 #define UAC2_HOST_DUPLEX_FIFO_NPTX_LINES    16
 #define UAC2_HOST_DUPLEX_FIFO_PTX_LINES     90
@@ -268,6 +271,11 @@ typedef struct {
     uint32_t ring_us;                  /**< ring_bytes as duration at the stream's rate */
     uint32_t in_flight_us;             /**< Audio in submitted isochronous URBs, about
                                             CONFIG_UAC2_NUM_ISOC_URBS * CONFIG_UAC2_NUM_PACKETS_PER_URB ms */
+    uint32_t underrun_bytes;           /**< TX: silence sent since start()/resume() because the
+                                            ring ran dry after the first written audio (the
+                                            start-up silence before it is not counted). Wraps. */
+    uint32_t dropped_bytes;            /**< RX: received bytes dropped since start()/resume()
+                                            because the ring was full. Wraps. */
 } uac2_host_buffer_status_t;
 
 // ── Driver lifecycle ───────────────────────────────────────────────
@@ -276,6 +284,16 @@ typedef struct {
  * Install the UAC2 host class driver.
  * Registers a USB Host client, optionally creates a background event task.
  * Call after usb_host_install().
+ *
+ * With CONFIG_UAC2_STOP_STREAMS_ON_RESTART (default off), also registers an
+ * esp_restart() shutdown handler (one of ESP-IDF's five) that stops started
+ * streams first (running or suspended), as stop() does, after any stop,
+ * suspend or close already under way, so the device sees alt 0 before the
+ * ESP32 resets. Audio is cut as stop() cuts it, so fade out before
+ * esp_restart() for a quiet restart. It needs driver events pumped meanwhile
+ * (the background task does), takes about 10 ms per stream, and does nothing
+ * when esp_restart() is called from the task that pumps events. Panics,
+ * watchdog resets and the reset pin skip it.
  */
 esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);
 
@@ -447,17 +465,19 @@ esp_err_t uac2_host_device_start(uac2_host_device_handle_t dev,
 /**
  * Stop the stream. Releases interface, frees URBs and ring buffer.
  *
- * Audio accepted by write() that is still in the ring buffer is discarded;
- * audio already in submitted URBs may or may not play. To play everything
- * written, wait for both to drain before stopping: up to buffer_size bytes
- * in the ring buffer plus
- * CONFIG_UAC2_NUM_ISOC_URBS * CONFIG_UAC2_NUM_PACKETS_PER_URB ms in flight.
+ * Audio accepted by write() that is still in the ring buffer is discarded.
+ * Audio already in submitted URBs is sent: stop() waits for those URBs
+ * (CONFIG_UAC2_NUM_ISOC_URBS * CONFIG_UAC2_NUM_PACKETS_PER_URB ms, 9 ms by
+ * default, or one feedback interval if longer) before selecting alt 0. To play
+ * everything written, wait for the ring buffer to drain before stopping
+ * (ring_bytes from uac2_host_device_get_buffer_status() reaches 0).
  */
 esp_err_t uac2_host_device_stop(uac2_host_device_handle_t dev);
 
 /**
  * Suspend an active stream without freeing resources.
- * Stream transitions from ACTIVE to READY.
+ * Stream transitions from ACTIVE to READY. Like stop(), it waits for the
+ * submitted URBs first; their audio is sent, the ring buffer is discarded.
  */
 esp_err_t uac2_host_device_suspend(uac2_host_device_handle_t dev);
 
@@ -474,6 +494,8 @@ esp_err_t uac2_host_device_resume(uac2_host_device_handle_t dev);
  * Write audio data to the playback ring buffer.
  *
  * Returns once the data is queued, not played (see uac2_host_device_stop()).
+ * The data is queued whole, so a write larger than the ring buffer returns
+ * ESP_ERR_INVALID_SIZE.
  *
  * @note This function takes a lightweight runtime reference to the handle.
  *       It returns `ESP_ERR_INVALID_STATE` if the stream is not active or if
@@ -541,6 +563,9 @@ esp_err_t uac2_host_device_get_buffer_status(uac2_host_device_handle_t dev,
                                              uac2_host_buffer_status_t *status);
 
 // ── Volume / Mute ──────────────────────────────────────────────────
+//
+// The setters return ESP_ERR_NOT_SUPPORTED, without sending a request, for a
+// control the device's descriptor marks read-only; the getters still read it.
 
 /**
  * Set mute on a feature unit channel.
@@ -558,6 +583,10 @@ esp_err_t uac2_host_device_get_mute(uac2_host_device_handle_t dev,
 /**
  * Set volume on a feature unit channel.
  * @param volume_db256  Volume in 1/256 dB units (e.g. 0x0100 = +1 dB)
+ * @return ESP_ERR_INVALID_ARG outside the channel's advertised range;
+ *         ESP_ERR_INVALID_RESPONSE if the range reply is malformed (short, or
+ *         max below min). A device that reports no range gets the value
+ *         unchecked.
  */
 esp_err_t uac2_host_device_set_volume(uac2_host_device_handle_t dev,
                                       uint8_t channel, int16_t volume_db256);
@@ -584,6 +613,8 @@ esp_err_t uac2_host_device_get_volume_range(uac2_host_device_handle_t dev,
 /**
  * Set volume as a percentage (0-100). Maps linearly from min to max dB,
  * rounded to the nearest step of the device's advertised resolution.
+ * @return ESP_ERR_INVALID_RESPONSE if the device's range is malformed
+ *         (max below min); ESP_ERR_NOT_SUPPORTED if it reports none
  */
 esp_err_t uac2_host_device_set_volume_percent(uac2_host_device_handle_t dev,
                                               uint8_t channel, uint8_t percent);
@@ -595,8 +626,9 @@ esp_err_t uac2_host_device_get_volume_percent(uac2_host_device_handle_t dev,
                                               uint8_t channel, uint8_t *percent);
 
 /**
- * Set volume on all channels that support volume control.
- * Iterates channels based on the feature unit's bmaControls bitmap.
+ * Set volume on all channels whose volume control can be set.
+ * Iterates channels based on the feature unit's bmaControls bitmap, skipping
+ * read-only controls (ESP_ERR_NOT_SUPPORTED if every one is read-only).
  * Stops on the first per-channel error and returns it. A failed master
  * (channel 0) write does not stop the per-channel writes, since some devices
  * advertise a master control that STALLs; it is returned only if the device
@@ -608,7 +640,7 @@ esp_err_t uac2_host_device_set_volume_all_channels(uac2_host_device_handle_t dev
                                                    int16_t volume_db256);
 
 /**
- * Set mute on all channels that support mute, with the same master fallback
+ * Set mute on all channels whose mute can be set, with the same master fallback
  * as uac2_host_device_set_volume_all_channels(). Muting before start() and
  * unmuting once audio flows avoids start-up noise on some DACs.
  */

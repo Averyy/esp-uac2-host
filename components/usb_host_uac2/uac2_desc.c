@@ -161,7 +161,9 @@ static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
     if (num_entries > 32) num_entries = 32;
     fu->nr_channels = (num_entries > 1) ? (uint8_t)(num_entries - 1) : 0;
 
-    // Parse bmaControls: each entry is 4 bytes (UAC2), bits 0-1=mute, bits 2-3=volume
+    // Parse bmaControls: each entry is 4 bytes (UAC2), bits 0-1=mute, bits 2-3=volume.
+    // Each pair is 01 read-only or 11 host programmable; like Linux, the high
+    // bit alone decides whether the control can be set.
     for (int i = 0; i < num_entries && (5 + i * 4 + 3) < bLength; i++) {
         uint32_t ctrl = read_u32(&desc[5 + i * 4]);
         bool mute = (ctrl & 0x03) != 0;
@@ -172,6 +174,8 @@ static void parse_feature_unit(const uint8_t *desc, uac2_device_info_t *info)
         }
         if (mute)   fu->mute_ch_map |= (1u << i);
         if (volume) fu->volume_ch_map |= (1u << i);
+        if (ctrl & 0x02) fu->mute_wr_ch_map |= (1u << i);
+        if (ctrl & 0x08) fu->volume_wr_ch_map |= (1u << i);
     }
 }
 
@@ -319,7 +323,24 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
     // State tracking as we walk descriptors
     uint8_t current_iface_class = 0;
     uint8_t current_iface_subclass = 0;
+    uint8_t current_iface_protocol = 0;
     uint8_t current_iface_num = 0;
+    // The UAC2 function's AudioControl interface is the first with protocol
+    // 0x20. A device can follow it with a UAC1 (protocol 0) AC interface,
+    // typically for USB-MIDI; its header and units must not replace the
+    // UAC2 ones, or class requests would address the MIDI interface.
+    bool ac_found = false;
+    bool in_uac2_ac = false;
+    // Streaming interfaces belong to the function whose interface association
+    // (IAD) holds that AC interface, as Linux scopes UAC2 functions. Without
+    // an IAD, those after a second UAC2 AC interface are its own and skipped.
+    uint8_t iad_first = 0;
+    uint8_t iad_count = 0;
+    bool iad_audio = false;
+    bool func_scoped = false;
+    uint8_t func_first = 0;
+    uint8_t func_count = 0;
+    bool other_function = false;
     uint8_t current_alt_setting = 0;
     uint8_t current_num_endpoints = 0;
 
@@ -348,27 +369,55 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
 
         const uint8_t *desc = &config_desc[offset];
 
-        if (type == 0x04) { // INTERFACE descriptor
+        if (type == 0x0B && len >= 8) { // INTERFACE ASSOCIATION descriptor
+            iad_first = desc[2];
+            iad_count = desc[3];
+            iad_audio = desc[4] == UAC2_CLASS_AUDIO;
+        } else if (type == 0x04) { // INTERFACE descriptor
             drop_incomplete_as_alt(info, current_as, ep_count_in_current_as, current_num_endpoints);
             current_iface_num = desc[2];
             current_alt_setting = desc[3];
             current_num_endpoints = desc[4];
             current_iface_class = desc[5];
             current_iface_subclass = desc[6];
+            current_iface_protocol = desc[7];
 
             // Start tracking a new AS interface if it has endpoints
             current_as = NULL;
             ep_count_in_current_as = 0;
 
-            // Track Audio Control interface number
+            in_uac2_ac = false;
             if (current_iface_class == UAC2_CLASS_AUDIO &&
-                current_iface_subclass == UAC2_SUBCLASS_AUDIOCONTROL) {
-                info->ac_iface_num = current_iface_num;
+                current_iface_subclass == UAC2_SUBCLASS_AUDIOCONTROL &&
+                current_iface_protocol == UAC2_PROTOCOL_VERSION_02_00) {
+                if (!ac_found) {
+                    ac_found = true;
+                    info->ac_iface_num = current_iface_num;
+                    in_uac2_ac = true;
+                    if (iad_audio && current_iface_num >= iad_first &&
+                        current_iface_num - iad_first < iad_count) {
+                        func_scoped = true;
+                        func_first = iad_first;
+                        func_count = iad_count;
+                    }
+                } else if (current_iface_num != info->ac_iface_num) {
+                    ESP_LOGW(TAG, "Second UAC2 audio function (AC interface %d) not supported, "
+                             "using AC interface %d", current_iface_num, info->ac_iface_num);
+                    other_function = true;
+                } else {
+                    in_uac2_ac = true;   // another alt setting of the same AC interface
+                }
             }
 
+            // Streaming interfaces of other protocols (UAC1) use different
+            // descriptor layouts; Espressif's usb_host_uac drives those
+            bool in_function = func_scoped ?
+                (current_iface_num >= func_first && current_iface_num - func_first < func_count) :
+                !other_function;
             if (current_iface_class == UAC2_CLASS_AUDIO &&
                 current_iface_subclass == UAC2_SUBCLASS_AUDIOSTREAMING &&
-                current_num_endpoints > 0) {
+                current_iface_protocol == UAC2_PROTOCOL_VERSION_02_00 &&
+                in_function && current_num_endpoints > 0) {
                 // This is an active AS alt setting
                 if (info->num_as_ifaces < UAC2_MAX_AS_INTERFACES) {
                     as_offset[info->num_as_ifaces] = offset;
@@ -384,7 +433,7 @@ bool uac2_parse_config_descriptor(const uint8_t *config_desc, uint16_t total_len
         } else if (type == UAC2_CS_INTERFACE && len >= 3) { // Class-specific INTERFACE
             if (current_iface_class == UAC2_CLASS_AUDIO) {
                 if (current_iface_subclass == UAC2_SUBCLASS_AUDIOCONTROL) {
-                    parse_ac_entity(desc, info);
+                    if (in_uac2_ac) parse_ac_entity(desc, info);
                 } else if (current_iface_subclass == UAC2_SUBCLASS_AUDIOSTREAMING && current_as) {
                     uint8_t subtype = desc[2];
                     if (subtype == UAC2_AS_GENERAL) {
@@ -488,8 +537,9 @@ void uac2_log_device_info(const uac2_device_info_t *info)
                  fu->unit_id, fu->source_id, fu->nr_channels,
                  fu->has_mute ? "yes" : "no", fu->has_volume ? "yes" : "no");
         if (fu->mute_ch_map || fu->volume_ch_map) {
-            ESP_LOGI(TAG, "    mute_ch_map=0x%08" PRIX32 " volume_ch_map=0x%08" PRIX32,
-                     fu->mute_ch_map, fu->volume_ch_map);
+            ESP_LOGI(TAG, "    mute_ch_map=0x%08" PRIX32 " volume_ch_map=0x%08" PRIX32
+                     " (settable: 0x%08" PRIX32 " 0x%08" PRIX32 ")",
+                     fu->mute_ch_map, fu->volume_ch_map, fu->mute_wr_ch_map, fu->volume_wr_ch_map);
         }
     }
 

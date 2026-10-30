@@ -11,6 +11,7 @@
  * claimed interfaces and USB Host contract violations.
  */
 
+#include <setjmp.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "sdkconfig.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "usb/uac2_host.h"
 #include "fake_usb.h"
@@ -61,11 +64,56 @@ static void driver_cb(uint8_t addr, uint8_t iface_num, const uac2_host_driver_ev
     xQueueSend(s_connects, &e, 0);
 }
 
+// Set by a test: the next TX_DONE callback blocks this long, holding a URB
+// callback between its ACTIVE check and its resubmit
+static atomic_int s_block_tx_done_ms;
+static atomic_bool s_tx_done_blocking;
+
+// esp_restart() runs shutdown handlers newest first. Registered before
+// install, this one runs after the driver's and jumps back instead of
+// restarting (no signal-mask restore, see CMakeLists.txt). Per thread: two
+// tasks may restart at once.
+static _Thread_local sigjmp_buf s_restart_jmp;
+static void restart_jump_back(void)
+{
+    siglongjmp(s_restart_jmp, 1);
+}
+
+static void restart_and_return(void)
+{
+    if (sigsetjmp(s_restart_jmp, 0) == 0) esp_restart();
+}
+
+// Registered first, so it runs last: a restart no test catches would end the
+// run with status 0 (the Linux port's esp_restart() exits 0)
+static void unexpected_restart(void)
+{
+    printf("UNEXPECTED esp_restart() in %s\n", s_test_name ? s_test_name : "?");
+    fflush(stdout);
+    exit(1);
+}
+
+// Set by a test: the next TX_DONE callback calls esp_restart() (from the
+// driver's event task) and records how long the handlers took
+static atomic_bool s_restart_in_tx_done;
+static atomic_llong s_restart_in_tx_done_us;
+
 static void device_cb(uac2_host_device_handle_t dev, const uac2_host_device_event_t event, void *arg)
 {
     (void)dev;
     (void)arg;
     if ((int)event >= 0 && event < 5) atomic_fetch_add(&s_dev_events[event], 1);
+    int block_ms = event == UAC2_HOST_DEVICE_EVENT_TX_DONE ? atomic_exchange(&s_block_tx_done_ms, 0) : 0;
+    if (block_ms > 0) {
+        atomic_store(&s_tx_done_blocking, true);
+        vTaskDelay(pdMS_TO_TICKS(block_ms));
+        atomic_store(&s_tx_done_blocking, false);
+    }
+    if (event == UAC2_HOST_DEVICE_EVENT_TX_DONE && atomic_exchange(&s_restart_in_tx_done, false)) {
+        int64_t t0 = esp_timer_get_time();
+        restart_and_return();
+        atomic_store(&s_restart_in_tx_done_us, esp_timer_get_time() - t0);
+    }
 }
 
 static int dev_events(uac2_host_device_event_t event)
@@ -121,6 +169,17 @@ static uac2_host_device_handle_t open_iface(uint8_t addr, uint8_t iface)
 {
     uac2_host_device_handle_t dev = NULL;
     TEST_ASSERT_EQUAL(ESP_OK, try_open(addr, iface, &dev));
+    return dev;
+}
+
+static uac2_host_device_handle_t open_iface_buffered(uint8_t addr, uint8_t iface,
+                                                     uint32_t buffer_size, uint32_t threshold)
+{
+    uac2_host_device_config_t cfg = {.addr = addr, .iface_num = iface, .callback = device_cb,
+                                     .buffer_size = buffer_size, .buffer_threshold = threshold};
+    uac2_host_device_handle_t dev = NULL;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_open(&cfg, &dev));
+    track(dev, true);
     return dev;
 }
 
@@ -299,6 +358,9 @@ void setUp(void)
     if (!s_connects) s_connects = xQueueCreate(16, sizeof(connect_evt_t));
     xQueueReset(s_connects);
     for (int i = 0; i < 5; i++) atomic_store(&s_dev_events[i], 0);
+    atomic_store(&s_block_tx_done_ms, 0);
+    atomic_store(&s_restart_in_tx_done, false);
+    atomic_store(&s_restart_in_tx_done_us, -1);
     memset(s_open, 0, sizeof(s_open));
     fake_usb_reset();
 }
@@ -320,6 +382,7 @@ void tearDown(void)
         s_active_hammer = NULL;
     }
     // Best-effort cleanup so a failed test does not cascade
+    (void)esp_unregister_shutdown_handler(restart_jump_back);
     for (int i = 0; i < 4; i++) {
         if (s_open[i]) (void)close_iface(s_open[i]);
     }
@@ -336,6 +399,12 @@ void tearDown(void)
     TEST_ASSERT_EQUAL_MESSAGE(0, st.close_with_ctrl_in_flight, "device closed with EP0 busy");
     TEST_ASSERT_EQUAL_MESSAGE(0, st.invalid_transfers, "transfer the real library would reject");
     TEST_ASSERT_EQUAL_MESSAGE(0, st.release_with_pending, "interface released with its transfers unfinished");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.halt_while_active, "endpoint halted with a transfer executing");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.alt0_with_urbs_in_flight, "SET_INTERFACE(0) with transfers in flight");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.submit_on_inactive_alt, "transfer submitted to an alt the device is not running");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.ctrl_in_unrounded, "IN control transfer not rounded to bMaxPacketSize0");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.ctrl_bad_wlength, "GET CUR wLength not the control's size");
+    TEST_ASSERT_EQUAL_MESSAGE(0, st.ctrl_wrong_interface, "class request not sent to the AC interface");
     TEST_ASSERT_EQUAL_MESSAGE(0, st.device_open_count, "device left open");
     TEST_ASSERT_EQUAL_MESSAGE(0, st.transfers_allocated, "transfers leaked");
     s_test_started_us = 0;
@@ -580,6 +649,196 @@ static void test_suspend_and_resume(void)
     TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
 }
 
+static void test_teardown_after_channel_error(void)
+{
+    // A channel error halts the pipe with URBs still queued behind it
+    // (hcd_dwc.c). They never complete on their own, so suspend() falls back
+    // to halting, which returns at once on a halted pipe. The feedback
+    // endpoint has one URB, so an error there leaves nothing queued for stop().
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    fake_usb_error_halt_endpoint(0x01);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int64_t t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_suspend(dev));
+    TEST_ASSERT_LESS_THAN(500000, esp_timer_get_time() - t0);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_resume(dev));
+    fake_usb_clear_out_stats();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    TEST_ASSERT_GREATER_THAN(50, fake_usb_stats().out_packets);   // the pipe was cleared
+
+    fake_usb_error_halt_endpoint(0x81);   // feedback, every 8 ms
+    vTaskDelay(pdMS_TO_TICKS(30));
+    t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_LESS_THAN(500000, esp_timer_get_time() - t0);
+    TEST_ASSERT_EQUAL(0, dev_events(UAC2_HOST_DEVICE_EVENT_STREAM_ERROR));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+#if !CONFIG_UAC2_STOP_STREAMS_ON_RESTART
+#error "test_restart_stops_running_streams needs CONFIG_UAC2_STOP_STREAMS_ON_RESTART (sdkconfig.defaults)"
+#endif
+
+typedef struct {
+    uac2_host_device_handle_t dev;
+    atomic_bool started;
+    atomic_bool done;
+    esp_err_t err;
+} stop_job_t;
+
+static void stop_task(void *arg)
+{
+    stop_job_t *job = arg;
+    atomic_store(&job->started, true);
+    job->err = uac2_host_device_stop(job->dev);
+    atomic_store(&job->done, true);
+    vTaskDelete(NULL);
+}
+
+typedef struct {
+    atomic_bool done;
+    uint32_t set_interface_calls;   // when its esp_restart() handlers returned
+} restart_job_t;
+
+static void restart_task(void *arg)
+{
+    restart_job_t *job = arg;
+    restart_and_return();
+    job->set_interface_calls = fake_usb_stats().set_interface_calls;
+    atomic_store(&job->done, true);
+    vTaskDelete(NULL);
+}
+
+static void test_restart_stops_running_streams(void)
+{
+    // A self-powered device keeps VBUS across an ESP32 reset. The driver's
+    // shutdown handler stops the stream first, so the device sees alt 0 (a
+    // miniDSP 2x4 HD reset mid-stream stays silent until it reboots).
+    TEST_ASSERT_EQUAL(ESP_OK, esp_register_shutdown_handler(restart_jump_back));
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(100));
+    uint32_t set_interface_calls = fake_usb_stats().set_interface_calls;
+    restart_and_return();
+    TEST_ASSERT_EQUAL(set_interface_calls + 1, fake_usb_stats().set_interface_calls);
+    uac2_host_stream_info_t info;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, uac2_host_device_get_stream_info(dev, &info));
+    fake_usb_clear_out_stats();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    TEST_ASSERT_EQUAL(0, fake_usb_stats().out_packets);
+
+    // From the event task (a driver callback) the handler can't wait for
+    // transfers, so it leaves the stream alone instead of timing out
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    set_interface_calls = fake_usb_stats().set_interface_calls;
+    atomic_store(&s_restart_in_tx_done, true);
+    uint8_t chunk[288] = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, chunk, sizeof(chunk), 100));   // re-arms TX_DONE
+    for (int i = 0; i < 100 && atomic_load(&s_restart_in_tx_done_us) < 0; i++) vTaskDelay(pdMS_TO_TICKS(5));
+    long long cb_us = atomic_load(&s_restart_in_tx_done_us);
+    TEST_ASSERT_GREATER_OR_EQUAL(0, cb_us);
+    TEST_ASSERT_LESS_THAN(50000, cb_us);
+    TEST_ASSERT_EQUAL(set_interface_calls, fake_usb_stats().set_interface_calls);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_stream_info(dev, &info));
+    TEST_ASSERT_TRUE(info.active);
+
+    // A stop() already under way (waiting on a URB callback) isn't at alt 0
+    // yet: the handler waits for it rather than skipping the stream
+    vTaskDelay(pdMS_TO_TICKS(20));
+    atomic_store(&s_block_tx_done_ms, 300);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, chunk, sizeof(chunk), 100));
+    for (int i = 0; i < 100 && !atomic_load(&s_tx_done_blocking); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_done_blocking));
+    static stop_job_t job;
+    job = (stop_job_t){.dev = dev};
+    // Above this task (one core): it runs into stop() until stop() blocks on
+    // the held callback, before xTaskCreate() returns here
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreate(stop_task, "stop", 4096, &job, 11, NULL));
+    TEST_ASSERT_TRUE(atomic_load(&job.started));
+    TEST_ASSERT_FALSE(atomic_load(&job.done));
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_done_blocking));
+    set_interface_calls = fake_usb_stats().set_interface_calls;
+    restart_and_return();
+    TEST_ASSERT_EQUAL(set_interface_calls + 1, fake_usb_stats().set_interface_calls);
+    for (int i = 0; i < 100 && !atomic_load(&job.done); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&job.done));
+    TEST_ASSERT_EQUAL(ESP_OK, job.err);
+
+    // Started suspended: READY, but its alt is already selected
+    uac2_host_stream_config_t suspended_cfg = k_tx_48k;
+    suspended_cfg.flags = UAC2_FLAG_STREAM_SUSPEND_AFTER_START;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &suspended_cfg));
+    set_interface_calls = fake_usb_stats().set_interface_calls;
+    restart_and_return();
+    TEST_ASSERT_EQUAL(set_interface_calls + 1, fake_usb_stats().set_interface_calls);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, uac2_host_device_get_stream_info(dev, &info));
+
+    // Two tasks restarting at once: the second, which runs once this task
+    // blocks in the handler, returns only after the stream reached alt 0
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(20));
+    atomic_store(&s_block_tx_done_ms, 200);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, chunk, sizeof(chunk), 100));
+    for (int i = 0; i < 100 && !atomic_load(&s_tx_done_blocking); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_done_blocking));
+    static restart_job_t second;
+    second = (restart_job_t){0};
+    TEST_ASSERT_EQUAL(pdPASS, xTaskCreate(restart_task, "restart2", 4096, &second, 9, NULL));
+    set_interface_calls = fake_usb_stats().set_interface_calls;
+    restart_and_return();
+    for (int i = 0; i < 200 && !atomic_load(&second.done); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&second.done));
+    TEST_ASSERT_EQUAL(set_interface_calls + 1, second.set_interface_calls);
+    TEST_ASSERT_EQUAL(set_interface_calls + 1, fake_usb_stats().set_interface_calls);
+
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+    TEST_ASSERT_EQUAL(ESP_OK, esp_unregister_shutdown_handler(restart_jump_back));
+}
+
+static void test_stop_waits_for_a_callback_mid_resubmit(void)
+{
+    // A URB callback that checked for ACTIVE just before stop() changed the
+    // state still resubmits. stop() waits for it instead of timing out its
+    // drain and selecting alt 0 (or halting) under the late transfer.
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    atomic_store(&s_block_tx_done_ms, 300);
+    uint8_t chunk[288] = {0};
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, chunk, sizeof(chunk), 100));   // re-arms TX_DONE
+    for (int i = 0; i < 100 && !atomic_load(&s_tx_done_blocking); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_done_blocking));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_FALSE(atomic_load(&s_tx_done_blocking));
+    TEST_ASSERT_EQUAL(0, fake_usb_stats().submit_on_inactive_alt);
+
+    // Held past stop()'s 2 s wait: stop() gives up without touching the
+    // endpoints or the alt, and a later stop() finishes the job
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    atomic_store(&s_block_tx_done_ms, 2500);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, chunk, sizeof(chunk), 100));
+    for (int i = 0; i < 100 && !atomic_load(&s_tx_done_blocking); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_TRUE(atomic_load(&s_tx_done_blocking));
+    uint32_t set_interface_calls = fake_usb_stats().set_interface_calls;
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(set_interface_calls, fake_usb_stats().set_interface_calls);
+    for (int i = 0; i < 200 && atomic_load(&s_tx_done_blocking); i++) vTaskDelay(pdMS_TO_TICKS(5));
+    TEST_ASSERT_FALSE(atomic_load(&s_tx_done_blocking));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(0, fake_usb_stats().submit_on_inactive_alt);
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
 static void test_io_after_close_is_invalid_state(void)
 {
     uint8_t addr = attach_and_install();
@@ -608,6 +867,7 @@ static void test_unplug_during_playback_then_replug(void)
     writer_wait_end(w, 2000);
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, w->end_err);
     TEST_ASSERT_EQUAL(1, dev_events(UAC2_HOST_DEVICE_EVENT_DISCONNECTED));
+    TEST_ASSERT_EQUAL(0, dev_events(UAC2_HOST_DEVICE_EVENT_STREAM_ERROR));
     TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
     TEST_ASSERT_TRUE(wait_until(device_freed, 1000));
 
@@ -688,6 +948,61 @@ static void test_control_timeout_orphan_then_late_reply(void)
     TEST_ASSERT_TRUE(fake_usb_release_hung_ctrl());
     TEST_ASSERT_TRUE(wait_until(device_closed, 1000));
     dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_sample_rate(dev, &rate));
+    TEST_ASSERT_EQUAL(48000, rate);
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+/**
+ * A timed-out request during start()'s clock setup is reported as the
+ * timeout. The next request would otherwise fail on the URB the timeout left
+ * in flight and replace it with ESP_ERR_INVALID_STATE.
+ */
+static void test_start_reports_clock_setup_timeout(void)
+{
+    static const struct {
+        uint8_t request;
+        bool get;
+        bool stall_set;
+        const char *what;
+    } cases[] = {
+        {0x02, true, false, "RANGE before the SET"},
+        {0x01, false, false, "the SET"},
+        {0x01, true, false, "the readback after the SET"},
+        {0x01, true, true, "the readback after a STALLed SET"},
+    };
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        printf("    hang %s\n", cases[i].what);
+        if (cases[i].stall_set) fake_usb_stall_ctrl(CLOCK_SOURCE, 0x01, 0, false);
+        fake_usb_hang_ctrl_request(CLOCK_SOURCE, 0x01, cases[i].request, cases[i].get);
+        TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, uac2_host_device_start(dev, &k_tx_48k));
+        TEST_ASSERT_EQUAL(0, fake_usb_stats().interfaces_claimed);
+        fake_usb_stall_ctrl_clear();
+        TEST_ASSERT_TRUE(fake_usb_release_hung_ctrl());
+        vTaskDelay(pdMS_TO_TICKS(50));      // the late reply reaches the driver
+    }
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+/** A timed-out request whose late reply is a STALL leaves EP0 recovering for the next one. */
+static void test_late_stall_then_request_waits_for_ep0(void)
+{
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    fake_usb_set_ep0_recovery_frames(30);
+    fake_usb_hang_ctrl(CLOCK_SOURCE, CS_CLOCK_VALID, true);
+    bool valid = false;
+    TEST_ASSERT_EQUAL(ESP_ERR_TIMEOUT, uac2_host_device_get_clock_valid(dev, &valid));
+    fake_usb_stall_ctrl(CLOCK_SOURCE, CS_CLOCK_VALID, 0, true);     // the late reply STALLs
+    TEST_ASSERT_TRUE(fake_usb_release_hung_ctrl());
+    vTaskDelay(pdMS_TO_TICKS(10));      // delivered; EP0 refuses submits for ~20 ms more
+    uint32_t rate = 0;
     TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_sample_rate(dev, &rate));
     TEST_ASSERT_EQUAL(48000, rate);
     TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
@@ -951,6 +1266,63 @@ static void test_adaptive_endpoint_plays_44k1_without_feedback(void)
     TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
 }
 
+/**
+ * Play against a feedback endpoint of this wMaxPacketSize. ESP-IDF rejects an
+ * isochronous IN request that is not a multiple of the endpoint size, so the
+ * driver has to request exactly what the descriptor advertises.
+ */
+static void play_following_feedback_endpoint(uint16_t fb_mps)
+{
+    uint16_t len = fake_usb_feedback_mps_config(fb_mps, s_cfg_buf, sizeof(s_cfg_buf));
+    TEST_ASSERT_NOT_EQUAL(0, len);
+    uint8_t addr = attach_config_and_install(s_cfg_buf, len);
+    fake_usb_set_feedback_q16(q16_from_millihertz(48000900));   // 48.0009 samples/frame
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    writer_t *w = &s_writer;
+    writer_start(w, dev);
+    vTaskDelay(pdMS_TO_TICKS(300));
+    fake_usb_clear_out_stats();
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    fake_usb_stats_t st = fake_usb_stats();
+    writer_join(w);
+    TEST_ASSERT_EQUAL(ESP_OK, w->end_err);
+    TEST_ASSERT_EQUAL(0, st.invalid_transfers);
+    double avg = (double)st.out_bytes / 6.0 / (double)st.out_packets;
+    printf("    average %.5f samples/packet (device asks 48.0009)\n", avg);
+    TEST_ASSERT_TRUE(avg > 48.0004 && avg < 48.0014);
+    TEST_ASSERT_EQUAL(0, st.out_pattern_breaks);
+    TEST_ASSERT_EQUAL(0, dev_events(UAC2_HOST_DEVICE_EVENT_STREAM_ERROR));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+/** The USB spec's full-speed feedback: 10.14 in a 3-byte endpoint. */
+static void test_three_byte_feedback_endpoint_followed(void)
+{
+    play_following_feedback_endpoint(3);
+}
+
+/** An endpoint larger than the 4-byte 16.16 value it sends. */
+static void test_oversized_feedback_endpoint_followed(void)
+{
+    play_following_feedback_endpoint(8);
+}
+
+/** A 2-byte endpoint cannot carry a feedback value: refused before claiming. */
+static void test_undersized_feedback_endpoint_refused(void)
+{
+    uint16_t len = fake_usb_feedback_mps_config(2, s_cfg_buf, sizeof(s_cfg_buf));
+    TEST_ASSERT_NOT_EQUAL(0, len);
+    uint8_t addr = attach_config_and_install(s_cfg_buf, len);
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(0, fake_usb_stats().interfaces_claimed);
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
 static void test_async_endpoint_without_feedback_refuses_44k1(void)
 {
     uint16_t len = fake_usb_no_feedback_config(UAC2_EP_SYNC_ASYNC, s_cfg_buf, sizeof(s_cfg_buf));
@@ -1049,6 +1421,156 @@ static void test_all_channel_controls_fall_back_when_master_stalls(void)
     TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
 }
 
+static void test_read_only_controls_left_alone(void)
+{
+    // Master mute and volume read-only (01 each); channels 1 and 2 stay host programmable
+    uint16_t len = fake_usb_minidsp_config(s_cfg_buf, sizeof(s_cfg_buf));
+    TEST_ASSERT_TRUE(fake_usb_config_set_fu_controls(s_cfg_buf, len, ENT_FU_PLAYBACK, 0, 0x05));
+    uint8_t addr = attach_config_and_install(s_cfg_buf, len);
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    int16_t master_vol = 0;
+    bool master_muted = true;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 0, &master_vol));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_mute(dev, 0, &master_muted));
+
+    // Refused without a request on the bus
+    uint32_t requests = fake_usb_stats().ctrl_requests;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_set_volume(dev, 0, -10 * 256));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_set_volume_percent(dev, 0, 50));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_set_mute(dev, 0, !master_muted));
+    TEST_ASSERT_EQUAL(requests, fake_usb_stats().ctrl_requests);
+
+    // Every-channel writes skip the read-only master
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_set_volume_all_channels(dev, -10 * 256));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_set_mute_all_channels(dev, !master_muted));
+    int16_t vol = 0;
+    bool muted = master_muted;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 0, &vol));
+    TEST_ASSERT_EQUAL(master_vol, vol);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_mute(dev, 0, &muted));
+    TEST_ASSERT_EQUAL(master_muted, muted);
+    for (uint8_t ch = 1; ch <= 2; ch++) {
+        TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, ch, &vol));
+        TEST_ASSERT_EQUAL(-10 * 256, vol);
+        TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_mute(dev, ch, &muted));
+        TEST_ASSERT_EQUAL(!master_muted, muted);
+    }
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+static void test_all_read_only_controls_refused(void)
+{
+    uint16_t len = fake_usb_minidsp_config(s_cfg_buf, sizeof(s_cfg_buf));
+    for (uint8_t ch = 0; ch <= 2; ch++) {
+        TEST_ASSERT_TRUE(fake_usb_config_set_fu_controls(s_cfg_buf, len, ENT_FU_PLAYBACK, ch, 0x05));
+    }
+    uint8_t addr = attach_config_and_install(s_cfg_buf, len);
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    uint32_t requests = fake_usb_stats().ctrl_requests;
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_set_volume_all_channels(dev, -10 * 256));
+    TEST_ASSERT_EQUAL(ESP_ERR_NOT_SUPPORTED, uac2_host_device_set_mute_all_channels(dev, true));
+    TEST_ASSERT_EQUAL(requests, fake_usb_stats().ctrl_requests);
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+/** An 8-byte EP0: every IN request still asks for whole packets (checked in tearDown). */
+static void test_control_requests_rounded_to_small_ep0(void)
+{
+    fake_usb_set_ep0_mps(8);
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    uac2_sample_rate_range_t rates[UAC2_MAX_SAMPLE_RATE_RANGES];
+    uint8_t n = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_sample_rate_range(dev, rates, &n));
+    TEST_ASSERT_EQUAL(2, n);
+    int16_t vol = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_set_volume(dev, 1, -6 * 256));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 1, &vol));
+    TEST_ASSERT_EQUAL(-6 * 256, vol);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+static void test_reversed_volume_range_not_used(void)
+{
+    fake_usb_set_volume_range(0, -90 * 256, 256);   // max below min
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    uint8_t pct = 0;
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_RESPONSE, uac2_host_device_set_volume_percent(dev, 0, 50));
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_RESPONSE, uac2_host_device_get_volume_percent(dev, 0, &pct));
+    int16_t vol = 1;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 0, &vol));
+    TEST_ASSERT_EQUAL(0, vol);   // the percent setter sent nothing
+    // Nor does a raw dB value, which cannot be checked against the range
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_RESPONSE, uac2_host_device_set_volume(dev, 1, -20 * 256));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 1, &vol));
+    TEST_ASSERT_EQUAL(0, vol);
+    // The raw ranges are reported as the device sent them, without being cached
+    uac2_volume_range_t ranges[UAC2_MAX_VOLUME_RANGES];
+    uint8_t n = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume_range(dev, 0, ranges, &n));
+    TEST_ASSERT_EQUAL(1, n);
+    TEST_ASSERT_EQUAL(-90 * 256, ranges[0].max);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_RESPONSE, uac2_host_device_set_volume_percent(dev, 0, 50));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+static void test_ring_buffer_sizes_checked(void)
+{
+    uint8_t addr = attach_and_install();
+    // Smaller than one 294-byte packet: refused before anything is claimed
+    uac2_host_device_handle_t dev = open_iface_buffered(addr, TX_IFACE, 100, 0);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(0, fake_usb_stats().interfaces_claimed);
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    dev = open_iface_buffered(addr, RX_IFACE, 100, 0);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, uac2_host_device_start(dev, &k_rx_48k));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    // A threshold the ring can never reach
+    dev = open_iface_buffered(addr, TX_IFACE, 1000, 2000);
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    // A write larger than the ring fails at once instead of timing out
+    dev = open_iface_buffered(addr, TX_IFACE, 1000, 0);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    static uint8_t pcm[1001];
+    int64_t t0 = esp_timer_get_time();
+    TEST_ASSERT_EQUAL(ESP_ERR_INVALID_SIZE, uac2_host_device_write(dev, pcm, sizeof(pcm), 1000));
+    TEST_ASSERT_LESS_THAN(100000, esp_timer_get_time() - t0);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_write(dev, pcm, 900, 1000));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
+/** A USB-MIDI function's UAC1 AC interface after the audio function is not used for requests. */
+static void test_trailing_midi_function_left_alone(void)
+{
+    uint16_t len = fake_usb_midi_function_config(s_cfg_buf, sizeof(s_cfg_buf));
+    TEST_ASSERT_NOT_EQUAL(0, len);
+    uint8_t addr = attach_config_and_install(s_cfg_buf, len);
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    uac2_device_info_t info;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_info(dev, &info));
+    TEST_ASSERT_EQUAL(0, info.ac_iface_num);
+    TEST_ASSERT_EQUAL(3, info.num_as_ifaces);
+    int16_t vol = 0;
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_set_volume(dev, 1, -3 * 256));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_volume(dev, 1, &vol));
+    TEST_ASSERT_EQUAL(-3 * 256, vol);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    TEST_ASSERT_EQUAL(48000, fake_usb_stats().last_set_rate);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
+}
+
 static void test_start_falls_back_to_an_alt_the_host_can_fit(void)
 {
     uint8_t addr = attach_and_install();
@@ -1141,8 +1663,10 @@ static uint64_t drain_capture(uac2_host_device_handle_t rx, int duration_ms, int
     bool have_prev = false;
     uint8_t prev = 0;
     if (breaks) *breaks = 0;
-    int64_t end = esp_timer_get_time() + (int64_t)duration_ms * 1000;
-    while (esp_timer_get_time() < end) {
+    // Timed in ticks, as the fake's bus is (one frame per tick): a loaded host
+    // drops POSIX-port ticks, and a wall-clock window would then see fewer frames
+    TickType_t start = xTaskGetTickCount();
+    while (xTaskGetTickCount() - start < pdMS_TO_TICKS(duration_ms)) {
         uint32_t n = 0;
         esp_err_t err = uac2_host_device_read(rx, buf, sizeof(buf), &n, 10);
         if (err == ESP_OK) {
@@ -1157,6 +1681,60 @@ static uint64_t drain_capture(uac2_host_device_handle_t rx, int duration_ms, int
         }
     }
     return total;
+}
+
+static void test_buffer_status_counts_underruns_and_drops(void)
+{
+    uint8_t addr = attach_and_install();
+    uac2_host_device_handle_t dev = open_iface(addr, TX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    uac2_host_buffer_status_t bs;
+    vTaskDelay(pdMS_TO_TICKS(50));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    TEST_ASSERT_EQUAL(0, bs.underrun_bytes);    // start-up silence, nothing written yet
+    writer_t *w = &s_writer;
+    writer_start(w, dev);
+    vTaskDelay(pdMS_TO_TICKS(500));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    TEST_ASSERT_EQUAL(0, bs.underrun_bytes);    // the writer keeps up
+    writer_join(w);
+    TEST_ASSERT_EQUAL(ESP_OK, w->end_err);
+    vTaskDelay(pdMS_TO_TICKS(300));             // the ~100 ms ring drains, then silence
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    printf("    %u underrun bytes after the writer stopped\n", (unsigned)bs.underrun_bytes);
+    TEST_ASSERT_GREATER_THAN(288 * 100, bs.underrun_bytes);
+    TEST_ASSERT_EQUAL(0, bs.dropped_bytes);
+    // The counters restart with the stream, and a resumed or restarted
+    // stream's start-up silence is not an underrun
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_suspend(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_resume(dev));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    TEST_ASSERT_EQUAL(0, bs.underrun_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_tx_48k));
+    vTaskDelay(pdMS_TO_TICKS(50));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    TEST_ASSERT_EQUAL(0, bs.underrun_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+
+    // Capture nobody reads: the ring fills, then packets are dropped
+    dev = open_iface(addr, RX_IFACE);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_rx_48k));
+    vTaskDelay(pdMS_TO_TICKS(300));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    printf("    %u capture bytes dropped\n", (unsigned)bs.dropped_bytes);
+    TEST_ASSERT_GREATER_THAN(288 * 100, bs.dropped_bytes);
+    TEST_ASSERT_EQUAL(0, bs.underrun_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_start(dev, &k_rx_48k));
+    vTaskDelay(pdMS_TO_TICKS(30));     // well inside the ~100 ms ring
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_get_buffer_status(dev, &bs));
+    TEST_ASSERT_EQUAL(0, bs.dropped_bytes);
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_device_stop(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, close_iface(dev));
+    TEST_ASSERT_EQUAL(ESP_OK, uac2_host_uninstall());
 }
 
 static void test_playback_and_capture_together(void)
@@ -1243,6 +1821,7 @@ static void test_unplug_during_playback_and_capture(void)
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, uac2_host_device_read(rx, buf, sizeof(buf), &n, 100));
     // One DISCONNECTED per open interface
     TEST_ASSERT_EQUAL(2, dev_events(UAC2_HOST_DEVICE_EVENT_DISCONNECTED));
+    TEST_ASSERT_EQUAL(0, dev_events(UAC2_HOST_DEVICE_EVENT_STREAM_ERROR));
     TEST_ASSERT_EQUAL(ESP_OK, close_iface(rx));
     TEST_ASSERT_EQUAL(ESP_OK, close_iface(tx));
     TEST_ASSERT_TRUE(wait_until(device_freed, 1000));
@@ -1264,6 +1843,9 @@ static void run_all_tests(void *arg)
     RUN_TEST(test_playback_48k_sends_whole_288_byte_packets);
     RUN_TEST(test_playback_follows_feedback_drift);
     RUN_TEST(test_suspend_and_resume);
+    RUN_TEST(test_teardown_after_channel_error);
+    RUN_TEST(test_stop_waits_for_a_callback_mid_resubmit);
+    RUN_TEST(test_restart_stops_running_streams);
     RUN_TEST(test_io_after_close_is_invalid_state);
     RUN_TEST(test_unplug_during_playback_then_replug);
     RUN_TEST(test_unplug_while_idle_open);
@@ -1271,6 +1853,8 @@ static void run_all_tests(void *arg)
     RUN_TEST(test_failed_urb_allocation_rolls_back);
     RUN_TEST(test_control_timeout_orphan_then_late_reply);
     RUN_TEST(test_control_timeout_orphan_reclaimed_on_unplug);
+    RUN_TEST(test_start_reports_clock_setup_timeout);
+    RUN_TEST(test_late_stall_then_request_waits_for_ep0);
     RUN_TEST(test_late_reply_consumed_by_next_request);
     RUN_TEST(test_interface_release_retried_while_busy);
     RUN_TEST(test_dead_data_endpoint_reaches_stream_error);
@@ -1281,13 +1865,23 @@ static void run_all_tests(void *arg)
     RUN_TEST(test_sibling_stream_at_other_rate_refused);
     RUN_TEST(test_clock_never_changes_under_a_stream);
     RUN_TEST(test_adaptive_endpoint_plays_44k1_without_feedback);
+    RUN_TEST(test_three_byte_feedback_endpoint_followed);
+    RUN_TEST(test_oversized_feedback_endpoint_followed);
+    RUN_TEST(test_undersized_feedback_endpoint_refused);
     RUN_TEST(test_async_endpoint_without_feedback_refuses_44k1);
     RUN_TEST(test_unadvertised_sample_rate_refused);
     RUN_TEST(test_rate_beyond_the_ranges_read_not_refused);
     RUN_TEST(test_clock_set_before_alt_enabled);
     RUN_TEST(test_all_channel_controls_fall_back_when_master_stalls);
+    RUN_TEST(test_read_only_controls_left_alone);
+    RUN_TEST(test_all_read_only_controls_refused);
+    RUN_TEST(test_control_requests_rounded_to_small_ep0);
+    RUN_TEST(test_trailing_midi_function_left_alone);
+    RUN_TEST(test_reversed_volume_range_not_used);
+    RUN_TEST(test_ring_buffer_sizes_checked);
     RUN_TEST(test_start_falls_back_to_an_alt_the_host_can_fit);
     RUN_TEST(test_buffer_status_tracks_queued_audio);
+    RUN_TEST(test_buffer_status_counts_underruns_and_drops);
     RUN_TEST(test_playback_and_capture_together);
     RUN_TEST(test_close_capture_while_playback_runs);
     RUN_TEST(test_unplug_during_playback_and_capture);
@@ -1297,6 +1891,7 @@ static void run_all_tests(void *arg)
 
 void app_main(void)
 {
+    if (esp_register_shutdown_handler(unexpected_restart) != ESP_OK) exit(1);
     xTaskCreate(watchdog_task, "watchdog", 4096, NULL, configMAX_PRIORITIES - 1, NULL);
     // Above the writer/hammer tasks (6) and the driver's event task (5), so a
     // test can always run its teardown; below the fake bus (23)

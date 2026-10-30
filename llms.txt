@@ -6,7 +6,7 @@ USB Audio Class 2.0 host driver for ESP32-S3. ESP-IDF component written in C. MI
 
 A UAC2 host driver that runs on ESP32-S3. It enables the ESP32 to stream audio to/from single-clock USB Audio Class 2.0 devices (DACs, audio interfaces, miniDSP hardware). The primary use case is playing measurement sweeps through a miniDSP 2x4 HD for automated subwoofer optimization.
 
-v0.1.3 (2026-10-29), on the ESP Component Registry as `averyy/usb_host_uac2` (folder `components/usb_host_uac2`): verified on a miniDSP 2x4 HD under ESP-IDF 5.4.0, 6.0.3 and 6.1 (full harness, hot-unplug, a downstream app's sweeps and a 10-minute run checked with a measurement mic). A harness session once left the miniDSP stuck silent until power-cycled; it didn't reproduce. Duplex is unverified on the 2x4 HD. Single-clock UAC2 devices; builds clean with `-Werror -Wextra`.
+v0.1.3 (2026-10-29), on the ESP Component Registry as `averyy/usb_host_uac2` (folder `components/usb_host_uac2`): verified on a miniDSP 2x4 HD under ESP-IDF 5.4.0, 6.0.3 and 6.1 (full harness, hot-unplug, a downstream app's sweeps and a 10-minute run checked with a measurement mic). An ESP32 hardware reset mid-stream sometimes leaves the miniDSP silent until it reboots (intermittent, undetectable from the host). Duplex (ESP-IDF 5.5+/6.x FIFO split) verified on the 2x4 HD. Single-clock UAC2 devices; builds clean with `-Werror -Wextra`.
 
 Install: `idf.py add-dependency "averyy/usb_host_uac2^0.1.3"` (or a `git:` dependency on this repo with `path: components/usb_host_uac2`).
 
@@ -33,7 +33,7 @@ simulators/minidsp-2x4hd/      Full miniDSP 2x4 HD simulator
                                 Optional test builds with profile markers: no-feedback (adaptive endpoints; 44.1 kHz must play), playback-channel-only FU, ep0-hang (control timeout), fb-drift (feedback +2 Hz)
 
 test/host/                      Host-side tests: descriptor parser + packet sizing (run.sh), parser fuzzer (fuzz.sh)
-test/host/driver/               The driver on the ESP-IDF Linux target against a fake USB Host Library (38 Unity tests)
+test/host/driver/               The driver on the ESP-IDF Linux target against a fake USB Host Library (53 Unity tests)
 
 ref/                            Reference code (read-only, not compiled)
   espressif-uac1/               Espressif's UAC1 host driver, source as of v1.4.0 (architecture reference)
@@ -47,7 +47,7 @@ ref/                            Reference code (read-only, not compiled)
 ### Types
 - `uac2_host_device_handle_t` — opaque device handle (pointer to internal `uac2_iface_t`)
 - `uac2_host_driver_config_t` — driver install config: `{ create_background_task, task_priority, stack_size, core_id, callback, callback_arg }`
-- `uac2_host_device_config_t` — device open config: `{ addr, iface_num, buffer_size, buffer_threshold, callback, callback_arg }`
+- `uac2_host_device_config_t` — device open config: `{ addr, iface_num, buffer_size, buffer_threshold, callback, callback_arg }`; `buffer_size` must hold one packet (else start() tries the next alt, then returns ESP_ERR_INVALID_SIZE) and the threshold must not exceed it
 - `uac2_host_stream_config_t` — stream config: `{ sample_freq, bit_resolution, channels, flags }`
 - `uac2_host_driver_event_t` — `UAC2_HOST_DRIVER_EVENT_TX_CONNECTED`, `UAC2_HOST_DRIVER_EVENT_RX_CONNECTED`
 - `uac2_host_driver_event_cb_t` — callback signature `void(addr, iface_num, event, arg)`
@@ -59,12 +59,12 @@ ref/                            Reference code (read-only, not compiled)
 - `uac2_host_dev_alt_param_t` — alternate-setting parameters including data/feedback endpoints
 - `uac2_ep_sync_type_t` — `UAC2_EP_SYNC_NONE/ASYNC/ADAPTIVE/SYNC` (data endpoint bmAttributes bits 3..2)
 - `uac2_host_stream_info_t` — started stream: `{ alt_setting, channels, bit_resolution, sub_slot_size, sample_freq, ep_max_packet_size, ep_addr, fb_ep_addr, sync_type, active }`
-- `uac2_host_buffer_status_t` — `{ ring_bytes, ring_capacity, ring_us, in_flight_us }`
+- `uac2_host_buffer_status_t` — `{ ring_bytes, ring_capacity, ring_us, in_flight_us, underrun_bytes, dropped_bytes }` (the last two count TX silence after the first written audio and RX ring-full drops since start/resume)
 
 ### Functions
 ```c
 // Driver lifecycle (Espressif class driver pattern)
-esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);  // already-attached devices are reported on the first event pump
+esp_err_t uac2_host_install(const uac2_host_driver_config_t *config);  // already-attached devices are reported on the first event pump; with CONFIG_UAC2_STOP_STREAMS_ON_RESTART, registers an esp_restart() handler
 esp_err_t uac2_host_uninstall(void);
 esp_err_t uac2_host_handle_events(TickType_t timeout);  // manual event pump (if no background task); stop when it returns ESP_FAIL. Uninstall waits only for an in-progress call, so it can be called from the pumping task between calls (never from a driver callback)
 
@@ -78,7 +78,7 @@ void      uac2_host_device_print_info(uac2_host_device_handle_t handle);
 // Streaming
 esp_err_t uac2_host_device_start(uac2_host_device_handle_t handle, const uac2_host_stream_config_t *config);  // tries matching alts best first
 esp_err_t uac2_host_device_stop(uac2_host_device_handle_t handle);    // discards queued audio; drain first (get_buffer_status)
-esp_err_t uac2_host_device_write(handle, data, size, timeout_ms);  // TX: blocks if ringbuf full; returns once queued
+esp_err_t uac2_host_device_write(handle, data, size, timeout_ms);  // TX: blocks if ringbuf full; returns once queued; size > ring = ESP_ERR_INVALID_SIZE
 esp_err_t uac2_host_device_read(handle, buf, size, &bytes_read, timeout_ms);  // RX
 esp_err_t uac2_host_device_suspend(handle);   // pause without realloc
 esp_err_t uac2_host_device_resume(handle);    // resume after suspend
@@ -93,15 +93,16 @@ esp_err_t uac2_host_device_set_sample_rate(handle, rate);  // ESP_ERR_INVALID_ST
 esp_err_t uac2_host_device_get_sample_rate_range(handle, ranges, &count);  // count in: capacity (0 = UAC2_MAX_SAMPLE_RATE_RANGES), out: written
 esp_err_t uac2_host_device_get_clock_valid(handle, &valid);
 
-// Volume/mute (feature unit)
-esp_err_t uac2_host_device_set_volume(handle, channel, volume_db256);
+// Volume/mute (feature unit). Setters return ESP_ERR_NOT_SUPPORTED, without a request, for a
+// control the descriptor marks read-only (uac2_feature_unit_t.*_wr_ch_map); getters still read it.
+esp_err_t uac2_host_device_set_volume(handle, channel, volume_db256);  // checked against RANGE (malformed RANGE = ESP_ERR_INVALID_RESPONSE); unchecked if the device reports none
 esp_err_t uac2_host_device_get_volume(handle, channel, &volume_db256);
 esp_err_t uac2_host_device_set_mute(handle, channel, mute);
 esp_err_t uac2_host_device_get_mute(handle, channel, &mute);
 esp_err_t uac2_host_device_get_volume_range(handle, channel, ranges, &count);  // count in: capacity (0 = UAC2_MAX_VOLUME_RANGES), out: written
 esp_err_t uac2_host_device_set_volume_percent(handle, channel, percent);
 esp_err_t uac2_host_device_get_volume_percent(handle, channel, &percent);
-esp_err_t uac2_host_device_set_volume_all_channels(handle, volume_db256);  // falls back to per-channel if master STALLs
+esp_err_t uac2_host_device_set_volume_all_channels(handle, volume_db256);  // falls back to per-channel if master STALLs; skips read-only channels
 esp_err_t uac2_host_device_set_mute_all_channels(handle, mute);            // same fallback; mute before start to avoid pops
 
 // Event callback fires from driver task — must not block or call driver APIs.
@@ -122,6 +123,7 @@ esp_err_t uac2_host_device_set_mute_all_channels(handle, mute);            // sa
 #define UAC2_HOST_DUPLEX_FIFO_NPTX_LINES 16 // fifo_settings_custom for playback + capture (with PTX 90, RX 94)
 #define UAC2_MAX_STRING_LEN         64      // VID/PID/strings in uac2_device_info_t
 // Kconfig UAC2_ALLOW_UNADVERTISED_RATES (default n): send rates outside the clock's RANGE with a warning
+// Kconfig UAC2_STOP_STREAMS_ON_RESTART (default n): stop started streams before esp_restart()
 ```
 
 ## Internal Design
@@ -129,14 +131,14 @@ esp_err_t uac2_host_device_set_mute_all_channels(handle, mute);            // sa
 ### Stream Lifecycle
 1. `device_start`: collect the AS alts matching the format, best first (`find_matching_as_ifaces`) → take `dev->stream_mutex` + duplex guard + shared-clock check → for each alt: descriptor checks (`check_alt_usable`: data EP bInterval must be 1, URB must fit the HCD's 61-frame ISOC list, fractional rates need feedback on async endpoints) → `stream_resources_alloc` (URBs, ringbuf, feedback URB) → `usb_host_interface_claim` → set sample rate (refused if not in the clock's RANGE, read back and warned on mismatch) → `ctrl_request_no_data(SET_INTERFACE, alt)` → `stream_submit_urbs`. An alt-specific failure (descriptor checks, packet size above MPS, claim refused because the HCD cannot fit the endpoint) moves on to the next alt; anything else ends the start. The clock is set before SET_INTERFACE, as Linux snd-usb-audio does for UAC2.
 2. Streaming: TX callback reads from ringbuf, sizes each packet from the feedback value (nominal rate until the first report) or, without a feedback endpoint (adaptive/synchronous sinks), from exact integer arithmetic (`uac2_tx_next_nominal_samples`: 44.1 kHz = nine 44-frame packets and one 45-frame packet per 10 ms), resubmits URB. RX callback writes to ringbuf, resubmits. Per-packet skips/errors/drops are aggregated and logged at most once per second.
-3. `device_stop`: set state IDLE under spinlock → `ctrl_request_no_data(SET_INTERFACE, 0)` → endpoint halt/flush/clear → wait for `urbs_in_flight` (callbacks retire URBs once not ACTIVE) → `usb_host_interface_release` → wait for `rw_users` (wake blocked read/write) → `stream_resources_free`. Releasing only after the URBs quiesce avoids espressif/usb's 10-tick sleep in `usb_host_interface_release()` (IDF 6.x; ~100 ms per stop at 100 Hz) and IDF 5.x's #17707 refusals; startup abort and suspend use the same order. Polling waits use `poll_delay()` (at least one tick: `pdMS_TO_TICKS(5)` is 0 at 100 Hz)
+3. `device_stop`: set state IDLE under spinlock → `stream_quiesce()`: wait for `urb_cbs_running` to reach 0 (a URB callback that found the stream ACTIVE before the change may still resubmit; once none runs, none can; if one still runs after 2 s, return ESP_ERR_TIMEOUT having changed nothing, stream in ERROR, resources kept), then wait up to `UAC2_URB_DRAIN_MS` (URBs × packets + 32 + 50 ms) for `urbs_in_flight` to reach 0 (callbacks retire URBs once not ACTIVE; isochronous URBs complete on schedule), halt/flush/clear the endpoints only if some are still out (a channel error halted the pipe), then `ctrl_request_no_data(SET_INTERFACE, 0)` → wait for `urbs_in_flight` and `urb_cbs_running` → `usb_host_interface_release` → wait for `rw_users` (wake blocked read/write) → `stream_resources_free`. Releasing only after the URBs quiesce avoids espressif/usb's 10-tick sleep in `usb_host_interface_release()` (IDF 6.x; ~100 ms per stop at 100 Hz) and IDF 5.x's #17707 refusals; startup abort and suspend use the same order. The driver never halts a pipe with a URB executing: esp-usb's `_pipe_cmd_halt()` (still in espressif/usb 1.6.0) waits for the channel with no timeout, and a channel error during that wait never wakes it, which would hang stop/suspend forever; halting an idle or error-halted pipe returns at once. URBs drain before SET_INTERFACE(0), as Linux kills its URBs before selecting alt 0, so the device keeps its endpoints while transfers are in flight. Polling waits use `poll_delay()` (at least one tick: `pdMS_TO_TICKS(5)` is 0 at 100 Hz)
 4. `device_suspend`/`device_resume`: pause/resume streaming without URB/ringbuf reallocation.
 
 ### Feedback Handling
-Async playback uses a feedback endpoint (EP IN, isochronous). The device reports its desired sample rate in 16.16 (4-byte) fixed-point format (confirmed with real XMOS hardware — previous 3-byte 10.14 assumption was incorrect). The driver accumulates the fractional part and adjusts packet size (one extra sample when accumulator overflows). This prevents device buffer drift during sustained playback. Feedback is followed at every sample rate, including integer-kHz rates (the miniDSP reports e.g. 48.0009 at 48 kHz); before the first report, or if a report is more than 1 sample/frame from nominal, the nominal rate is used. Endpoints without a feedback endpoint (adaptive or synchronous sinks, which follow the host's frame timing) get exact integer sizing instead (`uac2_tx_next_nominal_samples`, nine 44-frame and one 45-frame packet per 10 ms at 44.1 kHz); a fractional rate on an asynchronous endpoint without feedback is refused at start.
+Async playback uses a feedback endpoint (EP IN, isochronous). The driver requests the endpoint's wMaxPacketSize (ESP-IDF rejects an ISOC IN request that is not a multiple of it) and decodes by length: 4 bytes are 16.16 (XMOS devices such as the miniDSP send this at full speed), 3 bytes are the USB spec's 10.14. The driver accumulates the fractional part and adjusts packet size (one extra sample when accumulator overflows). This prevents device buffer drift during sustained playback. Feedback is followed at every sample rate, including integer-kHz rates (the miniDSP reports e.g. 48.0009 at 48 kHz); before the first report, or if a report is more than 1 sample/frame from nominal, the nominal rate is used. Endpoints without a feedback endpoint (adaptive or synchronous sinks, which follow the host's frame timing) get exact integer sizing instead (`uac2_tx_next_nominal_samples`, nine 44-frame and one 45-frame packet per 10 ms at 44.1 kHz); a fractional rate on an asynchronous endpoint without feedback is refused at start.
 
 ### Control Transfers
-All control requests go through `ctrl_request()` which serializes access via a mutex + completion semaphore. For requests with no response data (SET_INTERFACE, SET_CUR), use `ctrl_request_no_data()` which auto-releases the mutex. For GET requests, `ctrl_get_cur`/`ctrl_get_range` wrappers copy response data then release.
+All control requests go through `ctrl_request()` which serializes access via a mutex + completion semaphore. Class requests address `dev->ac_iface_num`, the first protocol-0x20 AudioControl interface (a trailing UAC1/MIDI AC interface is ignored); only that function's streaming interfaces are collected (its IAD's range, or those before a second UAC2 AC interface without IADs). IN requests are sized to whole `bMaxPacketSize0` packets. After a failed transfer, ESP-IDF 5.x refuses EP0 submissions until its library task clears the pipe, so the next submit retries `ESP_ERR_INVALID_STATE` for up to `UAC2_EP0_RECOVERY_US`. A clock-setup error that leaves EP0 unusable (timeout, orphan pending) is returned as is rather than followed by another request (`ctrl_err_blocks_ep0`). For requests with no response data (SET_INTERFACE, SET_CUR), use `ctrl_request_no_data()` which auto-releases the mutex. For GET requests, `ctrl_get_cur`/`ctrl_get_range` wrappers copy response data then release.
 
 ESP-IDF rejects `usb_host_endpoint_halt/flush` on EP0 and does not implement `timeout_ms`, so a timed-out control transfer cannot be cancelled. `ctrl_request()` marks it abandoned; the next request first consumes its late completion (or fails with `ESP_ERR_INVALID_STATE` while it is still pending). If the device is destroyed while it is still in flight, the URB and the USB device handle are orphaned (ESP-IDF asserts if the last handle is closed with a control transfer in flight) and released on the event task once the URB completes; that device cannot be reopened meanwhile, and `uac2_host_uninstall()` refuses while any orphan is pending. Each device allocates its orphan node with the control URB, so orphaning cannot fail or run out of slots. Separately, the in-tree USB Host Library of ESP-IDF 5.x (every release through 5.5.x) notifies a control completion before decrementing the device's in-flight count, so a task with higher priority than the USB Host library task can close the device too early and hit the same assert; `close_device_after_ctrl()` (used by `device_destroy()` and orphan reclaim) blocks 10 ms first on IDF < 6. `espressif/usb` 1.6.0, which the manifest requires on IDF 6.x, fixes the ordering.
 
@@ -152,6 +154,7 @@ ESP-IDF rejects `usb_host_endpoint_halt/flush` on EP0 and does not implement `ti
 - `iface->closing` (_Atomic bool): set during `device_close()` so new API calls are rejected while teardown is in progress.
 - `urbs_in_flight` (atomic_int): tracks in-flight URBs for clean shutdown.
 - `consecutive_errors` / `fb_consecutive_errors` (atomic_int): data-URB and feedback-URB error counts, each stopping the stream at `UAC2_MAX_CONSECUTIVE_ERRORS`. Kept separate so a working feedback EP cannot reset the count of a dead data EP. A feedback URB only counts as good when its packet status is COMPLETED (the HCD reports the URB COMPLETED regardless); a SKIPPED packet keeps the last value and is not counted as an error.
+- Restart hook (CONFIG_UAC2_STOP_STREAMS_ON_RESTART, default off): `uac2_host_install()` registers `stop_streams_on_restart()` with `esp_register_shutdown_handler()` (unregistered at uninstall). It visits every interface one at a time (rescanning under `s_uac2_lock`, marked by `restart_pass`), holding an `io_users` reference so close() can't free it, takes its `api_mutex`, which waits out a start/stop/suspend/close under way, and runs `stream_stop_internal()` on any started stream (the test close() uses: not IDLE, or resources held; SUSPEND_AFTER_START leaves READY with its alt selected). Concurrent calls are serialized: a second caller waits for the first pass. It skips them when `esp_restart()` runs on `driver->events_task` (the task that last pumped events), since transfers complete there and stop() would only time out. Why it's optional: esp_restart() leaves the USB OTG controller running, and the miniDSP 2x4 HD's occasional silent state followed hardware resets mid-stream, never a software restart (0 of 2).
 - Lifecycle mutex (static, never deleted): serializes install/uninstall/open/close, so a call racing uninstall never blocks on freed memory; a second concurrent uninstall returns `ESP_ERR_INVALID_STATE`. The background event task is bound to its installation and uninstall always waits for it to exit. `uac2_host_handle_events()` allows one caller at a time (`ESP_ERR_INVALID_STATE` otherwise).
 - `fb_value` (atomic_uint): feedback value written by feedback callback, read by TX submit.
 - `first_frame_us` (_Atomic int64_t): microsecond timestamp, write-once.
@@ -161,7 +164,7 @@ ESP-IDF rejects `usb_host_endpoint_halt/flush` on EP0 and does not implement `ti
 
 - ESP32-S3 USB OTG: Full Speed only (12 Mbps). Sufficient for stereo 48kHz/24-bit (288 bytes/ms = 2.3 Mbps = 25% of bus).
 - DWC_OTG FIFO: 1024 bytes physical, 200 lines (800 bytes) usable after endpoint scratch space. With PERIODIC_OUT bias: NPTX=16, PTX=150, RX=34 lines (64/600/136 bytes). The HCD accepts an iso/interrupt OUT endpoint up to PTX*4 bytes, a control/bulk OUT up to NPTX*4, and any IN endpoint up to (RX-2)*4, checked per endpoint at claim.
-- With the presets, no simultaneous TX+RX: capture packets (~294 bytes) exceed the 128-byte IN limit. ESP-IDF 5.5+/espressif/usb `usb_host_config_t.fifo_settings_custom` with `UAC2_HOST_DUPLEX_FIFO_*` (16/90/94 lines: 64-byte control, 360-byte OUT, 368-byte IN) plus `CONFIG_UAC2_ALLOW_DUPLEX` allows it. Both streams run at full rate on the miniDSP, but a session that included duplex left its output stuck silent (trigger not isolated), so the harness skips that check on it for now.
+- With the presets, no simultaneous TX+RX: capture packets (~294 bytes) exceed the 128-byte IN limit. ESP-IDF 5.5+/espressif/usb `usb_host_config_t.fifo_settings_custom` with `UAC2_HOST_DUPLEX_FIFO_*` (16/90/94 lines: 64-byte control, 360-byte OUT, 368-byte IN) plus `CONFIG_UAC2_ALLOW_DUPLEX` allows it. Verified on the miniDSP 2x4 HD (IDF 6.1, 2026-10-30): 30 s with both streams at full rate, playback audible throughout. Its occasional stuck-silent state follows ESP32 hardware resets mid-stream, not duplex.
 - VBUS: the DevKitC-1 doesn't power its OTG port; bridge the `USB-OTG` solder pads on the back.
 
 ## Kconfig
@@ -170,7 +173,7 @@ ESP-IDF rejects `usb_host_endpoint_halt/flush` on EP0 and does not implement `ti
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=512   # miniDSP config descriptor is 373 bytes
 CONFIG_USB_HOST_HW_BUFFER_BIAS_PERIODIC_OUT=y   # Bias FIFO for isochronous OUT
 # Other devices: CONTROL_TRANSFER_MAX_SIZE=1024 for composite headsets, CONFIG_USB_HOST_HUBS_SUPPORTED=y behind hubs
-# Component: CONFIG_UAC2_ALLOW_UNADVERTISED_RATES (default n), CONFIG_UAC2_ALLOW_DUPLEX (default n; needs fifo_settings_custom)
+# Component: CONFIG_UAC2_ALLOW_UNADVERTISED_RATES (default n), CONFIG_UAC2_ALLOW_DUPLEX (default n; needs fifo_settings_custom), CONFIG_UAC2_STOP_STREAMS_ON_RESTART (default n)
 ```
 
 ## miniDSP 2x4 HD Simulator

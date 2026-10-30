@@ -27,6 +27,7 @@
  * Additional live checks:
  *   - Suspend/resume on an active playback stream
  *   - ESP32-S3 duplex guard (reject opposite-direction stream activation)
+ *   - Restart mid-stream (CONFIG_UAC2_TEST_RESTART_SEC)
  */
 
 #include <string.h>
@@ -40,6 +41,7 @@
 #include "usb/uac2_host.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
+#include "esp_system.h"
 #if CONFIG_HEAP_TRACING_STANDALONE
 #include "esp_heap_trace.h"
 #define HEAP_TRACE_RECORDS  300
@@ -694,13 +696,8 @@ static esp_err_t start_playback(uac2_host_device_handle_t dev, const uac2_host_s
     return err;
 }
 
-static uint32_t prefill_tone_buffer(uac2_host_device_handle_t dev,
-                                    uint32_t sample_rate, uint8_t bit_depth,
-                                    float freq_hz, uint32_t prefill_ms)
+static void tone_init(tone_gen_t *gen, uint32_t sample_rate, uint8_t bit_depth, float freq_hz)
 {
-    uint32_t frame_remainder = 0;
-    uint32_t writes = 0;
-    tone_gen_t gen;
     tone_gen_config_t tone_cfg = {
         .sample_rate = sample_rate,
         .channels = TONE_CHANNELS,
@@ -708,13 +705,23 @@ static uint32_t prefill_tone_buffer(uac2_host_device_handle_t dev,
         .frequency = freq_hz,
         .amplitude = TONE_AMPLITUDE,
     };
-    tone_gen_init(&gen, &tone_cfg);
+    tone_gen_init(gen, &tone_cfg);
+}
 
+// The caller's generator carries on across prefill, feeding and the fade-out,
+// so the tone has no seams
+static uint32_t prefill_tone_buffer(uac2_host_device_handle_t dev, tone_gen_t *gen,
+                                    uint32_t prefill_ms)
+{
+    uint32_t sample_rate = gen->config.sample_rate;
+    uint8_t bit_depth = gen->config.bit_depth;
+    uint32_t frame_remainder = 0;
+    uint32_t writes = 0;
     uint8_t tone_buf[TONE_BUF_SIZE];
     uint32_t prefill_writes = prefill_ms / TONE_BUF_MS;
     for (uint32_t i = 0; i < prefill_writes; i++) {
         uint32_t buf_size = tone_chunk_bytes(sample_rate, bit_depth, TONE_BUF_MS, &frame_remainder);
-        tone_gen_fill(&gen, tone_buf, buf_size);
+        tone_gen_fill(gen, tone_buf, buf_size);
         if (uac2_host_device_write(dev, tone_buf, buf_size, 100) == ESP_OK) {
             writes++;
         }
@@ -746,28 +753,19 @@ static void close_device_with_retry(uac2_host_device_handle_t dev, const char *w
 }
 
 static uint32_t feed_tone_for_writes(app_state_t *app, uac2_host_device_handle_t dev,
-                                     uint32_t sample_rate, uint8_t bit_depth,
-                                     float freq_hz, uint32_t target_writes,
+                                     tone_gen_t *gen, uint32_t target_writes,
                                      const char *label)
 {
+    uint32_t sample_rate = gen->config.sample_rate;
+    uint8_t bit_depth = gen->config.bit_depth;
     uint32_t frame_remainder = 0;
     uint32_t writes = 0;
     uint32_t writes_per_sec = 1000 / TONE_BUF_MS;
-    tone_gen_t gen;
-    tone_gen_config_t tone_cfg = {
-        .sample_rate = sample_rate,
-        .channels = TONE_CHANNELS,
-        .bit_depth = bit_depth,
-        .frequency = freq_hz,
-        .amplitude = TONE_AMPLITUDE,
-    };
-    tone_gen_init(&gen, &tone_cfg);
-
     uint8_t tone_buf[TONE_BUF_SIZE];
     int64_t deadline = write_deadline_us(target_writes);
     while (app->dev_connected && writes < target_writes && esp_timer_get_time() < deadline) {
         uint32_t buf_size = tone_chunk_bytes(sample_rate, bit_depth, TONE_BUF_MS, &frame_remainder);
-        tone_gen_fill(&gen, tone_buf, buf_size);
+        tone_gen_fill(gen, tone_buf, buf_size);
         esp_err_t err = uac2_host_device_write(dev, tone_buf, buf_size, 100);
         if (err == ESP_ERR_INVALID_STATE) {
             break;
@@ -791,12 +789,14 @@ static void tone_fade_out_and_drain(app_state_t *app, tone_gen_t *gen, uint8_t *
                                     uint32_t chunk_bytes)
 {
     tone_gen_fade_out(gen);
-    // 30 ms: the 20 ms fade, then silence
-    for (int i = 0; i < 3 && app->dev_connected; i++) {
+    // The fade (up to 133 ms at 30 Hz), then one chunk of silence
+    for (int i = 0; i < 30 && app->dev_connected; i++) {
+        bool last = tone_gen_silent(gen);
         tone_gen_fill(gen, buf, chunk_bytes);
         if (uac2_host_device_write(app->uac2_dev, buf, chunk_bytes, 100) != ESP_OK) {
             return;
         }
+        if (last) break;
     }
     int64_t deadline = esp_timer_get_time() + 2000000;
     uac2_host_buffer_status_t status = {0};
@@ -923,15 +923,19 @@ static void run_live_suspend_resume_check(app_state_t *app)
         return;
     }
 
-    (void)prefill_tone_buffer(app->uac2_dev, 48000, 24, TONE_FREQ_HZ, 50);
+    uint8_t tone_buf[TONE_BUF_SIZE];
+    uint32_t chunk = max_tone_chunk_bytes(48000, 24, TONE_BUF_MS);
+    tone_gen_t warmup;
+    tone_init(&warmup, 48000, 24, TONE_FREQ_HZ);
+    (void)prefill_tone_buffer(app->uac2_dev, &warmup, 50);
     uint32_t writes_per_sec = 1000 / TONE_BUF_MS;
-    uint32_t warmup_writes = feed_tone_for_writes(app, app->uac2_dev, 48000, 24, TONE_FREQ_HZ,
+    uint32_t warmup_writes = feed_tone_for_writes(app, app->uac2_dev, &warmup,
                                                   writes_per_sec, "warmup");
+    tone_fade_out_and_drain(app, &warmup, tone_buf, chunk);
 
     esp_err_t suspend_err = uac2_host_device_suspend(app->uac2_dev);
     ESP_LOGI(TAG, "  suspend: %s", esp_err_to_name(suspend_err));
 
-    uint8_t tone_buf[TONE_BUF_SIZE];
     tone_gen_t gen;
     tone_gen_config_t tone_cfg = {
         .sample_rate = 48000,
@@ -957,8 +961,11 @@ static void run_live_suspend_resume_check(app_state_t *app)
 
     uint32_t resumed_writes = 0;
     if (resume_err == ESP_OK || resume_again_err == ESP_OK) {
-        resumed_writes = feed_tone_for_writes(app, app->uac2_dev, 48000, 24, TONE_ALT_HZ,
+        tone_gen_t resumed;
+        tone_init(&resumed, 48000, 24, TONE_ALT_HZ);
+        resumed_writes = feed_tone_for_writes(app, app->uac2_dev, &resumed,
                                               2 * writes_per_sec, "resumed");
+        tone_fade_out_and_drain(app, &resumed, tone_buf, chunk);
     }
 
     uac2_host_device_stop(app->uac2_dev);
@@ -985,7 +992,7 @@ static void run_live_suspend_resume_check(app_state_t *app)
  * split from app_main): write a tone while draining the capture ring buffer
  * for DUPLEX_STREAM_SEC. Returns whether both streams kept their rate.
  */
-static bool duplex_stream(app_state_t *app, uac2_host_device_handle_t rx_dev)
+static bool duplex_stream(app_state_t *app, uac2_host_device_handle_t rx_dev, tone_gen_t *gen)
 {
     uac2_host_stream_info_t rx_info;
     if (uac2_host_device_get_stream_info(rx_dev, &rx_info) != ESP_OK) {
@@ -999,15 +1006,6 @@ static bool duplex_stream(app_state_t *app, uac2_host_device_handle_t rx_dev)
 
     uint32_t frame_remainder = 0;
     uint32_t writes_per_sec = 1000 / TONE_BUF_MS;
-    tone_gen_t gen;
-    tone_gen_config_t tone_cfg = {
-        .sample_rate = 48000,
-        .channels = TONE_CHANNELS,
-        .bit_depth = 24,
-        .frequency = TONE_FREQ_HZ,
-        .amplitude = TONE_AMPLITUDE,
-    };
-    tone_gen_init(&gen, &tone_cfg);
     uint8_t tone_buf[TONE_BUF_SIZE];
     uint8_t rx_buf[1024];
 
@@ -1021,7 +1019,7 @@ static bool duplex_stream(app_state_t *app, uac2_host_device_handle_t rx_dev)
     int last_sec = 0;
     while (app->dev_connected && esp_timer_get_time() < end) {
         uint32_t buf_size = tone_chunk_bytes(48000, 24, TONE_BUF_MS, &frame_remainder);
-        tone_gen_fill(&gen, tone_buf, buf_size);
+        tone_gen_fill(gen, tone_buf, buf_size);
         esp_err_t err = uac2_host_device_write(app->uac2_dev, tone_buf, buf_size, 100);
         if (err == ESP_ERR_INVALID_STATE) break;
         if (err == ESP_OK) writes++;
@@ -1082,6 +1080,25 @@ static bool duplex_stream(app_state_t *app, uac2_host_device_handle_t rx_dev)
 }
 #endif
 
+#if CONFIG_UAC2_TEST_RESTART_SEC > 0
+/*
+ * LIVE CHECK: restart mid-stream. Calls esp_restart() CONFIG_UAC2_TEST_RESTART_SEC
+ * into Test 12; listen for the next boot's tones. With
+ * CONFIG_UAC2_STOP_STREAMS_ON_RESTART the driver stops the stream first.
+ */
+static void restart_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(CONFIG_UAC2_TEST_RESTART_SEC * 1000));
+#if CONFIG_UAC2_STOP_STREAMS_ON_RESTART
+    ESP_LOGI(TAG, "=== LIVE CHECK: Restart mid-stream: esp_restart() (driver stops streams first) ===");
+#else
+    ESP_LOGI(TAG, "=== LIVE CHECK: Restart mid-stream: esp_restart() (streams left running) ===");
+#endif
+    esp_restart();
+}
+#endif
+
 static void run_live_duplex_guard_check(app_state_t *app)
 {
     ESP_LOGI(TAG, "");
@@ -1103,16 +1120,6 @@ static void run_live_duplex_guard_check(app_state_t *app)
         ESP_LOGI(TAG, "=== LIVE CHECK: Duplex guard SKIP (no capture iface) ===");
         return;
     }
-
-#if CONFIG_UAC2_ALLOW_DUPLEX
-    // A session that included duplex runs left the 2x4 HD's output silent until
-    // a power cycle; skip until the trigger is identified
-    if (info.vid == 0x2752 && info.pid == 0x0011) {
-        ESP_LOGI(TAG, "=== LIVE CHECK: Duplex streaming SKIP (miniDSP 2x4 HD: unverified, a duplex "
-                 "session once left its output silent until power-cycled) ===");
-        return;
-    }
-#endif
 
     uac2_host_device_config_t rx_dev_cfg = {
         .addr = app->dev_addr,
@@ -1138,24 +1145,27 @@ static void run_live_duplex_guard_check(app_state_t *app)
         .bit_resolution = 24,
     };
 
+    tone_gen_t gen;
+    tone_init(&gen, 48000, 24, TONE_FREQ_HZ);
     esp_err_t tx_start_err = start_playback(app->uac2_dev, &tx_cfg);
     ESP_LOGI(TAG, "  start TX: %s", esp_err_to_name(tx_start_err));
     if (tx_start_err == ESP_OK) {
-        (void)prefill_tone_buffer(app->uac2_dev, 48000, 24, TONE_FREQ_HZ, 50);
-        (void)feed_tone_for_writes(app, app->uac2_dev, 48000, 24, TONE_FREQ_HZ,
-                                   (500 / TONE_BUF_MS), NULL);
+        (void)prefill_tone_buffer(app->uac2_dev, &gen, 50);
+        (void)feed_tone_for_writes(app, app->uac2_dev, &gen, (500 / TONE_BUF_MS), NULL);
     }
 
     esp_err_t rx_start_err = uac2_host_device_start(rx_dev, &rx_cfg);
     ESP_LOGI(TAG, "  start RX while TX active: %s", esp_err_to_name(rx_start_err));
 #if CONFIG_UAC2_ALLOW_DUPLEX
-    bool streamed = tx_start_err == ESP_OK && rx_start_err == ESP_OK && duplex_stream(app, rx_dev);
+    bool streamed = tx_start_err == ESP_OK && rx_start_err == ESP_OK && duplex_stream(app, rx_dev, &gen);
 #endif
     if (rx_start_err == ESP_OK) {
         uac2_host_device_stop(rx_dev);
     }
 
     if (tx_start_err == ESP_OK) {
+        uint8_t tone_buf[TONE_BUF_SIZE];
+        tone_fade_out_and_drain(app, &gen, tone_buf, max_tone_chunk_bytes(48000, 24, TONE_BUF_MS));
         uac2_host_device_stop(app->uac2_dev);
     }
     close_device_with_retry(rx_dev, "Duplex RX");
@@ -1318,11 +1328,16 @@ static void run_live_sample_rate_guard_check(app_state_t *app)
     esp_err_t set_active = ESP_FAIL;
     esp_err_t set_idle = ESP_FAIL;
     uint32_t rate_active = 0;
+    uint8_t tone_buf[TONE_BUF_SIZE];
+    uint32_t chunk = max_tone_chunk_bytes(48000, 24, TONE_BUF_MS);
+    tone_gen_t gen;
+    tone_init(&gen, 48000, 24, TONE_FREQ_HZ);
     esp_err_t start_err = start_playback(app->uac2_dev, &tx_cfg);
     if (start_err == ESP_OK) {
-        (void)prefill_tone_buffer(app->uac2_dev, 48000, 24, TONE_FREQ_HZ, 50);
+        (void)prefill_tone_buffer(app->uac2_dev, &gen, 50);
         set_active = uac2_host_device_set_sample_rate(rx_dev, 44100);
         (void)uac2_host_device_get_sample_rate(app->uac2_dev, &rate_active);
+        tone_fade_out_and_drain(app, &gen, tone_buf, chunk);
         uac2_host_device_stop(app->uac2_dev);
         set_idle = uac2_host_device_set_sample_rate(rx_dev, 44100);
     }
@@ -1347,12 +1362,14 @@ static void run_live_sample_rate_guard_check(app_state_t *app)
             continue;
         }
         starts_ok++;
-        (void)feed_tone_for_writes(app, app->uac2_dev, 48000, 24, TONE_FREQ_HZ, 300 / TONE_BUF_MS, NULL);
+        tone_init(&gen, 48000, 24, TONE_FREQ_HZ);
+        (void)feed_tone_for_writes(app, app->uac2_dev, &gen, 300 / TONE_BUF_MS, NULL);
         uint32_t rate = 0;
         if (uac2_host_device_get_sample_rate(app->uac2_dev, &rate) != ESP_OK || rate != 48000) {
             ESP_LOGE(TAG, "  cycle %d: clock is %" PRIu32 " Hz under a 48 kHz stream", i, rate);
             mismatches++;
         }
+        tone_fade_out_and_drain(app, &gen, tone_buf, chunk);
         uac2_host_device_stop(app->uac2_dev);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -1477,20 +1494,17 @@ static void run_stream_tests(app_state_t *app)
         const uac2_feature_unit_t *fu = NULL;
         uint32_t volume_map = 0;
         uint32_t mute_map = 0;
-        int volume_channel = 0;
-        int mute_channel = 0;
+        int volume_channel = -1;    // -1: no settable control, step skipped
+        int mute_channel = -1;
 
         if (uac2_host_device_get_info(app->uac2_dev, &info) == ESP_OK) {
             fu = resolve_feature_unit_for_iface_info(&info, app->iface_num);
             if (fu) {
-                volume_map = fu->volume_ch_map;
-                mute_map = fu->mute_ch_map;
-                if (volume_map != 0) {
-                    volume_channel = first_supported_channel(volume_map);
-                }
-                if (mute_map != 0) {
-                    mute_channel = first_supported_channel(mute_map);
-                }
+                // Controls the host can set; read-only ones refuse set_*()
+                volume_map = fu->volume_wr_ch_map;
+                mute_map = fu->mute_wr_ch_map;
+                volume_channel = first_supported_channel(volume_map);
+                mute_channel = first_supported_channel(mute_map);
             }
         }
 
@@ -1517,7 +1531,10 @@ static void run_stream_tests(app_state_t *app)
 
             uint8_t tbuf[TONE_BUF_SIZE];
             uint32_t bsz = (TONE_SAMPLE_RATE / 1000) * TONE_BUF_MS * TONE_CHANNELS * (TONE_BIT_DEPTH / 8);
-            bool t2_pass = true;
+            // Without its feature unit there is nothing to exercise; that is
+            // a topology failure, not a device without controls
+            bool t2_pass = fu != NULL;
+            if (!fu) ESP_LOGE(TAG, "  Playback feature unit topology not found");
 
             for (int i = 0; i < 50 / TONE_BUF_MS && app->dev_connected; i++) {
                 tone_gen_fill(&gen, tbuf, bsz);
@@ -1701,6 +1718,7 @@ static void run_stream_tests(app_state_t *app)
                 tone_gen_fill(&gen, tbuf, bsz);
                 uac2_host_device_write(app->uac2_dev, tbuf, bsz, 100);
             }
+            tone_fade_out_and_drain(app, &gen, tbuf, bsz);
             uac2_host_device_stop(app->uac2_dev);
             vTaskDelay(pdMS_TO_TICKS(200));
         }
@@ -1908,13 +1926,18 @@ static void run_stream_tests(app_state_t *app)
         const uac2_feature_unit_t *fu = NULL;
         uint32_t volume_map = 0;
         uint32_t mute_map = 0;
+        uint32_t volume_wr_map = 0;
+        uint32_t mute_wr_map = 0;
         if (uac2_host_device_get_info(app->uac2_dev, &info) == ESP_OK) {
             fu = resolve_feature_unit_for_iface_info(&info, app->iface_num);
             if (fu) {
                 volume_map = fu->volume_ch_map;
                 mute_map = fu->mute_ch_map;
-                ESP_LOGI(TAG, "  FU id=%d channels=%d volume_map=0x%08" PRIX32 " mute_map=0x%08" PRIX32,
-                         fu->unit_id, fu->nr_channels, volume_map, mute_map);
+                volume_wr_map = fu->volume_wr_ch_map;
+                mute_wr_map = fu->mute_wr_ch_map;
+                ESP_LOGI(TAG, "  FU id=%d channels=%d volume_map=0x%08" PRIX32 " mute_map=0x%08" PRIX32
+                         " (settable 0x%08" PRIX32 " 0x%08" PRIX32 ")",
+                         fu->unit_id, fu->nr_channels, volume_map, mute_map, volume_wr_map, mute_wr_map);
             } else {
                 ESP_LOGW(TAG, "  Playback feature unit topology not found");
             }
@@ -1925,13 +1948,14 @@ static void run_stream_tests(app_state_t *app)
         int16_t test_volume = -256;
         for (int ch = 0; ch <= 2; ch++) {
             bool channel_in_range = fu && ch <= fu->nr_channels;
-            bool expect_volume = channel_map_supports(volume_map, ch);
+            bool has_volume = channel_map_supports(volume_map, ch);
+            bool expect_volume = channel_map_supports(volume_wr_map, ch);
             uac2_volume_range_t vranges[UAC2_MAX_VOLUME_RANGES];
             uint8_t num_vranges = 0;
             esp_err_t range_err = uac2_host_device_get_volume_range(app->uac2_dev, ch, vranges, &num_vranges);
             ESP_LOGI(TAG, "  Volume range ch%d: %s (count=%d)",
                      ch, esp_err_to_name(range_err), num_vranges);
-            if (expect_volume) {
+            if (has_volume) {
                 if (range_err != ESP_OK || num_vranges == 0) {
                     t9_pass = false;
                 }
@@ -1964,6 +1988,13 @@ static void run_stream_tests(app_state_t *app)
                 if (restore_err != ESP_OK || restore_get_err != ESP_OK || restore_readback != 0) {
                     t9_pass = false;
                 }
+            } else if (has_volume) {
+                // Read-only: refused without a request, still readable
+                int16_t readback = 0;
+                esp_err_t get_err = uac2_host_device_get_volume(app->uac2_dev, ch, &readback);
+                if (err != ESP_ERR_NOT_SUPPORTED || get_err != ESP_OK) {
+                    t9_pass = false;
+                }
             } else if (err != ESP_ERR_NOT_SUPPORTED &&
                        !(err == ESP_ERR_INVALID_ARG && !channel_in_range)) {
                 t9_pass = false;
@@ -1971,7 +2002,8 @@ static void run_stream_tests(app_state_t *app)
         }
         for (int ch = 0; ch <= 2; ch++) {
             bool channel_in_range = fu && ch <= fu->nr_channels;
-            bool expect_mute = channel_map_supports(mute_map, ch);
+            bool has_mute = channel_map_supports(mute_map, ch);
+            bool expect_mute = channel_map_supports(mute_wr_map, ch);
             err = uac2_host_device_set_mute(app->uac2_dev, ch, true);
             ESP_LOGI(TAG, "  Mute ch%d=true: %s", ch, esp_err_to_name(err));
             if (expect_mute) {
@@ -1993,6 +2025,12 @@ static void run_stream_tests(app_state_t *app)
                          ch, restored ? "yes" : "no",
                          esp_err_to_name(restore_err), esp_err_to_name(restore_get_err));
                 if (restore_err != ESP_OK || restore_get_err != ESP_OK || restored) {
+                    t9_pass = false;
+                }
+            } else if (has_mute) {
+                bool muted = false;
+                esp_err_t get_err = uac2_host_device_get_mute(app->uac2_dev, ch, &muted);
+                if (err != ESP_ERR_NOT_SUPPORTED || get_err != ESP_OK) {
                     t9_pass = false;
                 }
             } else if (err != ESP_ERR_NOT_SUPPORTED &&
@@ -2123,6 +2161,15 @@ static void run_stream_tests(app_state_t *app)
 
     run_live_sample_rate_guard_check(app);
     if (!app->dev_connected) return;
+
+#if CONFIG_UAC2_TEST_RESTART_SEC > 0
+    // Once per power-on: the boot after the restart skips it
+    if (esp_reset_reason() != ESP_RST_SW) {
+        xTaskCreate(restart_task, "restart", 3072, NULL, 5, NULL);
+    } else {
+        ESP_LOGI(TAG, "=== LIVE CHECK: Restart mid-stream SKIP (this boot came from a restart) ===");
+    }
+#endif
 
     // ── Test 12: Long-running stability ──
     ESP_LOGI(TAG, "");
@@ -2429,6 +2476,8 @@ void app_main(void)
     ESP_LOGI(TAG, "esp-uac2-host — Comprehensive UAC2 test suite v0.1");
     ESP_LOGI(TAG, "Driver v%d.%d.%d",
              UAC2_HOST_VER_MAJOR, UAC2_HOST_VER_MINOR, UAC2_HOST_VER_PATCH);
+    ESP_LOGI(TAG, "Reset reason: %d%s", (int)esp_reset_reason(),
+             esp_reset_reason() == ESP_RST_SW ? " (software restart)" : "");
 
     memset(&s_app, 0, sizeof(s_app));
 
