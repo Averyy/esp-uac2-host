@@ -4,7 +4,7 @@ Published as [`averyy/usb_host_uac2`](https://components.espressif.com/component
 
 ## Releasing a version
 
-1. Bump the version in `components/usb_host_uac2/idf_component.yml`, `UAC2_HOST_VER_*` in `include/usb/uac2_host.h` and `PROJECT_VER` in the root `CMakeLists.txt`.
+1. Bump the version in `components/usb_host_uac2/idf_component.yml`, `UAC2_HOST_VER_*` in `components/usb_host_uac2/include/usb/uac2_host.h` and `PROJECT_VER` in the root `CMakeLists.txt`.
 2. Add a dated section to `components/usb_host_uac2/CHANGELOG.md` (Keep a Changelog; list anything existing callers must change under "Breaking Changes").
 3. Commit, push to `main` and wait for CI.
 4. Tag and release: `git tag -a vX.Y.Z -m vX.Y.Z && git push origin vX.Y.Z`, then `gh release create vX.Y.Z --title vX.Y.Z --notes-file <CHANGELOG section>`.

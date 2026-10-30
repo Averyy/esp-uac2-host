@@ -79,7 +79,7 @@ Three USB-C cables connect two ESP32-S3-DevKitC-1 boards to each other and to a 
 2. Flash the main `esp-uac2-host` firmware to the "host" ESP32-S3
 3. Connect both boards' UART ports to the Mac (for power + serial)
 4. Connect a USB-C cable between both boards' OTG ports (left side)
-5. Monitor the host board's serial output — it should enumerate the device, query clocks, start streaming, and log "Streamed N sec" every second
+5. Monitor the host board's serial output — it should enumerate the device, query clocks, start streaming, and log "N sec" every second ("Stream stopped after N sec" at the end)
 
 ## Differences from real miniDSP 2x4 HD
 
@@ -87,9 +87,9 @@ Three USB-C cables connect two ESP32-S3-DevKitC-1 boards to each other and to a 
 |---------|-----------|-------------|
 | PID | 0x9999 | 0x0011 |
 | VID | 0x2752 (same) | 0x2752 |
-| Sample rates | 44.1k, 48k | 44.1k, 48k, 88.2k, 96k (FS) |
+| Sample rates | 44.1k, 48k | 44.1k, 48k |
 | Alt settings | Alt 1 (24-bit) | Alt 1 (24-bit), Alt 2 (16-bit) |
 | Capture interface | Not present | IF2, 2ch 24-bit, EP 0x82 IN |
-| HID interface | Not present | IF3, 64-byte reports |
-| DFU interface | Not present | IF4, runtime mode |
+| DFU interface | Not present | IF3, runtime mode |
+| HID interface | Not present | IF4, 64-byte reports |
 | Feedback | Software-generated at configured rate | Hardware PLL-based |

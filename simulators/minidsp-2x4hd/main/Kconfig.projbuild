@@ -6,8 +6,9 @@ config MINIDSP_SIM_NO_FEEDBACK_TEST_BUILD
     help
         Build a reduced-capability simulator image where both playback
         alternate settings omit their feedback endpoints and the capture
-        streaming alt is removed. This exists only for host-side validation
-        of the driver's no-feedback fractional-rate rejection path.
+        streaming alt is removed (the playback endpoints become adaptive).
+        This exists only for host-side validation of 44.1 kHz playback
+        without a feedback endpoint.
 
 config MINIDSP_SIM_PLAYBACK_CHANNEL_ONLY_FU_TEST_BUILD
     bool "Build playback feature-unit channel-only test image"

@@ -63,6 +63,7 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 ### Example code
 
 ```c
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
@@ -71,6 +72,16 @@ See [uac2_host.h](include/usb/uac2_host.h) for the full API.
 static uint8_t s_addr;
 static uint8_t s_iface_num;
 static TaskHandle_t s_playback_task;
+static _Atomic bool s_disconnected;
+
+static void device_event_cb(uac2_host_device_handle_t dev,
+                            const uac2_host_device_event_t event, void *arg)
+{
+    // Driver callbacks must not call driver APIs: just flag it
+    if (event == UAC2_HOST_DEVICE_EVENT_DISCONNECTED) {
+        atomic_store(&s_disconnected, true);
+    }
+}
 
 static void playback_task(void *arg)
 {
@@ -83,10 +94,11 @@ static void playback_task(void *arg)
             .iface_num = s_iface_num,
             .buffer_size = 0,
             .buffer_threshold = 0,
-            .callback = NULL,
+            .callback = device_event_cb,
             .callback_arg = NULL,
         };
 
+        atomic_store(&s_disconnected, false);
         if (uac2_host_device_open(&open_cfg, &dev) != ESP_OK) {
             continue;
         }
@@ -98,12 +110,19 @@ static void playback_task(void *arg)
             .flags = 0,
         };
 
-        if (uac2_host_device_start(dev, &stream_cfg) != ESP_OK) {
-            uac2_host_device_close(dev);
-            continue;
+        if (uac2_host_device_start(dev, &stream_cfg) == ESP_OK) {
+            // Write audio with uac2_host_device_write() until the device goes away
+            while (!atomic_load(&s_disconnected)) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
         }
 
-        // Application can now call uac2_host_device_write()
+        // close() stops the stream too. It fails while teardown is still
+        // draining after an unplug; the handle stays valid, so retry.
+        esp_err_t err;
+        while ((err = uac2_host_device_close(dev)) != ESP_OK && err != ESP_ERR_INVALID_ARG) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
     }
 }
 

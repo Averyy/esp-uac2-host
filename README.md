@@ -24,9 +24,9 @@ New in v0.1.3:
 - Packet sizes follow the device's feedback at every sample rate
 - Stricter teardown, concurrency and descriptor validation
 
-**v0.1.2** is the last committed version, verified on the miniDSP and on the ESP32-to-ESP32 simulator and checked by ear.
+On `main` since v0.1.3 (unreleased, hardware-tested): stop() lets audio already submitted to USB finish (about 9 ms; the ring buffer is still discarded) before the device is told to stop, control requests recover after a STALL, only the first UAC2 audio function is used, an optional stop-before-restart hook, and playback with capture verified on the miniDSP.
 
-Upgrading from 0.1.2: the [CHANGELOG](components/usb_host_uac2/CHANGELOG.md) lists the calls that now behave differently (unadvertised sample rates are refused, for example). [PROGRESS.md](PROGRESS.md) has the full history and the hardware test plan. v0.1.3 is also the first release on the ESP Component Registry, as `averyy/usb_host_uac2`.
+Upgrading: the [CHANGELOG](components/usb_host_uac2/CHANGELOG.md)'s Breaking Changes sections list the calls that behave differently (0.1.3 refuses unadvertised sample rates; the unreleased changes return new errors for oversized writes and read-only controls, for example). [PROGRESS.md](PROGRESS.md) has the full history and the hardware test plan. v0.1.3 is also the first release on the ESP Component Registry, as `averyy/usb_host_uac2`.
 
 ## Features
 
@@ -176,7 +176,7 @@ The harness in `main/` runs on boot against any connected UAC2 device:
 11. Ring buffer starvation and recovery
 12. Long-running stability (`CONFIG_UAC2_TEST12_DURATION_SEC`, default 1 hour; `sdkconfig.smoke.defaults` sets 20 s)
 
-Then come live checks: suspend/resume, the duplex guard (or, in `sdkconfig.duplex.defaults` builds, a playback + capture streaming check), a sample-rate guard (another handle can't change the shared clock under a stream) and a driver reinstall with the device attached. Tones fade in and out and drain before each stop, so they don't click. For listening through a subwoofer, set `CONFIG_UAC2_TEST_TONES_SUBWOOFER=y` to move every tone to 30-110 Hz.
+Then come live checks: suspend/resume, the duplex guard (or, in `sdkconfig.duplex.defaults` builds, a playback + capture streaming check), a sample-rate guard (another handle can't change the shared clock under a stream) and a driver reinstall with the device attached. Tones fade in and out and drain before each stop, so they don't click. For listening through a subwoofer, set `CONFIG_UAC2_TEST_TONES_SUBWOOFER=y` to move every tone to 30-110 Hz. `CONFIG_UAC2_DUPLEX_TEST_SEC` sets the duplex check's length (default 30 s), and `CONFIG_UAC2_TEST_RESTART_SEC` (default 0, off) calls `esp_restart()` that many seconds into Test 12, once per power-on.
 
 Harness build variants: add `sdkconfig.smoke.defaults` (short run), `sdkconfig.duplex.defaults` (playback + capture, ESP-IDF 5.5+/6.x) or `sdkconfig.heaptrace.defaults` (per-cycle leak trace) after `sdkconfig.defaults`. Give each variant its own `sdkconfig` as well as its own build directory, or an existing root `sdkconfig` overrides the defaults:
 
