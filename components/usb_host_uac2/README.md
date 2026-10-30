@@ -188,7 +188,7 @@ dependencies:
 ## Known issues
 
 - Playback and capture at the same time needs `CONFIG_UAC2_ALLOW_DUPLEX` plus a custom FIFO split; without it the driver refuses a stream while one in the other direction runs (ESP-IDF's FIFO presets leave 128 bytes for incoming packets). The split lowers the largest playback packet from 600 to 360 bytes.
-- A miniDSP 2x4 HD sometimes goes silent when the ESP32 is hardware-reset (reset pin, flashing) mid-stream with VBUS up: it keeps accepting USB audio but outputs nothing until it's power-cycled or rebooted with its own HID reboot command. The host can't detect this, and 0.1.3 does it too. It followed 5 of 14 such resets in testing, each after 15 s or more of streaming. Software restarts (`esp_restart()`), resets with no stream running and unplugging the cable didn't trigger it.
+- A miniDSP 2x4 HD sometimes goes silent when the ESP32 is hardware-reset (reset pin, flashing) mid-stream with VBUS up: it keeps accepting USB audio but outputs nothing until it's power-cycled or rebooted with its own HID reboot command. The host can't detect this, and 0.1.3 does it too. In controlled tests, 2 of 8 such resets did it. Software restarts (`esp_restart()`), resets with no stream running and unplugging the cable didn't trigger it.
 - `uac2_host_device_set_sample_rate()` returns `ESP_ERR_INVALID_STATE` while any stream on the device is started or suspended (the clock is shared; `uac2_host_device_start()` applies the stream's rate).
 - 44.1 kHz on an asynchronous playback endpoint needs its feedback endpoint; implicit feedback isn't supported.
 - Full-speed audio data endpoints must use `bInterval = 1`, and only a device's first 8 streaming alt settings are used.
