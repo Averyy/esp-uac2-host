@@ -11,22 +11,20 @@ I built it to play measurement sweeps through a miniDSP 2x4 HD from an ESP32 for
 
 ## Status
 
-**v0.1.3** is verified on a miniDSP 2x4 HD under ESP-IDF 5.4, 6.0.3 and 6.1: the full test harness and hot-unplug pass, and a downstream app's measurement sweeps and a 10-minute playback run were checked with a measurement microphone. An ESP32 hardware reset mid-stream sometimes leaves the miniDSP silent until it reboots (see [Known limitations](#known-limitations)).
+**v0.2.0** is verified on a miniDSP 2x4 HD under ESP-IDF 5.4.0, 6.0.3 and 6.1: the full test harness passes with every tone audible on a measurement microphone, as do hot-unplug, playback with capture, and a downstream app's measurement sweeps and 10-minute soak. An ESP32 hardware reset mid-stream sometimes leaves the miniDSP silent until it reboots (see [Known limitations](#known-limitations)).
 
-New in v0.1.3:
+New in v0.2.0:
 
-- ESP-IDF 6.x support
-- 44.1 kHz on adaptive and synchronous endpoints without a feedback endpoint
-- Falls back to the next matching alt setting when one can't be used
-- Sets the clock before enabling the stream, as Linux does, and refuses sample rates the device doesn't advertise
-- Queries for the active stream format and for buffered audio
-- Playback and capture at the same time (opt-in, ESP-IDF 5.5+/6.x)
-- Packet sizes follow the device's feedback at every sample rate
-- Stricter teardown, concurrency and descriptor validation
+- stop() and suspend() can no longer hang on an ESP-IDF USB Host bug, and audio already submitted to USB (about 9 ms) finishes before the device is told to stop
+- Control requests recover after a STALL; clock-setup timeouts are reported as such
+- Feedback endpoints of any size, including the spec's 3-byte format
+- Devices with a MIDI function next to the audio one (MOTU, Focusrite) get their requests on the right interface
+- Read-only volume and mute controls are reported and refused
+- Underrun and dropped-byte counters in the buffer status
+- Optional `CONFIG_UAC2_STOP_STREAMS_ON_RESTART`
+- Playback with capture verified on the miniDSP 2x4 HD
 
-On `main` since v0.1.3 (unreleased, hardware-tested): stop() lets audio already submitted to USB finish (about 9 ms; the ring buffer is still discarded) before the device is told to stop, control requests recover after a STALL, only the first UAC2 audio function is used, an optional stop-before-restart hook, and playback with capture verified on the miniDSP.
-
-Upgrading: the [CHANGELOG](components/usb_host_uac2/CHANGELOG.md)'s Breaking Changes sections list the calls that behave differently (0.1.3 refuses unadvertised sample rates; the unreleased changes return new errors for oversized writes and read-only controls, for example). [PROGRESS.md](PROGRESS.md) has the full history and the hardware test plan. v0.1.3 is also the first release on the ESP Component Registry, as `averyy/usb_host_uac2`.
+Upgrading: the [CHANGELOG](components/usb_host_uac2/CHANGELOG.md)'s Breaking Changes sections list the calls that behave differently (0.2.0 returns new errors for oversized writes, undersized buffers and read-only controls, and two structs grew). [PROGRESS.md](PROGRESS.md) has the full history and the hardware test plan.
 
 ## Features
 
@@ -85,7 +83,7 @@ uac2_host_uninstall();
 From the ESP Component Registry:
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.3"
+idf.py add-dependency "averyy/usb_host_uac2^0.2.0"
 ```
 
 To track unreleased changes, depend on this repository instead:

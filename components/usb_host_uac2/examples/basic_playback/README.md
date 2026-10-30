@@ -30,7 +30,7 @@ It demonstrates:
 `main/idf_component.yml` depends on `averyy/usb_host_uac2` with an `override_path`, so a build inside the driver's repository uses the local copy, while a project created from the registry fetches the published component:
 
 ```sh
-idf.py create-project-from-example "averyy/usb_host_uac2^0.1.3:basic_playback"
+idf.py create-project-from-example "averyy/usb_host_uac2^0.2.0:basic_playback"
 ```
 
 ### Build and Flash

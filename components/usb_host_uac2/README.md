@@ -182,7 +182,7 @@ void app_main(void)
 ## Installation
 
 ```sh
-idf.py add-dependency "averyy/usb_host_uac2^0.1.3"
+idf.py add-dependency "averyy/usb_host_uac2^0.2.0"
 ```
 
 To track unreleased changes, depend on the repository instead:

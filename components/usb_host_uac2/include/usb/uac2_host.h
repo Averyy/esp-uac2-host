@@ -46,8 +46,8 @@ extern "C" {
 // ── Version ───────────────────────────────────────────────────────
 
 #define UAC2_HOST_VER_MAJOR  0
-#define UAC2_HOST_VER_MINOR  1
-#define UAC2_HOST_VER_PATCH  3
+#define UAC2_HOST_VER_MINOR  2
+#define UAC2_HOST_VER_PATCH  0
 
 // ── Configuration defaults ─────────────────────────────────────────
 

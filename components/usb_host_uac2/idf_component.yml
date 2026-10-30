@@ -1,4 +1,4 @@
-version: "0.1.3"
+version: "0.2.0"
 description: "USB Audio Class 2.0 (UAC2) host driver for ESP32-S3: playback and capture with USB DACs, audio interfaces and miniDSP processors"
 url: "https://github.com/Averyy/esp-uac2-host"
 repository: "https://github.com/Averyy/esp-uac2-host.git"
